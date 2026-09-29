@@ -1,0 +1,101 @@
+{
+  "_readme": "Copy to data/profile.json and replace every value. Keys starting with _ are ignored. Leave out anything you don't want sent to the models. Any leaf can be {\"value\": ..., \"about\": \"what this means\"} to explain a custom field.",
+
+  "personal": {
+    "first_name": "Aarav",
+    "last_name": "Sharma",
+    "email": "aarav.sharma@example.com",
+    "phone": "+91 98765 43210",
+    "city": "Bengaluru",
+    "state": "Karnataka",
+    "country": "India",
+    "pincode": "560034",
+    "nationality": "Indian"
+  },
+
+  "links": {
+    "linkedin": "https://www.linkedin.com/in/example",
+    "github": "https://github.com/example",
+    "portfolio": ""
+  },
+
+  "work": {
+    "current_title": "Software Engineer II",
+    "current_company": "Example Tech Pvt Ltd",
+    "total_experience_years": 4.5,
+    "relevant_experience_years": 4,
+    "notice_period_days": 30,
+    "notice_period_text": "30 days",
+    "serving_notice": false,
+    "earliest_start_date": "2026-11-02",
+    "worked_for_this_company_before": false,
+    "has_relative_at_company": false
+  },
+
+  "compensation": {
+    "_note": "Amounts are ANNUAL, in rupees. LPA and monthly versions are derived automatically.",
+    "currency": "INR",
+    "current": {
+      "fixed_annual": 1500000,
+      "variable_annual": 200000
+    },
+    "expected": {
+      "total_annual": 2200000,
+      "negotiable": true
+    }
+  },
+
+  "preferences": {
+    "willing_to_relocate": true,
+    "preferred_locations": ["Bengaluru", "Pune", "Hyderabad", "Remote"],
+    "work_mode": "Hybrid",
+    "open_to_rotational_shifts": false
+  },
+
+  "work_authorization": {
+    "authorized_to_work_in_india": true,
+    "requires_visa_sponsorship": false
+  },
+
+  "education": [
+    {
+      "degree": "B.Tech",
+      "field": "Computer Science and Engineering",
+      "institution": "Example Institute of Technology",
+      "start": "2018-08",
+      "end": "2022-06",
+      "grade": "8.4 CGPA"
+    }
+  ],
+
+  "experience": [
+    {
+      "company": "Example Tech Pvt Ltd",
+      "title": "Software Engineer II",
+      "start": "2022-07",
+      "end": "",
+      "summary": "Backend services in Python and Go; led the migration of billing jobs to event-driven workers."
+    }
+  ],
+
+  "school": {
+    "_note": "Class 10 and Class 12, which Indian forms ask separately from your degree. Leave out what you don't want filled.",
+    "class_10": {"percentage": "92%", "year": 2014, "board": "CBSE", "school": "Example Public School"},
+    "class_12": {"percentage": "88%", "year": 2016, "board": "CBSE", "school": "Example Public School", "stream": "Science (PCM)"}
+  },
+  "academics": {"active_backlogs": 0},
+  "_optional": "Add when forms ask: personal.date_of_birth (YYYY-MM-DD), personal.father_name, personal.mother_name, personal.has_valid_passport (true/false), self_identification.marital_status. A question about one of these that your profile leaves out is always asked, never guessed.",
+  "skills": ["Python", "Go", "PostgreSQL", "Kafka", "AWS", "Docker"],
+  "languages": ["English", "Hindi"],
+
+  "self_identification": {
+    "_note": "Optional. Watching, questions about gender, caste, disability etc. always ask you first. Unattended, a voluntary EEO question gets its decline option (decline_eeo: false turns that off) unless you set an answer here.",
+    "gender": "Prefer not to say",
+    "decline_eeo": true
+  },
+
+  "documents": {
+    "resume": {"path": "documents/resume.pdf", "about": "Résumé / CV (PDF)"},
+    "cover_letter": {"path": "documents/cover_letter.pdf", "about": "General cover letter (PDF)"}
+  }
+}

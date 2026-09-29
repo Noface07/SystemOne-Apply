@@ -1,0 +1,22 @@
+body{font:15px/1.4 system-ui,sans-serif;margin:0;background:#f6f6f3;color:#1d1d1b}
+main{max-width:720px;margin:24px auto;padding:0 20px}
+.field{margin:14px 0}.field>label,.q{display:block;font-weight:600;margin-bottom:4px}
+input[type=text],input[type=email],input[type=tel],input[type=number],input[type=date],input[type=month],select,textarea{
+  width:100%;box-sizing:border-box;padding:8px;border:1px solid #bbb;border-radius:6px;font:inherit}
+button,.btn{padding:9px 16px;border-radius:6px;border:1px solid #1d4d3a;background:#1d4d3a;color:#fff;font:inherit;cursor:pointer}
+button.secondary{background:#fff;color:#1d4d3a}
+.help{font-size:13px;color:#666}
+.panel{height:430px;overflow:auto;border:1px solid #ddd;background:#fff;padding:0 16px;border-radius:8px}
+.choice{position:relative;display:inline-block;margin-right:10px}
+.choice input{position:absolute;opacity:0;width:1px;height:1px}
+.choice span{display:inline-block;padding:6px 14px;border:1px solid #1d4d3a;border-radius:16px}
+.choice input:checked+span{background:#1d4d3a;color:#fff}
+[aria-pressed=true]{background:#1d4d3a;color:#fff}[aria-pressed=false]{background:#fff;color:#1d4d3a}
+#city-list{list-style:none;margin:0;padding:0;border:1px solid #bbb;background:#fff}
+#city-list li{padding:6px 8px;cursor:pointer}
+.cookie{position:fixed;left:0;right:0;bottom:0;min-height:45vh;box-sizing:border-box;background:#222;color:#fff;padding:22px;display:flex;gap:12px;align-items:center}
+.tag{display:inline-block;margin:0 6px 6px 0;padding:3px 4px 3px 10px;border-radius:14px;background:#e3ece7}
+.tag button{padding:0 6px;background:none;border:0;color:#1d4d3a}
+#skill-list{list-style:none;margin:0;padding:0;border:1px solid #bbb;background:#fff}
+#skill-list li{padding:6px 8px;cursor:pointer}
+select[multiple]{height:auto}

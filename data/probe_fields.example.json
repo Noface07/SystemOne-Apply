@@ -1,0 +1,92 @@
+{
+  "_readme": "Tricky field wordings for scripts/probe_fields.py. 'expect' is the profile key (or a list of acceptable keys) (or ASK_USER / DRAFT_ANSWER / SKIP_FIELD) you consider correct. Add wordings you meet in the wild.",
+  "fields": [
+    {
+      "label": "Current CTC (in LPA)",
+      "expect": "compensation.current.total_annual_lpa"
+    },
+    {
+      "label": "Present CTC",
+      "placeholder": "e.g. 1200000",
+      "expect": "compensation.current.total_annual"
+    },
+    {
+      "label": "Expected CTC",
+      "context": "Expected CTC (Lakhs per annum) *",
+      "expect": "compensation.expected.total_annual_lpa"
+    },
+    {
+      "label": "Expected package",
+      "help": "Annual, in INR",
+      "expect": "compensation.expected.total_annual"
+    },
+    {
+      "label": "Salary expectations (per month)",
+      "expect": "compensation.expected.total_annual_monthly"
+    },
+    {
+      "label": "Current fixed salary",
+      "help": "Excluding variable pay",
+      "expect": "compensation.current.fixed_annual"
+    },
+    {
+      "label": "Current annual income",
+      "expect": "compensation.current.total_annual"
+    },
+    {
+      "label": "Desired income",
+      "expect": "compensation.expected.total_annual"
+    },
+    {
+      "label": "Current take-home per month",
+      "expect": "ASK_USER"
+    },
+    {
+      "label": "Total experience (years)",
+      "expect": "work.total_experience_years"
+    },
+    {
+      "label": "Relevant experience in backend (years)",
+      "expect": "work.relevant_experience_years"
+    },
+    {
+      "label": "Notice period (days)",
+      "expect": "work.notice_period_days"
+    },
+    {
+      "label": "Last working day",
+      "expect": "ASK_USER"
+    },
+    {
+      "label": "Graduation year",
+      "expect": ["education.0.end.year", "education.0.end"]
+    },
+    {
+      "label": "Why do you want to work with us?",
+      "input_type": "textarea",
+      "expect": "DRAFT_ANSWER"
+    },
+    {
+      "label": "Middle name",
+      "required": false,
+      "expect": "SKIP_FIELD"
+    },
+    {
+      "label": "Skills",
+      "placeholder": "Comma-separated",
+      "expect": "skills"
+    },
+    {
+      "label": "Key skills",
+      "role": "combobox",
+      "multiple": true,
+      "context": "Key skills Python × Go ×",
+      "expect": [
+        "skills.item_3",
+        "skills.item_4",
+        "skills.item_5",
+        "skills.item_6"
+      ]
+    }
+  ]
+}

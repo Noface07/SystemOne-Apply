@@ -1,0 +1,32 @@
+<!doctype html><meta charset="utf-8"><title>Apply — Experience (2/3)</title>
+<link rel="stylesheet" href="/style.css">
+<main>
+  <h2>Experience and compensation <small>(step 2 of 3)</small></h2>
+  <div class="panel" id="panel">
+    <div class="field"><label for="title">Current designation *</label><input id="title" type="text" required></div>
+    <div class="field"><label for="exp">Total experience (years) *</label><input id="exp" type="number" step="0.5" required></div>
+    <div class="field"><label for="cctc">Current CTC (in LPA) *</label><input id="cctc" type="text" required></div>
+    <div class="field"><label for="ectc">Expected CTC *</label><input id="ectc" type="text" aria-describedby="ectc-help" required>
+      <div id="ectc-help" class="help">Annual, in INR</div></div>
+    <div class="field"><label for="fixed">Current fixed salary</label><input id="fixed" type="text"></div>
+    <div class="field"><label for="notice">Notice period *</label>
+      <select id="notice" required><option value="">Select…</option><option>Immediate</option><option>15 days</option>
+        <option>30 days</option><option>60 days</option><option>90 days</option></select></div>
+    <div class="field"><label for="start">Earliest start date</label><input id="start" type="date"></div>
+    <div class="field"><label for="grad">Graduation (month and year)</label><input id="grad" type="month"></div>
+    <fieldset class="field"><legend class="q">Are you willing to relocate? *</legend>
+      <label class="choice"><input type="radio" name="relocate" value="yes"><span>Yes</span></label>
+      <label class="choice"><input type="radio" name="relocate" value="no"><span>No</span></label>
+    </fieldset>
+    <div class="field"><span class="q" id="visa-q">Will you now or in the future require visa sponsorship?</span>
+      <div role="group" aria-labelledby="visa-q">
+        <button type="button" aria-pressed="false" onclick="press(this)">Yes</button>
+        <button type="button" aria-pressed="false" onclick="press(this)">No</button>
+      </div></div>
+    <p><button class="secondary" onclick="location.href='step1.html'">Back</button>
+       <button onclick="location.href='step3.html'">Save and continue</button></p>
+  </div>
+</main>
+<script>
+  function press(b){ for (const x of b.parentElement.children) x.setAttribute('aria-pressed', String(x===b)); }
+</script>

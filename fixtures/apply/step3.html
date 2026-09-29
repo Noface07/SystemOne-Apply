@@ -1,0 +1,47 @@
+<!doctype html><meta charset="utf-8"><title>Apply — Final questions (3/3)</title>
+<link rel="stylesheet" href="/style.css">
+<main>
+  <h2>A few more questions <small>(step 3 of 3)</small></h2>
+  <div class="field">
+    <label id="skills-label" for="skill-input">Key skills (add up to 8)</label>
+    <div id="tags"></div>
+    <input id="skill-input" type="text" role="combobox" aria-autocomplete="list" aria-expanded="false"
+      aria-controls="skill-list" placeholder="Type a skill and pick it" autocomplete="off">
+    <ul id="skill-list" role="listbox" aria-multiselectable="true" aria-labelledby="skills-label" hidden></ul>
+  </div>
+  <div class="field"><label for="locs">Preferred locations (select all that apply)</label>
+    <select id="locs" multiple size="5"><option>Bengaluru</option><option>Chennai</option><option>Hyderabad</option>
+      <option>Mumbai</option><option>Pune</option></select></div>
+  <div class="field"><label for="why">Why do you want to join Acme? *</label><textarea id="why" rows="5" required></textarea></div>
+  <div class="field"><label for="gender">Gender (voluntary self-identification)</label>
+    <select id="gender"><option value="">Select…</option><option>Female</option><option>Male</option>
+      <option>Non-binary</option><option>Prefer not to say</option></select></div>
+  <div class="field"><label for="heard">How did you hear about us?</label>
+    <select id="heard"><option value="">Select…</option><option>LinkedIn</option><option>Company careers page</option>
+      <option>Referral</option><option>Other</option></select></div>
+  <div class="field"><label><input id="accurate" type="checkbox"> I confirm the information above is accurate</label></div>
+  <button onclick="location.href='submitted.html'">Submit application</button>
+</main>
+<script>
+  // Tag input: suggestions only from this list (no "Kafka"), chosen skills become removable chips.
+  const known=['Python','Go','Google Cloud','PostgreSQL','AWS','Docker','Java','JavaScript'], added=[];
+  const input=document.getElementById('skill-input'), list=document.getElementById('skill-list'), tags=document.getElementById('tags');
+  function render(){
+    tags.innerHTML='';
+    for (const skill of added) {
+      const chip=document.createElement('span'); chip.className='tag'; chip.textContent=skill+' ';
+      const x=document.createElement('button'); x.type='button'; x.textContent='×'; x.setAttribute('aria-label','Remove '+skill);
+      x.onclick=()=>{added.splice(added.indexOf(skill),1); render()};
+      chip.append(x); tags.append(chip);
+    }
+  }
+  input.addEventListener('input', () => {
+    const q=input.value.trim().toLowerCase(); list.innerHTML='';
+    known.filter(k=>q && k.toLowerCase().startsWith(q) && !added.includes(k)).forEach(k=>{
+      const li=document.createElement('li'); li.setAttribute('role','option'); li.textContent=k;
+      li.onclick=()=>{added.push(k); input.value=''; list.hidden=true; input.setAttribute('aria-expanded','false'); render()};
+      list.append(li);
+    });
+    list.hidden=!list.children.length; input.setAttribute('aria-expanded', String(!list.hidden));
+  });
+</script>

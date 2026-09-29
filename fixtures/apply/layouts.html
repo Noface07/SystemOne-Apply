@@ -1,0 +1,77 @@
+<!doctype html><meta charset="utf-8"><title>Apply — Other layouts</title>
+<link rel="stylesheet" href="/style.css">
+<style>
+  .opt{cursor:pointer;display:inline-block;padding:4px 10px;border:1px solid #bbb;margin-right:6px}
+  .opt.selected{background:#246;color:#fff}
+  ul.plain{list-style:none;padding:0;display:flex;gap:12px}
+  .editor{border:1px solid #bbb;min-height:40px;padding:4px}
+</style>
+<main>
+  <h2>Other layouts</h2>
+  <!-- Lever: the question in a div above a list of labelled radios, no fieldset. -->
+  <div class="field"><div class="q">Are you willing to relocate? *</div>
+    <ul class="plain"><li><label><input type="radio" name="relocate" value="yes">Yes</label></li>
+      <li><label><input type="radio" name="relocate" value="no">No</label></li></ul></div>
+  <div class="field"><div class="q">Do you require visa sponsorship?</div>
+    <ul class="plain"><li><label><input type="radio" name="visa" value="yes">Yes</label></li>
+      <li><label><input type="radio" name="visa" value="no">No</label></li></ul></div>
+  <!-- An old portal: a table, the question in the first cell. -->
+  <table><tr><td>Do you have a valid passport?</td>
+    <td><label><input type="radio" name="passport" value="yes">Yes</label>
+        <label><input type="radio" name="passport" value="no">No</label></td></tr></table>
+  <!-- Yes/No made of divs: no role, no aria-pressed; the chosen one has a class. -->
+  <div class="field"><p class="q">Are you open to night shifts?</p>
+    <div id="shifts"><div class="opt">Yes</div><div class="opt">No</div></div></div>
+  <!-- Lever: the real <select> sits over a styled box with opacity 0. -->
+  <div class="field"><label for="where">Which location are you applying for? *</label>
+    <div style="position:relative;border:1px solid #bbb;width:300px;height:32px"><span>Select...</span>
+      <select id="where" style="position:absolute;inset:0;opacity:0;width:100%;height:100%">
+        <option value="">Select...</option><option>Mumbai</option><option>Pune</option></select></div></div>
+  <div class="field"><label for="dob">Date of birth</label>
+    <input id="dob" type="text" placeholder="DD/MM/YYYY" data-mask="dd/mm/yyyy"></div>
+  <div class="field"><label for="email">Email</label>
+    <input id="email" type="email" value="aarav@" aria-invalid="true" aria-errormessage="email-error">
+    <span id="email-error" class="help">Enter a valid email address</span></div>
+  <div class="field"><label for="slot">Interview slot</label><input id="slot" type="datetime-local"></div>
+  <div class="field"><div id="note-label">Cover note</div>
+    <div class="editor" contenteditable="" aria-labelledby="note-label"></div></div>
+  <div class="field"><shadow-field></shadow-field></div>
+  <iframe id="inner" style="width:420px;height:70px;border:0"
+    srcdoc="<label>Referral code <input id='ref'></label>"></iframe>
+  <!-- LinkedIn: no file input until the button is clicked; the click makes one and opens the file dialog. -->
+  <div class="field"><button id="uplbtn" type="button">Upload resume</button> <span id="uplname"></span></div>
+  <!-- Workday: the real Month/Year inputs are 0x0; a box drawn for each shows the value and focuses it on click. -->
+  <div class="field"><div>Work Experience 1</div><div>From *</div>
+    <span class="wd-part" style="display:inline-block;position:relative;width:60px;height:28px;border:1px solid #999">
+      <span class="wd-display">MM</span>
+      <input id="wd-month" type="text" role="spinbutton" aria-label="Month" aria-valuemin="1" aria-valuemax="12"
+        data-automation-id="dateSectionMonth-input" style="position:absolute;left:0;top:0;width:0;height:0;border:0;padding:0">
+    </span></div>
+  <p><a href="step1.html" target="_blank">Continue in a new tab</a></p>
+</main>
+<script>
+  customElements.define('shadow-field', class extends HTMLElement {
+    constructor() { super(); this.attachShadow({mode:'open'}).innerHTML='<label>Portfolio URL <input id="site"></label>'; }
+  });
+  for (const o of document.querySelectorAll('#shifts .opt'))
+    o.onclick=()=>{ for (const x of o.parentElement.children) x.classList.toggle('selected', x===o); };
+  document.getElementById('uplbtn').onclick=()=>{
+    const input=document.createElement('input'); input.type='file';
+    input.onchange=()=>{ document.getElementById('uplname').textContent=input.files[0]?.name || ''; };
+    input.click();
+  };
+  for (const part of document.querySelectorAll('.wd-part')) {
+    const input=part.querySelector('input'), shown=part.querySelector('.wd-display');
+    part.onclick=()=>input.focus();
+    input.oninput=()=>{ shown.textContent=input.value || 'MM'; };
+  }
+  // A typing mask: takes one digit per keystroke and adds the slashes itself. Pasted text is refused.
+  const dob=document.getElementById('dob');
+  dob.addEventListener('beforeinput', e => {
+    if (e.inputType!=='insertText') return;
+    e.preventDefault();
+    if (!/^\d$/.test(e.data||'')) return;
+    const digits=(dob.value.replace(/\D/g,'')+e.data).slice(0,8);
+    dob.value=digits.replace(/^(\d{2})(\d)/,'$1/$2').replace(/^(\d{2}\/\d{2})(\d)/,'$1/$2');
+  });
+</script>

@@ -1,0 +1,33 @@
+[project]
+name = "jev-apply"
+version = "0.1.0"
+description = "Fill job applications from your own data. A local decision model (Laya) chooses; you review and submit."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.12"
+dependencies = ["browser-harness==0.1.13", "httpx[http2]>=0.28,<1"]
+
+[project.optional-dependencies]
+# A separate, dedicated browser profile instead of your everyday Chrome (recommended).
+playwright = ["playwright>=1.45,<2"]
+# Laya, the default decision model: open weights, runs locally (pulls in PyTorch and Transformers).
+laya = ["laya>=0.3.5,<0.4"]
+
+[project.scripts]
+jev-apply = "jev_apply.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = ["pytest>=8.4,<9", "ruff>=0.14,<1"]
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

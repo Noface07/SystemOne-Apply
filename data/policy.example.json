@@ -1,0 +1,39 @@
+{
+  "_readme": "Copy to data/policy.json to change behaviour. Anything missing falls back to these defaults. Patterns match the start of words, case-insensitively, in a field's label and the question text around it.",
+
+  "min_operation_probability": 0.6,
+  "min_target_probability": 0.6,
+  "min_value_margin": 0.3,
+
+  "drafts": "confirm",
+  "naukri_apply": "assist",
+  "auto_submit": false,
+  "submit_drafts": false,
+  "login_wait_s": 900,
+  "max_actions": 200,
+  "learned_answers": "learned.json",
+
+  "auto_consent": false,
+  "consent_patterns": [
+    "privacy policy", "privacy notice", "privacy statement", "data privacy", "data protection", "personal data", "terms and conditions", "terms & conditions", "terms of use", "terms of service"
+  ],
+  "declaration_patterns": [
+    "criminal", "convict", "arrest", "offence", "offense", "background", "true", "accurate", "correct", "certify", "falsif", "misrepresent", "drug", "relative", "conflict", "non-compete", "non-disclosure", "bond", "arbitrat", "sponsor", "visa", "authori", "disab", "veteran", "gender", "caste", "religion", "salary", "notice period"
+  ],
+
+  "confirm_patterns": [
+    "gender", "sex", "pronoun", "race", "ethnic", "caste", "category", "religion", "disab", "veteran",
+    "criminal", "convict", "arrest", "sponsor", "visa", "work authori", "authorized to work", "authorised to work",
+    "date of birth", "birth", "age", "marital", "salary", "ctc", "compensation", "pay", "package", "background check",
+    "i agree", "i certify", "i confirm", "i acknowledge", "declare", "consent", "terms"
+  ],
+
+  "never_fill_patterns": [
+    "password", "otp", "one-time", "aadhaar", "aadhar", "pan card", "pan number", "permanent account number", "passport number", "social security", "ssn",
+    "bank", "account number", "ifsc", "credit card", "debit card", "cvv", "uan"
+  ],
+
+  "submit_patterns": [
+    "submit", "send application", "apply", "finish", "complete", "confirm and", "send"
+  ]
+}

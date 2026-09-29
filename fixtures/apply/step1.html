@@ -1,0 +1,48 @@
+<!doctype html><meta charset="utf-8"><title>Apply — Personal details (1/3)</title>
+<link rel="stylesheet" href="/style.css">
+<main>
+  <h2>Personal details <small>(step 1 of 3)</small></h2>
+  <div class="field"><label for="fn">First name *</label><input id="fn" type="text" required></div>
+  <div class="field"><label for="ln">Last name *</label><input id="ln" type="text" required></div>
+  <div class="field"><label for="em">Email *</label><input id="em" type="email" required></div>
+  <div class="field"><label for="ph">Mobile number *</label><input id="ph" type="tel" placeholder="+91" required></div>
+  <div class="field">
+    <label id="city-label" for="city">Current location *</label>
+    <input id="city" type="text" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="city-list" autocomplete="off">
+    <ul id="city-list" role="listbox" aria-labelledby="city-label" hidden></ul>
+  </div>
+  <div class="field">
+    <span class="q">Resume/CV *</span>
+    <label for="resume" class="btn">Attach</label> <span id="resume-name" class="help">PDF or DOCX</span>
+    <input id="resume" type="file" accept=".pdf,.docx" hidden required>
+  </div>
+  <div class="field">
+    <span class="q">Cover letter (optional)</span>
+    <label for="cover" class="btn">Attach</label>
+    <input id="cover" type="file" hidden>
+  </div>
+  <p id="err" role="alert" class="help"></p>
+  <button id="next" onclick="next1()">Next</button>
+</main>
+<div class="cookie" id="cookie">We use cookies.
+  <button onclick="document.getElementById('cookie').remove()">Only necessary cookies</button></div>
+<script>
+  const cities=['Bengaluru','Bhopal','Bhubaneswar','Pune','Hyderabad'], city=document.getElementById('city'), list=document.getElementById('city-list');
+  city.addEventListener('input', () => {
+    const q=city.value.toLowerCase(); list.innerHTML='';
+    cities.filter(c=>q && c.toLowerCase().startsWith(q.slice(0,2))).forEach(c=>{
+      const li=document.createElement('li'); li.setAttribute('role','option'); li.textContent=c;
+      li.onclick=()=>{city.value=c; list.hidden=true; city.setAttribute('aria-expanded','false')};
+      list.append(li);
+    });
+    list.hidden=!list.children.length; city.setAttribute('aria-expanded', String(!list.hidden));
+  });
+  document.getElementById('resume').addEventListener('change', e =>
+    document.getElementById('resume-name').textContent=e.target.files[0]?.name || 'PDF or DOCX');
+  function next1(){
+    const missing=['fn','ln','em','ph','city'].filter(id=>!document.getElementById(id).value);
+    if (!document.getElementById('resume').files.length) missing.push('resume');
+    if (missing.length) { document.getElementById('err').textContent='Please complete: '+missing.join(', '); return; }
+    location.href='step2.html';
+  }
+</script>

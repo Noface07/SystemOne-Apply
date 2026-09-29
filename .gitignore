@@ -1,0 +1,41 @@
+# ---- Secrets -----------------------------------------------------------------------------------------------------
+# API keys and local settings. Only .env.example belongs in git.
+.env
+.env.*
+!.env.example
+
+# ---- Your personal data ------------------------------------------------------------------------------------------
+# Profiles, answers, résumés and everything a run learns about you. Only the *.example.json files are tracked.
+data/*
+!data/*.example.json
+
+# Anything run from the project folder that holds your details or your job hunt.
+runs/
+jobs/
+applied.md
+hiringcafe_jobs.md
+*.pdf
+*.docx
+!fixtures/**
+
+# ---- Python ------------------------------------------------------------------------------------------------------
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
+
+# ---- Editors and OS ----------------------------------------------------------------------------------------------
+.vscode/
+.idea/
+.claude/settings.local.json
+.DS_Store
+Thumbs.db
+desktop.ini

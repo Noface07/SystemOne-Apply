@@ -1,0 +1,20 @@
+{
+  "_readme": "Copy to data/answers.json. Reusable answers you have written yourself. The agent types them verbatim when a question matches; anything open-ended that isn't here is drafted and shown to you first.",
+  "answers": [
+    {
+      "id": "why_change",
+      "question": "Why are you looking for a change? / Reason for leaving",
+      "answer": "I've grown a lot on backend systems at my current company and I'm now looking for a team where I can own larger distributed-systems problems end to end."
+    },
+    {
+      "id": "about_me",
+      "question": "Tell us about yourself / Professional summary",
+      "answer": "Backend engineer with 4.5 years in Python and Go, focused on reliable data-heavy services. Recently led a migration of billing jobs to event-driven workers that cut failed runs sharply."
+    },
+    {
+      "id": "how_heard",
+      "question": "How did you hear about this role?",
+      "answer": "Company careers page"
+    }
+  ]
+}
