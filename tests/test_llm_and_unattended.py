@@ -339,9 +339,9 @@ def test_naukri_own_apply_follows_the_policy(make_agent, monkeypatch):
 
 def submit_pages():
     before = make_page({1: "17", 3: "Prefer not to say", 5: "2026-11-02", 6: "Because."})
-    before["url"] = "https://jobs.lever.co/acme/0f8b3c2e-1d2a-4b5c-9e7f-123456789abc/apply"
+    before["url"] = "https://jobs.ashbyhq.com/acme/0f8b3c2e-1d2a-4b5c-9e7f-123456789abc/application"
     after = make_page()
-    after["url"], after["text"] = "https://jobs.lever.co/acme/thanks", "Thank you for applying!"
+    after["url"], after["text"] = "https://jobs.ashbyhq.com/acme/thanks", "Thank you for applying!"
     after["actions"] = [a for a in after["actions"] if a["id"] == "wait"]
     return before, after
 

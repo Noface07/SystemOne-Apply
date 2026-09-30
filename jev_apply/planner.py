@@ -22,7 +22,7 @@ The output is the same decision shape as model.choose, so every guard in agent.p
 import re
 
 from . import laya_backend, rules
-from .profile import MONTHS, Fact, safe_id, same_question, undouble
+from .profile import MONTHS, Fact, answers, safe_id, undouble
 
 PLACEHOLDER = re.compile(r"^\s*$|^\s*(select|choose|please|pick|--|—|-|none)", re.I)
 COOKIES = re.compile(
@@ -217,7 +217,7 @@ def fact_values(question, facts):
     """Your answer(s) to a question: one you saved for it before, else your profile's per the fixed rules (every
     fact a rule names, in order: '+91' and 'India' for a phone code), else Yes for experience with a skill you list."""
     for k, fact in facts.by_id.items():
-        if fact.key.startswith("saved: ") and same_question(fact.key[7:], question):
+        if fact.key.startswith("saved: ") and answers(fact.key[7:], question):
             return [item for item in fact.value.split(", ") if norm(item)]
     key = rules.key_for({"label": question, "context": question}, facts, set())
     values = []
@@ -391,7 +391,9 @@ def laya_pick(question, options, candidate):
             }
         },
     }
-    answer = laya_backend.system_one(body)["answers"]["option"]
+    from . import model  # the configured backend (Laya by default, or Jev): model imports this module
+
+    answer = model.systemone(body)[0]["answers"]["option"]
     chosen = options[int(answer["choice"]) - 1]
     by_target = {options[int(k) - 1].get("id"): v for k, v in answer["probabilities"].items()}
     return chosen, answer["probabilities"][answer["choice"]], by_target

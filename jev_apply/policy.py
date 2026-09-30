@@ -102,6 +102,13 @@ class Policy:
     # Unattended runs that reach a sign-in page alert you, show the tab and wait this long for you to sign in (or
     # create the account) before stopping the job. 0 stops at once. The agent never types into a login page.
     login_wait_s: int = 900
+    # After auto_submit clicks Submit: how long to watch for the site's own confirmation before recording the job
+    # as "submitted (no confirmation seen)". Nothing is clicked while waiting.
+    confirm_wait_s: int = 15
+    # Spread applications across companies: at most `per_company` in any `company_gap_days` window (from
+    # applied.json and within one batch). Jobs over the limit are deferred, listed, not dropped. 0 turns it off.
+    per_company: int = 1
+    company_gap_days: int = 14
     # Tick required privacy / terms consent boxes in unattended runs (off unless you turn it on). A box that also
     # matches declaration_patterns is never ticked this way: it becomes a Yes/No question in QUESTIONS.md.
     auto_consent: bool = False

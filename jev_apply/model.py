@@ -87,6 +87,38 @@ def backend():
     return name
 
 
+def steering():
+    """Who decides the next step on a page. `procedure` (default for Laya and Jev): planner.py walks the form and
+    the model only picks answers. `model`: the model also steers (the default for the llm backend)."""
+    name = (os.environ.get("DECISION_STEERING") or "").strip().lower()
+    if name and name not in {"procedure", "model"}:
+        raise RuntimeError(f"DECISION_STEERING must be 'procedure' or 'model', not {name!r}.")
+    return name or ("model" if backend() == "llm" else "procedure")
+
+
+# TypeSafe answers at most 255 options per choice question (256 is "Too many choices").
+MAX_TYPESAFE_CHOICES = 255
+
+
+def fit_for_typesafe(body):
+    """Shortlist choice questions longer than TypeSafe allows, like the Laya backend does: the options sharing the
+    field's words are kept, ASK_USER and the other exits always. Returns (body, dropped option ids per question)."""
+    questions, dropped = {}, {}
+    for qid, question in body["questions"].items():
+        criteria = question.get("criteria") or {}
+        if question.get("type") == "choice" and len(criteria) > MAX_TYPESAFE_CHOICES:
+            state = body.get("state") or {}
+            query = laya_backend.query_text(state) if isinstance(state.get("field"), dict) else json.dumps(question)
+            protected = sum(1 for k in criteria if k in laya_backend.PROTECTED)
+            kept = laya_backend.shortlist(
+                query, {k: str(v) for k, v in criteria.items()}, MAX_TYPESAFE_CHOICES - protected
+            )
+            dropped[qid] = [k for k in criteria if k not in kept]
+            question = {**question, "criteria": {k: criteria[k] for k in kept}}
+        questions[qid] = question
+    return {**body, "questions": questions}, dropped
+
+
 def systemone(body):
     if backend() in {"laya", "llm"}:
         started = time.perf_counter()
@@ -96,8 +128,13 @@ def systemone(body):
     key = os.environ.get("TYPESAFE_API_KEY")
     if not key:
         raise RuntimeError("Set TYPESAFE_API_KEY in .env")
+    body, dropped = fit_for_typesafe(body)
     started = time.perf_counter()
     result = post_json(base + "/v1/systemone", key, {"model": os.environ.get("TYPESAFE_MODEL", "jev-latest"), **body})
+    for qid, ids in dropped.items():  # every option the caller offered is accounted for, as with Laya
+        answer = result.get("answers", {}).get(qid)
+        if isinstance(answer, dict) and isinstance(answer.get("probabilities"), dict):
+            answer["probabilities"].update({k: 0.0 for k in ids})
     return result, round((time.perf_counter() - started) * 1000)
 
 
@@ -163,9 +200,9 @@ def action_space(actions):
 
 
 def choose(page, goal, history, candidate, exclude=()):
-    if backend() == "laya":
-        # Laya answers small questions well and steers pages badly: a fixed procedure walks the form and asks
-        # the rules and Laya only which answer fits (see planner.py).
+    if steering() == "procedure":
+        # A fixed procedure walks the form (planner.py) and asks the rules, then the model (Laya or Jev), only
+        # which answer fits. The same guards and fixes apply whichever model answers.
         return planner.choose(page, candidate, exclude, history)
     elements, targets, controls = action_space(page["actions"])
     operations = {key: LABELS[key] for key in targets}
@@ -332,10 +369,11 @@ def draft_text(action, page, profile):
     return house_style(text) or None, meta
 
 
-def draft_with_claude_code(context):
-    """Draft through the Claude Code CLI (`claude -p`), on the candidate's own Claude login rather than an API key.
-    The job page is untrusted text, so Claude runs with no tools and no MCP servers, from an empty folder: it can
-    only write the answer, never read or run anything."""
+def claude_code(system, payload, model=None, stdin=None, timeout=None):
+    """One answer from the Claude Code CLI (`claude -p`) on the candidate's own Claude login, no API key. It runs
+    with no tools and no MCP servers, from an empty folder: whatever the input says (job pages, résumés and
+    screenshots are untrusted), Claude can only write text back, never read or run anything.
+    Returns (text or None, meta). `stdin` replaces the JSON payload, e.g. stream-json messages with images."""
     import shutil
     import subprocess
     import tempfile
@@ -343,33 +381,50 @@ def draft_with_claude_code(context):
     exe = os.environ.get("CLAUDE_CODE_BIN") or shutil.which("claude")
     if not exe:
         return None, {"model": None, "reason": "the claude CLI (Claude Code) isn't installed or on PATH"}
-    model = os.environ.get("TEXT_MODEL") or "sonnet"
+    model = model or os.environ.get("TEXT_MODEL") or "sonnet"
     command = [exe, "-p", "--tools", "", "--strict-mcp-config", "--no-session-persistence", "--model", model]
-    command += ["--output-format", "json", "--system-prompt", DRAFT]
+    command += ["--output-format", "json", "--system-prompt", system]
+    if stdin is not None:
+        command += ["--input-format", "stream-json", "--verbose", "--output-format", "stream-json"]
     started = time.perf_counter()
     try:
-        with tempfile.TemporaryDirectory(prefix="jev-draft-") as empty:
+        with tempfile.TemporaryDirectory(prefix="jev-claude-") as empty:
             done = subprocess.run(
                 command,
-                input=json.dumps(context),
+                input=stdin if stdin is not None else json.dumps(payload),
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
                 cwd=empty,
-                timeout=int(os.environ.get("CLAUDE_CODE_TIMEOUT") or 180),
+                timeout=timeout or int(os.environ.get("CLAUDE_CODE_TIMEOUT") or 180),
             )
     except (OSError, subprocess.TimeoutExpired) as error:
         return None, {"model": f"claude-code/{model}", "reason": f"claude CLI failed: {error}"}
     meta = {"model": f"claude-code/{model}", "latency_ms": round((time.perf_counter() - started) * 1000)}
-    try:
-        reply = json.loads(done.stdout)
-    except ValueError:
+    reply = None
+    for line in reversed((done.stdout or "").strip().splitlines() or [""]):  # stream-json: the last "result" line
+        try:
+            candidate = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(candidate, dict) and ("result" in candidate or candidate.get("type") == "result"):
+            reply = candidate
+            break
+    if reply is None:
         return None, {**meta, "reason": f"claude CLI gave no JSON: {(done.stdout or done.stderr).strip()[:160]!r}"}
     if reply.get("is_error") or done.returncode:
         return None, {**meta, "reason": f"claude CLI error: {str(reply.get('result'))[:160]!r}"}
-    text = read_draft(str(reply.get("result") or ""))
+    return str(reply.get("result") or ""), meta
+
+
+def draft_with_claude_code(context):
+    """Draft an open answer through the Claude Code CLI (see claude_code: no tools, empty folder)."""
+    content, meta = claude_code(DRAFT, context)
+    if content is None:
+        return None, meta
+    text = read_draft(content)
     if text is None:
-        return None, {**meta, "reason": f"couldn't read Claude's reply: {str(reply.get('result'))[:120]!r}"}
+        return None, {**meta, "reason": f"couldn't read Claude's reply: {content[:120]!r}"}
     return house_style(text) or None, meta
 
 

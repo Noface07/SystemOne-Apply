@@ -73,11 +73,11 @@ def test_documents_must_exist_and_answers_become_facts(tmp_path):
     assert Profile.load(tmp_path / "profile.json", None, tmp_path / "learned.json").facts["answer.learned_1"]
 
 
-def test_too_many_facts_is_a_clear_error(monkeypatch):
-    monkeypatch.setenv("DECISION_BACKEND", "typesafe")  # every fact is one of TypeSafe's 255 categories
+def test_too_many_facts_is_a_clear_error():
+    from jev_apply.profile import MAX_SOURCES_SHORTLISTED
+
     with pytest.raises(ValueError, match="limit"):
-        Profile({"many": {f"k{i}": "v" for i in range(MAX_SOURCES + 1)}})
-    monkeypatch.setenv("DECISION_BACKEND", "laya")  # Laya shortlists: saved answers can keep growing
+        Profile({"many": {f"k{i}": "v" for i in range(MAX_SOURCES_SHORTLISTED + 1)}})
     assert len(Profile({"many": {f"k{i}": "v" for i in range(MAX_SOURCES + 1)}}).facts) > MAX_SOURCES
 
 
@@ -118,6 +118,7 @@ def test_code_defaults_match_the_documented_example_and_cannot_be_emptied():
     default = Policy()
     keys = ("confirm_patterns", "never_fill_patterns", "submit_patterns", "min_value_margin", "drafts")
     keys += ("auto_consent", "consent_patterns", "declaration_patterns", "login_wait_s", "submit_drafts")
+    keys += ("confirm_wait_s", "per_company", "company_gap_days")
     for key in keys:
         assert getattr(default, key) == example[key]
     with pytest.raises(ValueError):
@@ -133,3 +134,12 @@ def test_lists_also_become_one_item_facts_for_tag_fields():
     assert "skills.item_1" not in profile.candidate_state()  # the model's page state gets the list once
     tried = {safe_id("skills.item_1")}
     assert safe_id("skills.item_1") not in profile.sources(exclude=tried)
+
+
+def test_a_dropdown_placeholder_read_with_the_label_is_not_part_of_the_question():
+    from jev_apply.profile import same_question
+
+    assert same_question("Current Salary", "Current Salary Select...")
+    assert same_question("Notice Period", "Notice Period * Select One")
+    assert same_question("Primary skills", "Primary skills 0 items selected")
+    assert not same_question("Current Salary", "Expected Salary Select...")

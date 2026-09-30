@@ -10,6 +10,9 @@
   "auto_submit": false,
   "submit_drafts": false,
   "login_wait_s": 900,
+  "confirm_wait_s": 15,
+  "per_company": 1,
+  "company_gap_days": 14,
   "max_actions": 200,
   "learned_answers": "learned.json",
 

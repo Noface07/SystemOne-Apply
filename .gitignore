@@ -8,6 +8,7 @@
 # Profiles, answers, résumés and everything a run learns about you. Only the *.example.json files are tracked.
 data/*
 !data/*.example.json
+!data/*.example.txt
 
 # Anything run from the project folder that holds your details or your job hunt.
 runs/
@@ -39,3 +40,6 @@ build/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# Benchmark runs: photos of forms filled with your details.
+bench/results/

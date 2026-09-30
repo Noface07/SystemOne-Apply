@@ -6,16 +6,15 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-# Choice questions offer every fact (TypeSafe accepts up to 255 categories; the Laya backend shortlists).
-# Keep room for DRAFT_ANSWER / ASK_USER / SKIP_FIELD.
-MAX_SOURCES = 240
-# Laya shortlists a field's facts and a chat model reads them as text: saved answers can keep growing there.
+# A choice question offers a field's facts: TypeSafe takes up to 255 options and Laya a handful, so both backends
+# get a shortlist of the facts sharing the field's words (model.fit_for_typesafe, laya_backend.shortlist). Saved
+# answers can keep growing; this is only a sanity bound on a profile.
+MAX_SOURCES = 240  # per question sent to TypeSafe, leaving room for DRAFT_ANSWER / ASK_USER / SKIP_FIELD
 MAX_SOURCES_SHORTLISTED = 1000
 
 
 def source_limit():
-    backend = (os.environ.get("DECISION_BACKEND") or "laya").strip().lower()
-    return MAX_SOURCES if backend == "typesafe" else MAX_SOURCES_SHORTLISTED
+    return MAX_SOURCES_SHORTLISTED
 
 
 MAX_ITEMS = 25  # lists up to this long also become one-item facts, for tag / multi-select fields
@@ -213,17 +212,37 @@ def undouble(text):
     return " ".join(words)
 
 
+PLACEHOLDER_TAIL = re.compile(
+    r"(\s*[*✱])?\s*(select\s*(one|an option)?|choose\s*(one|an option)?|please select|pick one|--|\d+ items? selected)"
+    r"\s*\.*\s*$",
+    re.I,
+)
+
+
 def same_question(a, b):
     """Is this the same question, asked again (another form, another job)? Whole text, or the part before the
     context ('Notice period' of 'Notice period — Select...'), ignoring case, punctuation and '*'."""
 
     def forms(q):
         q = undouble(q)
+        # A dropdown's placeholder read with its label ("Current Salary Select...") is not part of the question.
+        q = PLACEHOLDER_TAIL.sub("", str(q))
         whole = re.sub(r"[^0-9a-z]", "", str(q).lower())
         head = re.sub(r"[^0-9a-z]", "", str(q).split(" — ")[0].lower())
         return {x for x in (whole, head) if len(x) >= 8}
 
     return bool(forms(a) & forms(b))
+
+
+def answers(saved, asked):
+    """Does a saved answer to `saved` answer `asked`? The same question, or a years-of-experience question about
+    the same skill in other words ('...with React?' answers '...experience in React.js')."""
+    if same_question(saved, asked):
+        return True
+    from .skills import asked_skill
+
+    skill = asked_skill(asked)
+    return bool(skill) and asked_skill(saved) == skill
 
 
 def native_date(value, input_type):
@@ -375,7 +394,7 @@ class Profile:
 
     def saved_answer(self, question):
         """Your saved answer to this question if you answered it before (here or on another form), else None."""
-        return next((a for q, a in self.saved.items() if same_question(q, question)), None)
+        return next((a for q, a in self.saved.items() if answers(q, question)), None)
 
     def add_pending(self, entries):
         """Questions an unattended run couldn't answer, added (once each) to QUESTIONS.md. Returns how many are open."""

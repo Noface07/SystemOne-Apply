@@ -168,6 +168,7 @@ def test_invalid_choice_is_rejected(mutation):
 
 def test_choose_builds_operation_specific_heads_and_uses_only_the_selected_one(monkeypatch):
     monkeypatch.setenv("DECISION_BACKEND", "typesafe")  # one request with every head; Laya is in test_laya.py
+    monkeypatch.setenv("DECISION_STEERING", "model")  # the model-steers mode (procedure is the default)
     sent = {}
 
     def fake(body):
@@ -635,3 +636,80 @@ def test_a_declaration_you_answered_yes_is_ticked_on_later_forms(tmp_path):
     agent = loop.Agent(FakeBrowser([page]), no, Policy(), UnattendedFakeUI(), run_dir=tmp_path / "runs")
     agent.page = page
     assert not agent.matches_profile(criminal)
+
+
+def test_jev_gets_the_same_procedure_and_a_shortlist_within_its_limit(monkeypatch):
+    from jev_apply import planner
+
+    monkeypatch.setenv("DECISION_BACKEND", "typesafe")
+    monkeypatch.delenv("DECISION_STEERING", raising=False)
+    assert model.steering() == "procedure"  # Laya and Jev both answer inside planner.py's procedure
+    monkeypatch.setenv("DECISION_STEERING", "model")
+    assert model.steering() == "model"
+    monkeypatch.delenv("DECISION_STEERING")
+
+    monkeypatch.setenv("TYPESAFE_API_KEY", "test")
+    sent = {}
+
+    def fake_post(url, key, body):
+        sent.update(body)
+        ids = list(body["questions"]["source"]["criteria"])
+        return {"answers": {"source": {"choice": ids[0], "confidence": 0.9,
+                                       "probabilities": {k: (1.0 if k == ids[0] else 0.0) for k in ids}}}}  # fmt: skip
+
+    monkeypatch.setattr(model, "post_json", fake_post)
+    criteria = {f"fact_{i}": f"fact number {i}" for i in range(400)} | {"notice_days": "notice period in days"}
+    criteria |= {k: v for k, v in model.SPECIAL.items()}
+    body = {
+        "state": {"field": {"label": "Notice period (days)"}},
+        "questions": {"source": {"type": "choice", "criteria": criteria}},
+    }
+    result, _ = model.systemone(body)
+    offered = sent["questions"]["source"]["criteria"]
+    assert len(offered) <= model.MAX_TYPESAFE_CHOICES and "notice_days" in offered and "ASK_USER" in offered
+    assert set(result["answers"]["source"]["probabilities"]) == set(criteria)  # dropped options reported as 0
+    assert planner  # the procedure module stays importable alongside model
+
+
+def test_the_sites_confirmation_is_waited_for_after_submit(make_agent, monkeypatch):
+    monkeypatch.setattr(loop.time, "sleep", lambda s: None)
+    before = make_page()
+    sent = {**make_page(), "text": "Your application was sent to Example Corp!"}
+    agent = make_agent([before, before, sent], ui=UnattendedFakeUI(), confirm_wait_s=10)
+    agent.page = agent.browser.observe()
+    assert agent.wait_for_confirmation() and "sent" in agent.page["text"]
+    clock = iter(range(0, 1000, 5))
+    monkeypatch.setattr(loop.time, "monotonic", lambda: next(clock))
+    quiet = make_agent([before], ui=UnattendedFakeUI(), confirm_wait_s=10)
+    quiet.page = quiet.browser.observe()
+    assert not quiet.wait_for_confirmation()
+
+
+def test_a_captcha_submit_is_left_for_you_and_the_batch_moves_on(make_agent):
+    page = {**make_page(), "url": "https://jobs.lever.co/acme/123/apply"}
+    agent = make_agent([page], ui=UnattendedFakeUI(), auto_submit=True)
+    agent.page = page
+    agent.not_ready = lambda: []
+    submit = action(page, "e4")
+    assert agent.submit(submit, decision("CLICK", submit))
+    assert agent.status == "ready to submit (captcha)" and not agent.browser.acts  # nothing clicked
+    assert any("captcha" in x["why"] for x in agent.left)
+    plain = make_agent([make_page()], ui=UnattendedFakeUI(), auto_submit=True)
+    plain.page = make_page()
+    assert not plain.needs_a_person()  # FakeBrowser has no hCaptcha
+
+
+def test_answers_from_the_form_are_used_for_that_run_only(make_agent):
+    agent = make_agent([make_page()], ui=UnattendedFakeUI())
+    agent.answers = {"Notice Period": "15 Days"}
+    agent.status = "done"  # nothing to fill: only the answers' lifetime is checked
+    seen = {}
+    real_finish = agent.finish
+
+    def finish():
+        seen["during"] = agent.profile.saved_answer("Notice Period")
+        return real_finish()
+
+    agent.finish = finish
+    agent.run()
+    assert agent.profile.saved_answer("Notice Period") is None  # never saved beyond the run

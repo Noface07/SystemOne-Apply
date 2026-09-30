@@ -11,6 +11,8 @@ from a model's imagination. By default it stops at the final **Submit** button s
   skills, years per technology) are answered by plain code from your profile.
 - **Laya for every other choice.** [Laya](https://huggingface.co/convaiinnovations/laya) is an open-weights
   decision model that runs locally. It only ever picks *which* of your facts or options answers a question.
+  One line in `.env` switches that role to TypeSafe's [Jev](https://typesafe.ai) instead
+  ([Choosing the decision model](#choosing-the-decision-model)).
 - **Claude for text only.** Open questions ("Why do you want to join us?") are drafted through the
   [Claude Code](https://docs.anthropic.com/en/docs/claude-code) CLI on your own Claude login, with no tools and
   no file access. Or leave drafting off and answer them yourself.
@@ -26,6 +28,7 @@ from a model's imagination. By default it stops at the final **Submit** button s
 ## Contents
 
 1. [How it works](#how-it-works)
+   - [Choosing the decision model](#choosing-the-decision-model)
 2. [Quick start](#quick-start)
 3. [Your data](#your-data)
 4. [Running applications](#running-applications)
@@ -60,6 +63,21 @@ from a model's imagination. By default it stops at the final **Submit** button s
 4. **Check.** Low-confidence picks, sensitive fields, declarations and the final submit go through the guards.
 5. **Act and read back.** The action runs on the exact element observed, then the page is read again to confirm
    the value stuck.
+
+### Choosing the decision model
+
+Laya is the default. To let TypeSafe's Jev pick the answers instead, set two lines in `.env`:
+
+```bash
+DECISION_BACKEND=typesafe
+TYPESAFE_API_KEY=...            # from https://console.typesafe.ai/keys
+```
+
+Only *who picks the answer* changes. The same procedure walks the form. The same rules, guards, logins and
+submit checks apply either way. Long fact lists are shortlisted to TypeSafe's limit of 255 options per question,
+as they are for Laya. `TYPESAFE_MODEL` pins a version (default `jev-latest`). `DECISION_STEERING=model` lets the
+model also decide each step, which is the older mode and not recommended. Switch back with
+`DECISION_BACKEND=laya`. Laya runs locally and costs nothing per decision; Jev is a paid API.
 
 ---
 
@@ -102,6 +120,21 @@ Everything personal lives in `data/` and is git-ignored. Only the `*.example.jso
 | `policy.json` | Overrides of the safety defaults (only what you change) |
 | `documents/` | Résumé and cover letter; the only files that can ever be uploaded |
 | `applied.json` | Jobs submitted with `auto_submit`, so none is applied to twice |
+
+### Starting from your résumé
+
+```bash
+uv run jev-apply --data data/dotnet learn --resume data/dotnet/documents/cv.pdf
+```
+
+Plain code reads what a pattern can read exactly: name, email, phone, city, links, each job's company, title
+and dates, education with its grade and the skills listed under a skills heading. Claude Code (your own
+login, no tools) then fills only what code can't: a headline, one summary per job, total and relevant
+experience and years per skill, counted from the job dates. It is told to invent nothing and lists anything it
+had to judge under `_review`. The result goes to `profile.learned.json` with a list of every value that
+differs from your `profile.json`, which is never changed. Copy over what you want. Add `--no-claude` for
+the code-only draft. Check experience totals in particular: a résumé rarely separates an internship from the
+full-time job it led to.
 
 ### Several résumés, several profiles
 
@@ -152,6 +185,9 @@ never-fill list anyway.
 | `uv run jev-apply run URL` | One application, asking you when it needs you |
 | `uv run jev-apply run URL --step` | Ask before every action |
 | `uv run jev-apply batch jobs.txt` | Several jobs, one tab each, never asking (unattended) |
+| `uv run jev-apply scan boards.txt --keywords "c#,.net" --out jobs.txt` | Find matching jobs on Greenhouse, Lever and Ashby boards (see below) |
+| `uv run jev-apply preflight jobs.txt` | Read those forms ahead and send questions nothing can answer to `QUESTIONS.md` |
+| `uv run jev-apply learn --resume cv.pdf` | Draft a profile from your résumé into `profile.learned.json` |
 | `uv run jev-apply answer` | Answer the open questions of `QUESTIONS.md` in the terminal |
 
 Options go after the command, except `--data`, which goes first:
@@ -168,9 +204,64 @@ uv run jev-apply --data data/dotnet batch jobs/dotnet.txt --submit --browser chr
 | `--submit` | Submit complete applications (see below) |
 | `--unattended` | For `run`: never ask; leave what needs you and list it at the end |
 | `--note "..."` | Extra instruction, e.g. "apply for the Pune location" |
+| `--tracks a,b,c` | For `batch`: several profile folders; each job gets the one whose résumé fits it best |
+| `--plan-only` | For `batch`: print the plan (résumé per job, skill questions, deferrals) and stop |
 
 A **batch** file has one job or application URL per line (`#` starts a comment). At the end it prints, per job,
 what it filled, what it left and why it stopped. Every run writes a full report to `runs/<date-time>/report.json`.
+
+**Finding jobs with `scan`.** Greenhouse, Lever and Ashby list every open job through a public API. Their
+forms take applications without an account. List the company boards you care about in a file
+(`data/boards.example.txt` shows the format: `greenhouse:<token>`, `lever:<site>`, `ashby:<org>` or the board's
+address) and run:
+
+```bash
+uv run jev-apply --data data/dotnet scan data/boards.txt --keywords "c#,.net,asp.net" --out jobs/boards.txt
+uv run jev-apply --data data/dotnet batch jobs/boards.txt --submit
+```
+
+`scan` keeps a job when a keyword is in its title (or at least two are in the description, as whole words), when
+it is in India or remote without another country named (`--location` changes that), when it asks for no more
+years than you have (your completed years, or `--max-years`) and when it isn't senior, lead or staff
+(`--include-senior` keeps those). Jobs you already applied to are skipped. No model is involved.
+
+**Planning a batch.** Before any form opens, `batch` looks up each job (LinkedIn's public job page, or the
+Greenhouse, Lever and Ashby APIs) and prints a plan:
+
+```
+uv run jev-apply batch jobs.txt --tracks data/automation,data/dotnet,data/genai --submit
+   1. Zuci Systems · Dotnet Developer            résumé dotnet 2 skill question(s)
+   2. Zuci Systems · Dotnet Developer            résumé dotnet DEFERRED (Zuci Systems: already 1 application(s) in 14 days)
+   4. CoffeeBeans · Generative AI Engineer       résumé genai
+  16. Prodigal · Machine Learning Engineer       résumé genai 4 answer(s) from the form
+```
+
+- **Résumé per job.** With `--tracks`, each job gets the profile folder whose résumé lists the job's skills,
+  each skill weighted by how few of your tracks list it. The job title's skills count five times as much.
+- **Skill questions first.** "How many years with X?" is what most LinkedIn runs stop on. The skills a job
+  names in its title or at least twice in its description, which your profile has no years for, go to
+  `QUESTIONS.md` before the run (at most 5 per job). One answer serves every wording: "React", "React.js" and
+  "ReactJS" are one skill.
+- **Spread per company.** At most `per_company` applications to one company in any `company_gap_days`
+  window (1 in 14 days by default), counting `applied.json` and the batch itself. Extra jobs are deferred and
+  listed, not dropped. `"per_company": 0` turns it off.
+- **Answers from the form.** For Greenhouse, Lever and Ashby, every option your profile answers exactly (a
+  notice period of "15 Days", a salary range of "12 - 15 LPA") is handed to the run in the form's own words, so
+  searchable dropdowns get the right option. These answers are used for that job only and never saved.
+
+**Reading forms ahead with `preflight`.** Greenhouse, Lever and Ashby also publish each application form:
+every question, its options and whether it is required. `preflight` reads them before any browser opens and
+sorts each question by who will answer it: a rule or your profile, a saved answer, your résumé, Laya, a draft,
+or nobody yet. The last kind goes to `QUESTIONS.md`, so you answer it once *before* the batch instead of after
+it stops. `batch --preflight` does this first on its own. Nothing is filled or sent.
+
+```
+https://job-boards.greenhouse.io/acme/jobs/123
+  14 questions: 2 ASK, 1 Laya, 9 profile, 1 résumé, 1 skip
+    profile       How many years of work experience do you have?        2 years
+    Laya          Undergraduate Institution Name                        picks among 49 options
+  ? ASK           Are you comfortable working from office 5 days a week? only you can say
+```
 
 **Logins.** The agent never types into a sign-in page. In an unattended run it brings the tab to the front, prints
 **LOGIN NEEDED** and waits (15 minutes by default) while you sign in or create the account, then carries on.
@@ -189,8 +280,14 @@ unattended run then clicks the final Submit **only when the application is compl
 - no model-written draft is unread (unless `"submit_drafts": true`).
 
 Anything else stops before Submit and says why. A watched run asks "Submit this application now?" first. After
-submitting, the job is recorded in `applied.json` and never submitted again, whatever address it comes under
+clicking Submit it watches for the site's own confirmation ("Your application was sent", "Thank you for
+applying") for up to `confirm_wait_s` seconds, then records the job in `applied.json` and never submitted again, whatever address it comes under
 (LinkedIn, Indeed and Naukri job ids, Greenhouse, Lever and Ashby postings).
+
+**Captchas (Lever).** Lever runs an hCaptcha when you click Submit. So does any form carrying one. The
+agent never solves a captcha: it fills the whole form, brings the tab to the front, prints **SUBMIT YOURSELF**,
+marks the job "ready to submit (captcha)" and moves on to the next job. The tab stays open for you. `scan`
+marks Lever jobs so you know in advance.
 
 **Consent boxes.** With `"auto_consent": true`, a required checkbox that only agrees to a privacy notice or the
 site's terms is ticked. A box that also declares something about you (criminal record, background check, "the
@@ -271,7 +368,9 @@ The older route still works: leave `TEXT_MODEL_PROVIDER` empty and set `TEXT_MOD
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `DECISION_BACKEND` | `laya` | `laya` (local), `llm` (chat model via API) or `typesafe` (Jev via API) |
+| `DECISION_BACKEND` | `laya` | Who picks answers: `laya` (local), `typesafe` (Jev via API) or `llm` (chat model via API) |
+| `DECISION_STEERING` | `procedure` | `procedure`: the fixed procedure walks the form. `model`: the model also steers |
+| `TYPESAFE_API_KEY` / `TYPESAFE_MODEL` | *(empty)* / `jev-latest` | Only for `DECISION_BACKEND=typesafe` |
 | `LAYA_MODEL` / `LAYA_CHECKPOINT` / `LAYA_DEVICE` | Hugging Face repo, English, auto | Which Laya and where it runs |
 | `LAYA_MAX_LEN` / `LAYA_HEAD_MAX_LEN` / `LAYA_MAX_OPTIONS` | `2048` / `1024` / `20` | Token budgets and shortlist size |
 | `TEXT_MODEL_PROVIDER` | *(empty)* | `claude-code` to draft with the Claude Code CLI |
@@ -297,6 +396,8 @@ defaults in `jev_apply/policy.py`.
 | `auto_consent` | `false` | Tick required privacy / terms consent boxes |
 | `consent_patterns` / `declaration_patterns` | privacy notice, terms… / criminal, background, true… | What counts as plain consent; what makes a box a declaration |
 | `login_wait_s` | `900` | How long an unattended run waits at a sign-in page |
+| `confirm_wait_s` | `15` | How long to watch for the site's confirmation after Submit |
+| `per_company` / `company_gap_days` | `1` / `14` | At most this many applications per company in this many days (0: off) |
 | `confirm_patterns` | gender, caste, visa, salary, "i confirm"… | Fields that always need your yes |
 | `never_fill_patterns` | password, otp, aadhaar, pan card, bank… | Fields the agent never touches |
 | `submit_patterns` | submit, apply, send application, finish… | Buttons treated as a final submit. Cannot be empty |
@@ -311,10 +412,21 @@ Patterns match the start of words, ignoring case: `disab` matches "Disability"; 
 ## Testing and development
 
 ```bash
-uv run pytest                                               # 259 unit tests, offline
+uv run pytest                                               # 277 unit tests, offline
 uv run --extra playwright python scripts/local_check.py     # 69 real-browser checks on the built-in test forms
 uv run --extra playwright python scripts/dry_run.py         # a full application on the test site, nothing sent
 uv run ruff check . && uv run ruff format --check .
+```
+
+**Benchmark.** `scripts/bench.py` fills real application forms with your profile while every request that
+could save or submit is blocked, photographs each form top to bottom and has Claude Code (sandboxed: the
+photos go in with the prompt, no tools) grade every question against your profile as right, wrong, missed or
+couldn't. The judge never sees the agent's own log, so it grades what a recruiter would see. Results and photos
+go to `bench/results/`, which is git-ignored. The list of wrong and missed answers is what the rules get fixed
+from.
+
+```bash
+uv run --extra playwright --extra laya python scripts/bench.py jobs/boards.txt --data data/dotnet
 ```
 
 `scripts/probe_fields.py` measures how often Laya is *confidently wrong* on tricky wordings (current vs expected
@@ -340,12 +452,18 @@ jev-apply/
 │  ├─ policy.py         guard patterns and thresholds
 │  ├─ inbox.py          QUESTIONS.md
 │  ├─ applied.py        applied.json (never apply twice)
+│  ├─ scan.py           finds jobs on Greenhouse, Lever and Ashby boards
+│  ├─ preflight.py      reads those forms ahead; unknown questions to QUESTIONS.md
+│  ├─ learn.py          drafts a profile from a résumé (code, then Claude Code)
+│  ├─ jobinfo.py        a job's company, title and description (LinkedIn guest page, board APIs)
+│  ├─ jobplan.py        batch plan: résumé per job, skill questions, form answers, spread per company
+│  ├─ skills.py         technology names and aliases found in job descriptions
 │  ├─ transport.py      separate browser (Playwright) or your Chrome
 │  ├─ ui.py             terminal and unattended interfaces
-│  └─ cli.py            jev-apply run / batch / check / answer
+│  └─ cli.py            jev-apply run / batch / scan / preflight / learn / check / answer
 ├─ data/                *.example.json (your real files are git-ignored)
 ├─ fixtures/            built-in test application pages
-├─ scripts/             browser checks, dry run, probes
+├─ scripts/             browser checks, dry run, probes, bench.py (screenshot benchmark)
 └─ tests/               unit tests
 ```
 
@@ -376,5 +494,8 @@ reports and `data/` stay local and are git-ignored. Keep sensitive identifiers o
 ## Credits and license
 
 MIT, see [LICENSE](LICENSE). Based on [jev-ultrafast](https://github.com/browser-use/jev-ultrafast) by Browser Use
-(MIT). Laya is a model by Convai Innovations (Apache-2.0). Jev is a model by TypeSafe. Not affiliated with any of
+(MIT). Job discovery, reading forms ahead, résumé learning, the screenshot benchmark and the post-submit
+confirmation wait follow ideas from
+[TheAdaply/jev-apply](https://github.com/TheAdaply/jev-apply) (MIT). Laya is a model by Convai Innovations
+(Apache-2.0). Jev is a model by TypeSafe. Not affiliated with any of
 them.

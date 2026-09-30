@@ -43,11 +43,23 @@ Read this before changing `agent.py`, `browser.py`, `snapshot.js` or `policy.py`
 14. **The Laya backend doesn't steer.** `planner.py` decides the step (a fixed procedure); Laya is only asked which
     option answers one question, with a handful of options. Keep it that way: Laya's option budget is small.
 
+15. **Claude only writes text and never acts.** Every Claude Code call goes through `model.claude_code`: no tools,
+    no MCP servers, an empty working folder, untrusted input (job pages, résumés, photos) passed in as data.
+    Claude drafts open answers, fills gaps in a résumé-learned draft and judges the benchmark. It never
+    decides a field, clicks or submits: Laya (or Jev with `DECISION_BACKEND=typesafe`) does that inside
+    `planner.py`'s procedure, whichever backend is set.
+16. **`learn` never touches `profile.json`.** It writes `profile.learned.json`; code-extracted facts win over
+    Claude's additions.
+17. **A captcha is never solved.** A form whose Submit runs one (Lever, any hCaptcha) ends at
+    "ready to submit (captcha)" with the tab left open; the batch moves on.
+18. **Reading ahead sends nothing.** `scan` and `preflight` only read public board APIs and pages; `bench.py`
+    blocks every saving or submitting request in the browser.
+
 ## Checks
 
 ```bash
 uv run pytest
-uv run --extra playwright python scripts/local_check.py   # must print 66/66
+uv run --extra playwright python scripts/local_check.py   # must print 69/69
 uv run --extra playwright python scripts/dry_run.py       # must end: status=review ... unconfirmed=0 not_added=['Kafka'] submitted=False
 uv run ruff check . && uv run ruff format --check .
 ```

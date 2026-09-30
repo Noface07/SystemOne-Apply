@@ -22,9 +22,15 @@ from .questions import GOAL, SPECIAL
 
 FILLS = {"fill", "select", "setdate", "upload"}
 # What sites say once an application went through.
+# A challenge a person must answer before the form sends: hCaptcha's frame or its response field.
+CAPTCHA_CHECK = (
+    '!!document.querySelector(\'iframe[src*="hcaptcha.com"],textarea[name="h-captcha-response"],'
+    "[data-hcaptcha-widget-id],.h-captcha')"
+)
 SUBMITTED = re.compile(
     r"thank you for (applying|your application|your interest)|application (was |has been )?(sent|submitted|received)|"
-    r"successfully (applied|submitted)|we'?ve received your application|your application is (in|on its way)",
+    r"successfully (applied|submitted)|we'?ve received your application|your application is (in|on its way)|"
+    r"thanks? (you )?for (applying|submitting)|we have received your application|application (is )?complete",
     re.I,
 )
 # Buttons that finish an application whatever page they are on. Never clicked unattended.
@@ -52,8 +58,9 @@ def form_state(page):
 
 
 class Agent:
-    def __init__(self, browser, profile, policy, ui, *, note="", run_dir="runs"):
+    def __init__(self, browser, profile, policy, ui, *, note="", run_dir="runs", answers=None, company=""):
         self.browser, self.profile, self.policy, self.ui = browser, profile, policy, ui
+        self.answers, self.company = dict(answers or {}), company
         self.goal = GOAL + (f"\nCandidate's note: {note.strip()}" if note and note.strip() else "")
         self.run_dir = Path(run_dir)
         self.history, self.fills, self.decisions, self.handovers, self.asked = [], [], [], [], []
@@ -83,11 +90,18 @@ class Agent:
             self.ui.event(f"Already submitted on {done['at']}: skipped.")
             self.status = "already applied"
             return self.finish()
+        # Answers this job's own form definition gives (Greenhouse / Lever / Ashby): each is an option your profile
+        # already answers, in the form's exact words. Used for this run only, never saved.
+        added = {q: a for q, a in self.answers.items() if not self.profile.saved_answer(q)}
+        self.profile.saved.update(added)
         try:
             while self.status == "ready":
                 self.tick()
         except Stop:
             self.status = "stopped"
+        finally:
+            for question in added:
+                self.profile.saved.pop(question, None)
         return self.finish()
 
     def tick(self):
@@ -132,7 +146,11 @@ class Agent:
         if operation == "APPLIED":
             self.status = "applied"  # Naukri, auto-apply on: the site says the application went through
             applied.record(
-                self.applied_path(), [self.start_url, self.page["url"]], "applied", self.page.get("title", "")
+                self.applied_path(),
+                [self.start_url, self.page["url"]],
+                "applied",
+                self.page.get("title", ""),
+                company=self.company,
             )
             return
         if operation == "BLOCKED":
@@ -379,6 +397,18 @@ class Agent:
             return False
         if not self.unattended and not self.ui.approve(f"Submit this application now ('{action['label']}')?", ""):
             return False
+        if self.needs_a_person():
+            # Lever (and any hCaptcha form): Submit opens a challenge only a person can answer. Leave the filled
+            # form for you, say so, and let the batch move on.
+            self.browser.show()
+            self.ui.event(
+                f"\a!!! SUBMIT YOURSELF: '{action['label']}' needs a captcha only you can solve. The form is filled "
+                f"in the open tab: {self.page['url'][:120]}"
+            )
+            self.left.append({"what": f"Click '{action['label']}' and solve the captcha", "why": "captcha",
+                              "url": self.page["url"]})  # fmt: skip
+            self.status = "ready to submit (captcha)"
+            return True
         before = self.page
         self.execute(action, d, source="submitted (auto_submit)")
         refused = planner.invalid_fields(self.page["actions"]) or (
@@ -388,10 +418,44 @@ class Agent:
             self.left.append({"what": "Submit was refused by the site", "why": "see the page", "url": self.page["url"]})
             self.status = "stopped"
             return True
-        confirmed = SUBMITTED.search(self.page.get("text", "")) or planner.APPLIED.search(self.page.get("text", ""))
+        confirmed = self.wait_for_confirmation()
         self.status = "submitted" if confirmed else "submitted (no confirmation seen)"
-        applied.record(self.applied_path(), [self.start_url, before["url"]], self.status, before.get("title", ""))
+        applied.record(
+            self.applied_path(),
+            [self.start_url, before["url"]],
+            self.status,
+            before.get("title", ""),
+            company=self.company,
+        )
         return True
+
+    def needs_a_person(self):
+        """Does this form's Submit run a challenge only a person can answer? Lever always does (hCaptcha); any
+        page carrying an hCaptcha does too. Invisible reCAPTCHA passes by itself and doesn't count."""
+        if re.search(r"^https?://jobs(\.eu)?\.lever\.co/", self.page.get("url", "")):
+            return True
+        check = getattr(self.browser, "evaluate", None)
+        try:
+            return bool(check) and check(CAPTCHA_CHECK) is True
+        except (StalePage, RuntimeError):
+            return False
+
+    def wait_for_confirmation(self):
+        """After Submit: the site's own confirmation ("Your application was sent", "Thank you for applying"),
+        which often appears a moment later (LinkedIn's pop-up, a redirect to a thank-you page). Nothing is
+        clicked while waiting."""
+        deadline = time.monotonic() + self.policy.confirm_wait_s
+        while True:
+            text = self.page.get("text", "")
+            if SUBMITTED.search(text) or planner.APPLIED.search(text) or planner.APPLIED_AGO.search(text):
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(1)
+            try:
+                self.page = self.browser.observe()
+            except StalePage:
+                continue  # the site is navigating to its confirmation page
 
     def do_select(self, action, d, low):
         option = action["label"].split(" → ", 1)[-1]

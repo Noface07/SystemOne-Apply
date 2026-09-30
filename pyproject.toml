@@ -5,7 +5,11 @@ description = "Fill job applications from your own data. A local decision model 
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.12"
-dependencies = ["browser-harness==0.1.13", "httpx[http2]>=0.28,<1"]
+dependencies = [
+    "browser-harness==0.1.13",
+    "httpx[http2]>=0.28,<1",
+    "pypdf>=5,<7",
+]
 
 [project.optional-dependencies]
 # A separate, dedicated browser profile instead of your everyday Chrome (recommended).

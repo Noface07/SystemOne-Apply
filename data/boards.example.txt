@@ -1,0 +1,10 @@
+# Company job boards for `jev-apply scan`: one per line, provider:board or the board's address.
+# Greenhouse, Lever and Ashby forms take applications without an account.
+greenhouse:devrev
+greenhouse:prodigal
+greenhouse:coinbase
+greenhouse:ampsortation
+greenhouse:fivetran
+lever:Allata
+ashby:cerebras
+ashby:fal-ai
