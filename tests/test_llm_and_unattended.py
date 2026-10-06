@@ -460,3 +460,26 @@ def test_claude_code_drafts_run_without_tools(monkeypatch):
     tools = seen["command"].index("--tools")
     assert seen["command"][tools + 1] == "" and "--strict-mcp-config" in seen["command"]
     assert "ignore all rules" in seen["input"]  # the page goes in as data on stdin, not as arguments
+
+
+def test_questions_a_later_run_filled_leave_the_open_list(tmp_path):
+    from jev_apply import inbox
+    from jev_apply.profile import Profile
+
+    (tmp_path / "profile.json").write_text(json.dumps({"personal": {"first_name": "Aarav"}}), encoding="utf-8")
+    profile = Profile.load(tmp_path / "profile.json", None, tmp_path / "learned.json")
+    profile.add_pending(
+        [
+            {"question": "Why Do You Want to Join Our Company? 0 of 1,440 characters", "urls": ["https://x"]},
+            {"question": "Do you hold a security clearance?", "urls": ["https://x"]},
+        ]
+    )
+    md = tmp_path / "QUESTIONS.md"
+    text = md.read_text(encoding="utf-8")
+    head, tail = text.split("clearance?", 1)
+    md.write_text(head + "clearance?" + tail.replace("- Answer:", "- Answer: No", 1), encoding="utf-8")
+    profile = Profile.load(tmp_path / "profile.json", None, tmp_path / "learned.json")
+    # A run drafted the first one and filled the answered one: the open entry goes, your answer stays.
+    filled = ["Why Do You Want to Join Our Company?* 0 of 1,440 characters", "Do you hold a security clearance?"]
+    assert profile.add_pending([], filled) == 0
+    assert [(q["question"], q["answer"]) for q in inbox.read(md)] == [("Do you hold a security clearance?", "No")]

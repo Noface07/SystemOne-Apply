@@ -396,14 +396,18 @@ class Profile:
         """Your saved answer to this question if you answered it before (here or on another form), else None."""
         return next((a for q, a in self.saved.items() if answers(q, question)), None)
 
-    def add_pending(self, entries):
-        """Questions an unattended run couldn't answer, added (once each) to QUESTIONS.md. Returns how many are open."""
+    def add_pending(self, entries, done=()):
+        """Questions an unattended run couldn't answer, added (once each) to QUESTIONS.md. Returns how many are open.
+        `done`: questions this run filled from your profile or a draft; still-open entries for them are dropped, so
+        the file lists only what really needs you."""
         from . import inbox
 
         path = self.questions_path
         if not path:
             return 0
         known = inbox.read(path)
+        before = len(known)
+        known = [q for q in known if q.get("answer") or not any(same_question(q["question"], d) for d in done)]
         for entry in entries:
             if self.saved_answer(entry["question"]):
                 continue
@@ -420,7 +424,7 @@ class Profile:
                         "answer": "",
                     }
                 )
-        if entries or path.is_file():
+        if entries or len(known) != before:
             inbox.write(path, known)
         return sum(1 for q in known if not q.get("answer"))
 

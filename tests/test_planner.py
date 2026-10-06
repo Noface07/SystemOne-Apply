@@ -753,3 +753,64 @@ def test_a_file_already_in_the_list_is_not_uploaded_again(laya):
 def test_a_label_that_says_type_to_add_is_a_search_prompt():
     assert planner.is_prompt({"kind": "fill", "role": "textbox", "label": "Type to Add Skills"})
     assert not planner.is_prompt({"kind": "fill", "role": "textbox", "label": "Skills you would like to learn"})
+
+
+def test_a_saved_resume_that_does_not_stay_selected_stops_the_run(laya):
+    candidate = {**CANDIDATE, "document.resume": "Aarav_Sharma_Resume_GenAI.pdf"}
+    cards = [
+        {
+            "id": f"c{n}",
+            "node": n,
+            "kind": "click",
+            "role": "radio",
+            "label": label,
+            "checked": checked,
+            "context": "Resume*",
+        }  # fmt: skip
+        for n, label, checked in (
+            (1, "v4_Aarav_Sharma_Resume_CSharp_DotNET.pdf", "true"),
+            (2, "Aarav_Sharma_Resume_GenAI.pdf", "false"),
+        )
+    ]
+    url = "https://www.linkedin.com/jobs/view/1/"
+    clicked = [{"kind": "click", "action": cards[1]["label"], "url": url, "context": "Resume*"}]
+    d = model.choose({**page(*cards, button(3, "Next")), "url": url}, "goal", clicked, candidate)
+    assert d["operation"] == "BLOCKED" and "didn't stay selected" in d["reason"]
+
+
+def test_a_saved_resume_scrolled_out_of_view_is_scrolled_back_to_never_uploaded_again(laya):
+    # LinkedIn moves the chosen résumé to the top of its list; after scrolling down only the others are on screen,
+    # though the list still names it.
+    candidate = {**CANDIDATE, "document.resume": "Aarav_Sharma_Resume_CSharp_DotNET.pdf"}
+    listing = (
+        "PDF Aarav_Sharma_GenAI.pdf 10/1/2026 PDF v4_Aarav_Sharma_Resume_CSharp_DotNET.pdf 9/25/2026 PDF Resume-.pdf"
+    )
+    cards = [
+        {
+            "id": f"c{n}",
+            "node": n,
+            "kind": "click",
+            "role": "radio",
+            "label": label,
+            "checked": "false",
+            "context": listing,
+        }  # fmt: skip
+        for n, label in ((1, "Aarav_Sharma_GenAI.pdf"), (2, "Resume-.pdf"))
+    ]
+    upload = {"id": "u1", "node": 9, "kind": "click", "role": "button", "label": "Upload resume", "context": listing}
+    up = {"id": "scroll_up", "kind": "scroll", "label": "Scroll up inside the form panel", "delta": -400}
+    url = "https://www.linkedin.com/jobs/view/1/"
+    shown = {**page(*cards, upload, up, button(3, "Next")), "url": url}
+    d = model.choose(shown, "goal", [], candidate)
+    assert d["operation"] == "SCROLL_UP" and d["action"]["id"] == "scroll_up"
+    # Clicked, then seen again after scrolling up: on to Next, no second copy uploaded.
+    seen = [
+        {"kind": "click", "action": "v4_Aarav_Sharma_Resume_CSharp_DotNET.pdf", "url": url, "context": listing},
+        {"kind": "scroll", "action": "Scroll up inside the form panel", "url": url},
+    ]
+    d = model.choose(shown, "goal", seen, candidate)
+    assert d["operation"] != "UPLOAD" and d["action"]["label"] == "Next"
+    # Never picked and never in view after scrolling: yours to choose, not an upload.
+    tried = [{"kind": "scroll", "action": "Scroll up inside the form panel", "url": url}] * 4
+    d = model.choose(shown, "goal", tried, candidate)
+    assert d["operation"] == "BLOCKED" and "saved list" in d["reason"]

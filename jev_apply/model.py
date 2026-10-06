@@ -4,6 +4,7 @@ Decision backends (DECISION_BACKEND in .env):
   laya      default. Laya, open weights, runs locally in this process (see laya_backend.py). No key, no network
             after the first download.
   typesafe  Jev through the TypeSafe API (or a compatible gateway). Needs TYPESAFE_API_KEY.
+  clef      Cloudflare's Clef-Flash (9B, open weights) on this machine, served by llama-server (clef_backend.py).
   llm       a general chat model through any OpenAI-compatible API (e.g. OpenRouter); see llm_backend.py.
 
 Whatever the backend, rules.py answers the common fields (CTC, notice period, experience...) first.
@@ -17,7 +18,7 @@ import time
 
 import httpx
 
-from . import laya_backend, llm_backend, planner, rules
+from . import clef_backend, laya_backend, llm_backend, planner, rules
 from .questions import DOCUMENT, DRAFT, NEXT_ACTION, SPECIAL, TARGET, VALUE_SOURCE
 
 CLIENT = httpx.Client(http2=True, timeout=25)
@@ -80,10 +81,13 @@ def post_json(url, key, body):
     raise RuntimeError("Model unavailable")
 
 
+BACKENDS = ("laya", "clef", "typesafe", "llm")
+
+
 def backend():
     name = os.environ.get("DECISION_BACKEND", "laya").strip().lower() or "laya"
-    if name not in {"laya", "typesafe", "llm"}:
-        raise RuntimeError(f"DECISION_BACKEND must be 'laya', 'typesafe' or 'llm', not {name!r}.")
+    if name not in BACKENDS:
+        raise RuntimeError(f"DECISION_BACKEND must be one of {', '.join(BACKENDS)}, not {name!r}.")
     return name
 
 
@@ -101,18 +105,20 @@ MAX_TYPESAFE_CHOICES = 255
 
 
 def fit_for_typesafe(body):
-    """Shortlist choice questions longer than TypeSafe allows, like the Laya backend does: the options sharing the
+    return fit_options(body, MAX_TYPESAFE_CHOICES)
+
+
+def fit_options(body, limit):
+    """Shortlist choice questions longer than `limit` options, like the Laya backend does: the options sharing the
     field's words are kept, ASK_USER and the other exits always. Returns (body, dropped option ids per question)."""
     questions, dropped = {}, {}
     for qid, question in body["questions"].items():
         criteria = question.get("criteria") or {}
-        if question.get("type") == "choice" and len(criteria) > MAX_TYPESAFE_CHOICES:
+        if question.get("type") == "choice" and len(criteria) > limit:
             state = body.get("state") or {}
             query = laya_backend.query_text(state) if isinstance(state.get("field"), dict) else json.dumps(question)
             protected = sum(1 for k in criteria if k in laya_backend.PROTECTED)
-            kept = laya_backend.shortlist(
-                query, {k: str(v) for k, v in criteria.items()}, MAX_TYPESAFE_CHOICES - protected
-            )
+            kept = laya_backend.shortlist(query, {k: str(v) for k, v in criteria.items()}, limit - protected)
             dropped[qid] = [k for k in criteria if k not in kept]
             question = {**question, "criteria": {k: criteria[k] for k in kept}}
         questions[qid] = question
@@ -123,6 +129,10 @@ def systemone(body):
     if backend() in {"laya", "llm"}:
         started = time.perf_counter()
         result = (laya_backend if backend() == "laya" else llm_backend).system_one(body)
+        return result, round((time.perf_counter() - started) * 1000)
+    if backend() == "clef":
+        started = time.perf_counter()
+        result = clef_backend.system_one(body)
         return result, round((time.perf_counter() - started) * 1000)
     base = os.environ.get("TYPESAFE_BASE_URL", "https://api.typesafe.ai").rstrip("/")
     key = os.environ.get("TYPESAFE_API_KEY")

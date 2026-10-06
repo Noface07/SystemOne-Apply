@@ -849,7 +849,12 @@ def choose(page, candidate, exclude=(), history=()):
             # Workday and others empty the file input once the file is in their list ("x.pdf successfully
             # uploaded", "Delete x.pdf"): an empty input then is not a missing file. Never upload it twice.
             stems = [norm(re.sub(r"\.\w{2,4}$", "", n)) for n in names]
-            shown = norm(page.get("text", "") + " " + " ".join(o["label"] for o in actions))
+            # The list around a file field names saved files even when their cards are scrolled out of view.
+            shown = norm(
+                " ".join(
+                    [page.get("text", ""), *(o["label"] for o in actions), *(o.get("context") or "" for o in actions)]
+                )
+            )
             uploaded = any(
                 h.get("url") == url and h.get("kind") == "upload" and h.get("action") == a["label"] for h in history
             )
@@ -893,6 +898,45 @@ def choose(page, candidate, exclude=(), history=()):
                 mine = next((o for o in group if any(n and n in norm(o["label"]) for n in names)), None)
                 if mine and not is_on(mine) and not touched(history, url, label=mine["label"]):
                     return decision("CLICK", mine)
+                if mine and not is_on(mine):
+                    # Clicked and still not selected: going on would send whichever résumé the site preselected.
+                    return decision(
+                        "BLOCKED",
+                        None,
+                        reason=f"Your résumé ({mine['label'][:60]}) didn't stay selected among the site's saved "
+                        "résumés: select it yourself before sending, or another résumé goes with this application.",
+                    )
+                listed = [n for n in names if n and n in norm(a["context"])]
+                if not mine and listed:
+                    # The list names your résumé but its card is out of view (LinkedIn moves the selected one to the
+                    # top, above the scrolled panel): bring it back into view, never upload another copy.
+                    picked = [
+                        i
+                        for i, h in enumerate(history)
+                        if h.get("url") == url
+                        and h.get("kind") == "click"
+                        and any(n in norm(str(h.get("action"))) for n in listed)
+                    ]
+                    ups = [
+                        i
+                        for i, h in enumerate(history)
+                        if h.get("url") == url
+                        and h.get("kind") == "scroll"
+                        and str(h.get("action")).startswith("Scroll up")
+                    ]
+                    if picked and any(i > picked[-1] for i in ups):
+                        continue  # seen since the click (not selected then would have stopped the run above)
+                    up = next((o for o in actions if o.get("id") == "scroll_up"), None)
+                    if up and len(ups) < 4:
+                        return decision("SCROLL_UP", up)
+                    if picked:
+                        continue
+                    return decision(
+                        "BLOCKED",
+                        None,
+                        reason="Your résumé is in the site's saved list but its card couldn't be brought into view: "
+                        "select it yourself.",
+                    )
                 button = next(
                     (
                         o

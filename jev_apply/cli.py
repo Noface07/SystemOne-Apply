@@ -46,13 +46,17 @@ def backend_problem():
     name = (os.environ.get("DECISION_BACKEND", "laya") or "laya").strip().lower()
     if name == "typesafe":
         return None if os.environ.get("TYPESAFE_API_KEY") else "set TYPESAFE_API_KEY in .env (see .env.example)"
+    if name == "clef":
+        from .clef_backend import problem
+
+        return problem()
     if name == "llm":
         from .llm_backend import settings as llm_settings
 
         s = llm_settings()
         return None if s["key"] and s["model"] else "set DECISION_MODEL and DECISION_API_KEY (or TEXT_MODEL_*) in .env"
     if name != "laya":
-        return f"DECISION_BACKEND must be 'laya', 'typesafe' or 'llm', not {name!r}"
+        return f"DECISION_BACKEND must be 'laya', 'clef', 'typesafe' or 'llm', not {name!r}"
     from .laya_backend import installed
 
     return None if installed() else "Laya isn't installed: run `uv sync --extra laya`"
@@ -84,6 +88,12 @@ def check(args):
             f"  model {s['model']} at {s['base']}"
             + (f", paced {s['min_interval']}s apart" if s["min_interval"] else "")
         )
+    if name == "clef" and not problem:
+        from .clef_backend import healthy, settings
+
+        s = settings()
+        where = "running" if healthy(s["base"]) else f"started on demand from {s['path']}"
+        print(f"  {s['model']} at {s['base']} ({where}), shortlist {s['max_options']}")
     if name == "laya" and not problem:
         from .laya_backend import settings
 
@@ -113,6 +123,15 @@ def prepare_model():
     problem = backend_problem()
     if problem:
         sys.exit(problem[0].upper() + problem[1:] + ".")
+    if (os.environ.get("DECISION_BACKEND", "laya") or "laya").strip().lower() == "clef":
+        from .clef_backend import healthy, prepare
+
+        if not healthy():
+            print("Starting Clef (llama-server; loading 6 GB onto the GPU takes a minute)...")
+        try:
+            prepare()
+        except Exception as error:  # nothing has been opened yet
+            sys.exit(f"Couldn't start Clef: {error}")
     if (os.environ.get("DECISION_BACKEND", "laya") or "laya").strip().lower() == "laya":
         from .laya_backend import agent as load_laya
 

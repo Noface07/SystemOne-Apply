@@ -900,7 +900,14 @@ class Agent:
         }
         if self.unattended and self.status != "submitted":
             self.inbox += self.unanswered_entries()
-        report["pending_total"] = self.profile.add_pending(self.inbox)
+        done = [
+            q
+            for h in self.history
+            if h.get("kind") == "fill" and h.get("source") in {"profile", "saved", "draft"}
+            for q in (h.get("action"), h.get("context"))
+            if q
+        ]
+        report["pending_total"] = self.profile.add_pending(self.inbox, done)
         Path(report["path"]).write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
         self.ui.review(report)
         return report

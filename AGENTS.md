@@ -42,11 +42,13 @@ Read this before changing `agent.py`, `browser.py`, `snapshot.js` or `policy.py`
 
 14. **The Laya backend doesn't steer.** `planner.py` decides the step (a fixed procedure); Laya is only asked which
     option answers one question, with a handful of options. Keep it that way: Laya's option budget is small.
+    The same holds for Clef (`clef_backend.py`, llama-server's `/v1/systemone`): it shortlists like Laya
+    (`model.fit_options`, PROTECTED kept, dropped options at probability 0) and never steers.
 
 15. **Claude only writes text and never acts.** Every Claude Code call goes through `model.claude_code`: no tools,
     no MCP servers, an empty working folder, untrusted input (job pages, résumés, photos) passed in as data.
     Claude drafts open answers, fills gaps in a résumé-learned draft and judges the benchmark. It never
-    decides a field, clicks or submits: Laya (or Jev with `DECISION_BACKEND=typesafe`) does that inside
+    decides a field, clicks or submits: Laya, Clef or Jev (`DECISION_BACKEND`) does that inside
     `planner.py`'s procedure, whichever backend is set.
 16. **`learn` never touches `profile.json`.** It writes `profile.learned.json`; code-extracted facts win over
     Claude's additions.
@@ -54,6 +56,13 @@ Read this before changing `agent.py`, `browser.py`, `snapshot.js` or `policy.py`
     "ready to submit (captcha)" with the tab left open; the batch moves on.
 18. **Reading ahead sends nothing.** `scan` and `preflight` only read public board APIs and pages; `bench.py`
     blocks every saving or submitting request in the browser.
+19. **QUESTIONS.md holds only what the résumé and the job page can't settle.** Before a question is asked, a rule
+    maps it to a profile fact (certifications, notice period, a skill's years under another name: "REST APIs" is
+    your "REST API"), or, when it asks to list, describe or give examples, it is drafted (DRAFT_ANSWER) from the
+    profile with the job page as context; the draft prompt returns null when the facts don't cover it, and only
+    then is it asked. Still asked: personal choices (office days, salary you'd accept), dates, years for a skill
+    the profile doesn't list, and Yes/No claims (rule 12). A question a later run fills leaves the open list.
+    When QUESTIONS.md shows a question this could have handled, fix the rule and add a test, don't just answer it.
 
 ## Checks
 

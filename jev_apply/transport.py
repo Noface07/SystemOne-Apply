@@ -23,9 +23,16 @@ class ChromeTransport:
 
     def tall(self):
         """A small window clips the footer (Next, Submit) of a tall modal form such as LinkedIn Easy Apply, and a
-        clipped button can't be clicked. Lay this tab out at least JEV_VIEWPORT_HEIGHT px tall (your window's width
-        is kept; only the agent's own tabs are affected)."""
-        height = int(os.environ.get("JEV_VIEWPORT_HEIGHT") or 1000)
+        clipped button can't be clicked. The window is maximised, so the page keeps its normal size and you see all
+        of it. Only when you set JEV_VIEWPORT_HEIGHT is the tab also laid out that tall, which cuts off whatever
+        doesn't fit your window."""
+        try:
+            window = self._cdp("Browser.getWindowForTarget", targetId=self.target)
+            if window.get("bounds", {}).get("windowState") == "normal":
+                self._cdp("Browser.setWindowBounds", windowId=window["windowId"], bounds={"windowState": "maximized"})
+        except Exception:  # an older Chrome: the window keeps its size
+            pass
+        height = int(os.environ.get("JEV_VIEWPORT_HEIGHT") or 0)
         try:
             if (
                 height

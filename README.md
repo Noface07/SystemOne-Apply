@@ -73,6 +73,21 @@ DECISION_BACKEND=typesafe
 TYPESAFE_API_KEY=...            # from https://console.typesafe.ai/keys
 ```
 
+To use Cloudflare's [Clef-Flash](https://huggingface.co/cloudflare/clef-flash), a 9B open-weights decision
+model, on your own GPU: get llama.cpp b11430 or newer and a GGUF such as
+[bartowski/Cloudflare_clef-flash-GGUF](https://huggingface.co/bartowski/Cloudflare_clef-flash-GGUF) (Q4_K_M,
+6 GB, fits an 8 GB GPU), then set:
+
+```bash
+DECISION_BACKEND=clef
+CLEF_MODEL_PATH=D:/models/Cloudflare_clef-flash-Q4_K_M.gguf
+CLEF_SERVER_BIN=D:/llama.cpp/llama-server.exe   # jev-apply starts it when nothing answers on CLEF_BASE_URL
+```
+
+Clef answers through the same `/v1/systemone` API as Jev, so nothing else changes. Each question keeps its 12
+most relevant options (`CLEF_MAX_OPTIONS`); the exits (ask you, skip, draft) always stay. With the rules switched
+off, on a real profile, Clef-Flash answered 18 of 26 field wordings right against Laya's 3 (Laya asked about most).
+
 Only *who picks the answer* changes. The same procedure walks the form. The same rules, guards, logins and
 submit checks apply either way. Long fact lists are shortlisted to TypeSafe's limit of 255 options per question,
 as they are for Laya. `TYPESAFE_MODEL` pins a version (default `jev-latest`). `DECISION_STEERING=model` lets the
@@ -377,7 +392,7 @@ The older route still works: leave `TEXT_MODEL_PROVIDER` empty and set `TEXT_MOD
 | `TEXT_MODEL` | `sonnet` with Claude Code | Drafting model |
 | `TEXT_MODEL_API_KEY` / `TEXT_MODEL_BASE_URL` | *(empty)* | Only for an OpenAI-compatible drafting endpoint |
 | `CLAUDE_CODE_BIN` / `CLAUDE_CODE_TIMEOUT` | `claude` on PATH / `180` | Where the CLI is; seconds per draft |
-| `JEV_VIEWPORT_HEIGHT` | `1000` | Minimum layout height of the agent's Chrome tabs |
+| `JEV_VIEWPORT_HEIGHT` | off | Minimum layout height of the agent's Chrome tabs; by default the window is maximised instead, so pages keep their normal size |
 | `JEV_BACKGROUND_TABS` | `0` | `1` keeps the agent's Chrome tabs behind yours |
 | `JEV_CHROMIUM` | *(empty)* | A specific Chromium for `--browser playwright` |
 

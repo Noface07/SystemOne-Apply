@@ -432,3 +432,50 @@ def test_a_generic_word_is_not_read_as_a_longer_listed_skill():
     assert rules.match(dotnet, profile, False, ()) == safe_id("skill_years.ASP.NET Core")
     aspnet = field("How many years of work experience do you have with ASP.NET?")
     assert rules.match(aspnet, profile, False, ()) == safe_id("skill_years.ASP.NET Core")  # the start of it
+
+
+def test_list_and_example_questions_are_drafted_not_asked():
+    # Written from your résumé facts by the drafting model (which returns nothing, so it's asked, when they don't
+    # cover it). Short labels stay with the other rules.
+    for question in (
+        "Have you worked on both small-scale and large-scale projects/products? Please provide examples.",
+        "Please list the primary technologies you've worked with and mention any advanced or latest versions used",
+        "Have you led a team? If so, how many people and what did you own?",
+    ):
+        assert rules.match(field(question, input_type="textarea"), PROFILE) == "DRAFT_ANSWER", question
+    assert rules.match(field("Please mention your notice period"), PROFILE) == safe_id("work.notice_period_text")
+
+
+def test_certifications_come_from_the_profile_fact():
+    data = json.loads((ROOT / "data" / "profile.example.json").read_text(encoding="utf-8"))
+    certs = {"value": "AWS Cloud Practitioner (2025)", "about": "Certifications / courses completed"}
+    profile = Profile({**data, "certifications": certs}, ROOT / "data")
+    asked = field("Have you completed any relevant certifications or training programs? Please list them.")
+    assert rules.match(asked, profile) == safe_id("certifications")
+    assert rules.match(field("Certification number"), profile) != safe_id("certifications")
+    assert rules.match(field("Upload your certifications", kind="upload"), profile) != safe_id("certifications")
+    # Without the fact, nothing stands in for it: drafted (and asked when the facts don't cover it).
+    assert rules.match(asked, PROFILE) == "DRAFT_ANSWER"
+
+
+def test_last_working_day_when_not_serving_notice():
+    data = json.loads((ROOT / "data" / "profile.example.json").read_text(encoding="utf-8"))
+    free = Profile({**data, "work": {**data["work"], "serving_notice": False}}, ROOT / "data")
+    serving = Profile({**data, "work": {**data["work"], "serving_notice": True}}, ROOT / "data")
+    conditional = field("If you are serving notice, what will be your official last working day?")
+    assert rules.match(conditional, free) == "DRAFT_ANSWER"  # "Not serving notice; I can join in N days."
+    assert rules.match(conditional, serving) == "ASK_USER"  # the date is yours
+    assert rules.match(field("Last working day", input_type="date"), free, True) == "ASK_USER"
+    both = field("Could you please confirm your official notice period/last working day?")
+    assert rules.match(both, free) == safe_id("work.notice_period_text")
+    assert rules.match(both, serving) == "ASK_USER"
+
+
+def test_years_with_a_skill_match_other_wordings_of_a_listed_skill():
+    data = json.loads((ROOT / "data" / "profile.example.json").read_text(encoding="utf-8"))
+    profile = Profile({**data, "skill_years": {"REST API": 1.5, "Agentic AI": 0.5}}, ROOT / "data")
+    rest = rules.match(field("How many years of work experience do you have with REST APIs?"), profile)
+    assert profile.by_id[rest].key == "skill_years.REST API"
+    agents = rules.match(field("How many years of work experience do you have with AI Agents?"), profile)
+    assert profile.by_id[agents].key == "skill_years.Agentic AI"
+    assert rules.match(field("How many years of work experience do you have with SQL Server?"), profile) == ("ASK_USER")

@@ -9,6 +9,7 @@ your profile facts or one of the special choices (ASK_USER, SKIP_FIELD, DRAFT_AN
 import re
 
 from .profile import DATE, format_date, safe_id
+from .skills import canonical
 
 MONEY = re.compile(r"\b(ctc|salary|compensation|package|income|pay|remuneration|stipend)\b")
 EXPECTED = re.compile(r"expect|desired|asking|target|anticipat|looking for|new (ctc|salary|package)")
@@ -63,7 +64,14 @@ GENERIC = set(
     "was were who whom why when where does done make made most more less than also just like give tell share describe "
     "explain field value experience professional work years year yrs months month".split()
 )
-OPEN_QUESTION = re.compile(r"^(what|why|how|tell|describe|explain|share|give|walk us|talk about|briefly)\b|\bif yes\b")
+OPEN_QUESTION = re.compile(
+    r"^(what|why|how|tell|describe|explain|share|give|walk us|talk about|briefly|list|mention|elaborate)\b|"
+    r"\bif (yes|so)\b|\b(please|kindly) (list|provide|mention|describe|share|elaborate|explain|give|specify)\b|"
+    r"\b(provide|give|share) (some |an |a few |two |specific )?examples?\b"
+)
+# "If you are serving notice, what is your last working day?": a question only for those serving notice.
+IF_SERVING = re.compile(r"\bif (you are|you're|currently|already)? ?(serving|on) (your |the )?notice")
+CERTIFICATIONS = re.compile(r"\bcertifications?\b|\btraining programs?\b|\bcourses? (you have )?(completed|taken)\b")
 
 
 def words_of(text):
@@ -278,6 +286,16 @@ def skill_years_key(t, profile):
     # The skill itself, else the longest skill a segment starts with (the earliest segment first), else the
     # closest listed skill the question abbreviates.
     exact = [key for skill, key in listed if skill == phrase]
+    if not exact:
+        # The same skill in other words or number: "REST APIs" for your "REST API", "ReactJS" for "React".
+        name = canonical(asked.group(1))
+        exact = [
+            fact.key
+            for key, fact in profile.by_id.items()
+            if key.startswith("skill_years__")
+            and fact.key != "skill_years.default"
+            and canonical(fact.key.split(".", 1)[1]).lower() == name.lower()
+        ]
     inside = [(starts[skill], -len(skill), key) for skill, key in listed if skill in starts]
     # A shorter name for a longer listed skill: an abbreviation anywhere in it (".NET", "PLC"), or its start
     # ("ASP.NET" for "ASP.NET Core"). "Engineering" is not "Prompt engineering".
@@ -368,6 +386,12 @@ def key_for(action, profile, tried, dates_only=False, page_text=""):
     if re.search(r"how did you (hear|find|come)|where did you (hear|find)|source of (application|referral)", t):
         return "application.how_heard" if safe_id("application.how_heard") in profile.by_id else "ASK_USER"
     if ASK.search(t):
+        serving = profile.by_id.get(safe_id("work.serving_notice"))
+        if serving is not None and serving.value == "No" and re.search(r"last working day|relieving date", t):
+            if "notice period" in t:
+                return "work.notice_period_text"  # "notice period / last working day": not serving, so the period
+            if IF_SERVING.search(t) and action.get("input_type") not in {"date", "month"}:
+                return "DRAFT_ANSWER"  # asked only of those serving notice: a line saying you aren't
         return "ASK_USER"
     if re.search(
         r"(start|join)\w*\s+(right away|immediately|at once|asap)|immediate(ly)? (joiner|joining|available|start)", t
@@ -534,6 +558,13 @@ def key_for(action, profile, tried, dates_only=False, page_text=""):
         return "education.0.field"
     if re.search(r"\bc?gpa\b|percentage|\bgrade\b|\bmarks\b", t):
         return "education.0.grade"
+    if (
+        CERTIFICATIONS.search(t)
+        and action.get("kind", "fill") == "fill"
+        and not re.search(r"upload|attach|number|\bid\b|expir|valid", t)
+        and safe_id("certifications") in profile.by_id
+    ):
+        return "certifications"  # "Have you completed any certifications? Please list them."
     if "skill" in t:
         return next_item(profile, "skills", action, tried) if action.get("multiple") else "skills"
     if re.search(r"languages?( known| spoken)?\b", label):
