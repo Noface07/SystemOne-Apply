@@ -97,7 +97,7 @@ def judge(facts, shots):
         )
     content.append({"type": "text", "text": "Grade every question now. JSON only."})
     message = json.dumps({"type": "user", "message": {"role": "user", "content": content}}) + "\n"
-    text, meta = model.claude_code(JUDGE, None, stdin=message, timeout=600)
+    text, meta = model.claude_code(JUDGE, None, stdin=message, timeout=600, stage="judge")
     if text is None:
         return None, meta.get("reason")
     start, end = text.find("{"), text.rfind("}")

@@ -143,3 +143,19 @@ def test_a_dropdown_placeholder_read_with_the_label_is_not_part_of_the_question(
     assert same_question("Notice Period", "Notice Period * Select One")
     assert same_question("Primary skills", "Primary skills 0 items selected")
     assert not same_question("Current Salary", "Expected Salary Select...")
+
+
+def test_a_step_button_is_not_sensitive_because_of_the_step_it_sits_in():
+    from jev_apply.policy import Policy
+
+    policy = Policy()
+    step = "4/5 pages Work authorization Not sure how to answer the following questions?"
+    assert not policy.sensitive({"kind": "click", "role": "button", "label": "Review", "context": step})
+    assert not policy.sensitive({"kind": "click", "role": "button", "label": "Next", "context": step})
+    # An answer in that step still is.
+    assert policy.sensitive(
+        {"kind": "click", "role": "radio", "label": "Yes", "context": "Are you authorized to work?"}
+    )
+    assert policy.sensitive(
+        {"kind": "click", "role": "button", "label": "Yes", "context": "Will you require visa sponsorship?"}
+    )

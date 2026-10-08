@@ -479,3 +479,13 @@ def test_years_with_a_skill_match_other_wordings_of_a_listed_skill():
     agents = rules.match(field("How many years of work experience do you have with AI Agents?"), profile)
     assert profile.by_id[agents].key == "skill_years.Agentic AI"
     assert rules.match(field("How many years of work experience do you have with SQL Server?"), profile) == ("ASK_USER")
+
+
+def test_your_annual_ctc_without_current_or_expected_is_your_current_ctc():
+    assert rules.match(field("What is your annual CTC in lakhs*"), PROFILE) == safe_id(
+        "compensation.current.total_annual_lpa"
+    )
+    assert rules.match(field("What is your CTC?"), PROFILE) is None  # no unit: LPA or rupees, still asked
+    assert rules.match(field("What CTC are you looking for in the new role (LPA)?"), PROFILE) == safe_id(
+        "compensation.expected.total_annual_lpa"
+    )

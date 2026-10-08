@@ -175,7 +175,7 @@ def fill_with_claude(text, extracted, today=None):
     from . import model
 
     payload = {"today": (today or date.today()).isoformat(), "extracted": extracted, "resume": text[:20000]}
-    content, meta = model.claude_code(FILL, payload, timeout=300)
+    content, meta = model.claude_code(FILL, payload, timeout=300, stage="learn")
     if content is None:
         return {}, meta.get("reason", "Claude Code did not answer")
     content = re.sub(r"^```\w*|```$", "", content.strip(), flags=re.M).strip()

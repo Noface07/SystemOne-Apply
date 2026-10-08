@@ -1,5 +1,7 @@
 """Clef-Flash through llama-server's /v1/systemone: the same contract as every other backend."""
 
+import pytest
+
 from jev_apply import clef_backend, model
 
 
@@ -39,3 +41,14 @@ def test_clef_without_a_server_or_settings_says_what_to_set(monkeypatch, tmp_pat
     assert "doesn't exist" in clef_backend.problem()
     command = clef_backend.command(clef_backend.settings())
     assert command[command.index("--port") + 1] == "9" and "-ngl" in command
+
+
+def test_clef_is_not_started_when_windows_cannot_spare_the_memory(monkeypatch, tmp_path):
+    model_file = tmp_path / "clef.gguf"
+    model_file.write_bytes(b"0" * 1024)
+    monkeypatch.setenv("CLEF_BASE_URL", "http://127.0.0.1:9")
+    monkeypatch.setenv("CLEF_MODEL_PATH", str(model_file))
+    monkeypatch.setattr(clef_backend, "commit_free_gb", lambda: 1.0)
+    monkeypatch.setattr(clef_backend.subprocess, "Popen", lambda *a, **k: pytest.fail("started anyway"))
+    with pytest.raises(RuntimeError, match="close some programs"):
+        clef_backend.prepare()

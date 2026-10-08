@@ -36,8 +36,16 @@ def settings():
 
 def healthy(base=None):
     """Is a server answering at CLEF_BASE_URL (llama-server's /health says ok once the model is loaded)?"""
+    import socket
+
+    base = base or settings()["base"]
+    url = urlparse(base)
+    try:  # Windows takes ~2 s to refuse a closed local port: a short probe first
+        socket.create_connection((url.hostname or "127.0.0.1", url.port or 80), timeout=0.3).close()
+    except OSError:
+        return False
     try:
-        response = httpx.get((base or settings()["base"]) + "/health", timeout=2)
+        response = httpx.get(base + "/health", timeout=2)
     except httpx.HTTPError:
         return False
     return response.status_code == 200
@@ -84,12 +92,42 @@ def command(s):
     ]
 
 
+def commit_free_gb():
+    """Memory Windows can still promise to programs (RAM + page file), in GB; None elsewhere."""
+    if os.name != "nt":
+        return None
+    import ctypes
+
+    class Status(ctypes.Structure):
+        _fields_ = [("length", ctypes.c_ulong), ("load", ctypes.c_ulong)] + [
+            (name, ctypes.c_ulonglong)
+            for name in ("phys", "phys_free", "commit", "commit_free", "virtual", "virtual_free", "extended")
+        ]
+
+    status = Status(length=ctypes.sizeof(Status))
+    if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+        return None
+    return status.commit_free / 2**30
+
+
+def needed_gb(s):
+    """Windows charges the whole mapped model file, plus about 1 MB of output buffer per batch token."""
+    return Path(s["path"]).stat().st_size / 2**30 + int(s["context"]) / 1024 + 0.6
+
+
 def prepare():
     """Start llama-server with Clef when nothing answers yet; wait until it has loaded the model."""
     global _server
     s = settings()
     if healthy(s["base"]):
         return
+    free, need = commit_free_gb(), needed_gb(s)
+    if free is not None and free < need + 1:
+        # Starting anyway starves Chrome and Windows itself (tabs fail to open, programs can't start threads).
+        raise RuntimeError(
+            f"Clef needs about {need:.1f} GB of memory and Windows can only promise {free:.1f} GB: close some "
+            "programs (editor windows, browsers, other sessions) or enlarge the page file, then run again"
+        )
     log = Path(os.environ.get("CLEF_SERVER_LOG") or Path.cwd() / "runs" / "clef-server.log")
     log.parent.mkdir(parents=True, exist_ok=True)
     with log.open("ab") as sink:

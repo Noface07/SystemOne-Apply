@@ -181,6 +181,12 @@ class Browser:
 
     def follow_popup(self):
         """An Apply link that opened a new tab or window: continue there (the transport switches its tab)."""
+        back = getattr(self.transport, "back_to_open_tab", None)
+        try:
+            if back and back():
+                self.call("Emulation.setFocusEmulationEnabled", enabled=True)
+        except Exception:  # the browser itself is gone: the next call reports it
+            pass
         adopt = getattr(self.transport, "adopt_popup", None)
         if adopt and adopt():
             self.call("Emulation.setFocusEmulationEnabled", enabled=True)

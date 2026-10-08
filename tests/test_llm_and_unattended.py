@@ -483,3 +483,38 @@ def test_questions_a_later_run_filled_leave_the_open_list(tmp_path):
     filled = ["Why Do You Want to Join Our Company?* 0 of 1,440 characters", "Do you hold a security clearance?"]
     assert profile.add_pending([], filled) == 0
     assert [(q["question"], q["answer"]) for q in inbox.read(md)] == [("Do you hold a security clearance?", "No")]
+
+
+def test_a_submitted_application_keeps_a_receipt_of_the_confirmation(make_agent, monkeypatch):
+    import base64
+    from pathlib import Path
+
+    before, after = submit_pages()
+    after = {**after, "text": "Your application was sent to Acme. " + after.get("text", "")}
+    agent = make_agent([before, after], ui=UnattendedUI(), auto_submit=True)
+    png = b"\x89PNG fake"
+    agent.browser.call = lambda method, **kw: (
+        {"data": base64.b64encode(png).decode()} if method == "Page.captureScreenshot" else {}
+    )
+    monkeypatch.setattr(model, "choose", lambda *a: decision("CLICK", action(before, "e4")))
+    agent.step()
+    assert agent.status == "submitted" and agent.receipt["confirmed"]
+    agent.status = "submitted"
+    report = agent.finish()
+    folder = Path(report["path"]).parent
+    assert (folder / "receipt.png").read_bytes() == png
+    assert "application was sent" in (folder / "receipt.txt").read_text(encoding="utf-8")
+    assert report["receipt"]["screenshot"] == "receipt.png" and report["claude"] == []
+
+
+def test_claude_calls_record_time_tokens_and_cost(monkeypatch):
+    import subprocess
+
+    reply = {"type": "result", "result": "ok", "usage": {"input_tokens": 1200, "output_tokens": 80,
+             "cache_read_input_tokens": 900}, "total_cost_usd": 0.0042, "duration_api_ms": 1800}  # fmt: skip
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(a, 0, json.dumps(reply), ""))
+    monkeypatch.setenv("CLAUDE_CODE_BIN", "claude")
+    text, meta = model.claude_code("system", {"q": 1}, stage="draft")
+    assert text == "ok" and meta["ok"] and meta["stage"] == "draft"
+    assert (meta["input_tokens"], meta["output_tokens"], meta["cache_read_tokens"]) == (1200, 80, 900)
+    assert meta["cost_usd"] == 0.0042 and meta["api_ms"] == 1800 and meta["latency_ms"] >= 0

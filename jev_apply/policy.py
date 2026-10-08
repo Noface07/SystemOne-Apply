@@ -82,6 +82,9 @@ def compile_patterns(words):
     return re.compile("|".join(r"(?<![a-z0-9])" + re.escape(w.lower()) for w in words) or r"(?!x)x", re.I)
 
 
+NAVIGATION = re.compile(r"(next|continue|review|back|previous|proceed|save (and|&) continue)( step)?")
+
+
 @dataclass
 class Policy:
     min_operation_probability: float = 0.6
@@ -102,6 +105,10 @@ class Policy:
     # Unattended runs that reach a sign-in page alert you, show the tab and wait this long for you to sign in (or
     # create the account) before stopping the job. 0 stops at once. The agent never types into a login page.
     login_wait_s: int = 900
+    # At a "Continue with Google" sign-in: click it, choose the Google account whose address is your profile's e-mail
+    # and confirm Google's "share your name, email and picture" page. Clicks only: nothing is ever typed into Google
+    # (an e-mail, password or code request waits for you), and wider access (Drive, Gmail...) is left for you.
+    google_sign_in: bool = False
     # After auto_submit clicks Submit: how long to watch for the site's own confirmation before recording the job
     # as "submitted (no confirmation seen)". Nothing is clicked while waiting.
     confirm_wait_s: int = 15
@@ -143,6 +150,11 @@ class Policy:
         return " ".join(str(action.get(k) or "") for k in ("label", "context", "help", "placeholder"))
 
     def sensitive(self, action):
+        # A button that only moves between steps (Next, Review...) carries no answer: its own label decides, not
+        # the step around it ("Work authorization" heads LinkedIn's step; its Review button declares nothing).
+        label = str(action.get("label") or "")
+        if action.get("role") in {"button", "link"} and NAVIGATION.fullmatch(label.strip().lower()):
+            return self._confirm.search(label)
         return self._confirm.search(self.text(action))
 
     def plain_consent(self, action):

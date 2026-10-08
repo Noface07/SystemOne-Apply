@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="jev-token" content="__JEV_TOKEN__">
+  <title>jev-apply</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%236d5efc'/%3E%3Cpath d='M9 17l5 5 9-12' stroke='white' stroke-width='3.2' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar">
+      <a class="brand" href="#/">
+        <span class="logo"><svg viewBox="0 0 32 32"><path d="M9 17l5 5 9-12"/></svg></span>
+        <span class="brand-text">jev<span>apply</span></span>
+      </a>
+      <nav id="nav">
+        <a href="#/" data-page="overview"><svg viewBox="0 0 24 24"><path d="M3 12l9-8 9 8M5 10v10h5v-6h4v6h5V10"/></svg><span>Overview</span></a>
+        <a href="#/find" data-page="find"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M21 21l-5-5"/></svg><span>Find jobs</span></a>
+        <a href="#/batch" data-page="batch"><svg viewBox="0 0 24 24"><path d="M5 4l14 8-14 8z"/></svg><span>Live batch</span><i class="dot" id="nav-live" hidden></i></a>
+        <a href="#/inbox" data-page="inbox"><svg viewBox="0 0 24 24"><path d="M3 13h5l2 3h4l2-3h5M5 5h14l2 8v6H3v-6z"/></svg><span>Inbox</span><b class="count" id="nav-inbox" hidden></b></a>
+        <a href="#/questions" data-page="questions"><svg viewBox="0 0 24 24"><path d="M4 5h16v11H8l-4 4z"/><path d="M10 9.5a2 2 0 113 1.7c-.6.4-1 .8-1 1.5"/></svg><span>Questions</span><b class="count" id="nav-questions" hidden></b></a>
+        <a href="#/profile" data-page="profile"><svg viewBox="0 0 24 24"><circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0116 0"/></svg><span>Profile</span><i class="dot warn" id="nav-dirty" hidden></i></a>
+        <a href="#/history" data-page="history"><svg viewBox="0 0 24 24"><path d="M3 12a9 9 0 109-9 9 9 0 00-7 3.4M3 3v4h4"/><path d="M12 7v5l3 2"/></svg><span>History</span></a>
+        <a href="#/insights" data-page="insights"><svg viewBox="0 0 24 24"><path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/></svg><span>Insights</span></a>
+        <a href="#/settings" data-page="settings"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 00.3 1.8l.1.1a2 2 0 11-2.8 2.8l-.1-.1a1.7 1.7 0 00-1.8-.3 1.7 1.7 0 00-1 1.5V21a2 2 0 11-4 0v-.1a1.7 1.7 0 00-1.1-1.5 1.7 1.7 0 00-1.8.3l-.1.1a2 2 0 11-2.8-2.8l.1-.1a1.7 1.7 0 00.3-1.8 1.7 1.7 0 00-1.5-1H3a2 2 0 110-4h.1a1.7 1.7 0 001.5-1.1 1.7 1.7 0 00-.3-1.8l-.1-.1a2 2 0 112.8-2.8l.1.1a1.7 1.7 0 001.8.3H9a1.7 1.7 0 001-1.5V3a2 2 0 114 0v.1a1.7 1.7 0 001 1.5 1.7 1.7 0 001.8-.3l.1-.1a2 2 0 112.8 2.8l-.1.1a1.7 1.7 0 00-.3 1.8V9a1.7 1.7 0 001.5 1H21a2 2 0 110 4h-.1a1.7 1.7 0 00-1.5 1z"/></svg><span>System</span></a>
+      </nav>
+      <div class="sidebar-foot" id="model-badge"></div>
+    </aside>
+    <main id="main" tabindex="-1"></main>
+  </div>
+  <div id="toast" role="status" aria-live="polite"></div>
+  <div id="drawer" class="drawer" hidden></div>
+  <div id="modal" class="modal" hidden></div>
+  <script type="module" src="/static/app.js"></script>
+</body>
+</html>

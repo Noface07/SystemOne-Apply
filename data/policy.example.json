@@ -10,6 +10,7 @@
   "auto_submit": false,
   "submit_drafts": false,
   "login_wait_s": 900,
+  "google_sign_in": false,
   "confirm_wait_s": 15,
   "per_company": 1,
   "company_gap_days": 14,

@@ -245,8 +245,29 @@ def fact_values(question, facts):
     return []
 
 
+# "Are you from Mumbai?": one place, asked about where you live. "...or nearby?", "relocate" are not this.
+PLACE_QUESTION = re.compile(
+    r"\bare you (?:from|based (?:in|out of)|located in|living in|residing in|a resident of|currently (?:in|based in|"
+    r"located in|living in)) (?:the )?([a-z][a-z .'-]{1,40}?)\s*\??\s*$"
+)
+
+
+def place_answer(question, options, facts):
+    """Yes when the place asked about is your city, state or country; No for any other one place."""
+    asked = PLACE_QUESTION.search(question.lower().strip(" *"))
+    home = [facts.by_id[k].value for k in map(safe_id, ("personal.city", "personal.state", "personal.country"))
+            if k in facts.by_id]  # fmt: skip
+    if not asked or not home or re.search(r"\b(or|and|near|nearby|around)\b", asked[1]):
+        return []
+    want = "yes" if any(norm(h) == norm(asked[1]) for h in home) else "no"
+    return [o for o in options if norm(option_text(o)) == want]
+
+
 def profile_answer(question, options, facts):
     """Options that are exactly what your profile says for this question (via the fixed rules)."""
+    placed = place_answer(question, options, facts)
+    if placed:
+        return placed
     values = fact_values(question, facts)
     # A decimal ("2.2" years) is never matched as text: without its point it would read "22 years".
     wanted = [norm(v) for v in values if not re.fullmatch(r"\s*\d+\.\d+\s*", v)]
@@ -439,10 +460,44 @@ def question_of(context, group):
 SIGN_IN_STEP = re.compile(r"current step \d+ of \d+\W*(create account\s*/\s*sign in|sign in)\b", re.I)
 
 
+# "Continue with Google" and its kind: a sign-in even with no password box on the page. "Apply with LinkedIn"
+# (an autofill button on Greenhouse and Lever forms) is not one.
+SSO = re.compile(
+    r"^\s*(?:sign\s*in|log\s*in|continue|sign\s*up|register)\s+(?:with|using|via)\s+(google|microsoft|linkedin|apple)\b",
+    re.I,
+)
+# The identity providers' own sign-in pages (Google's account chooser, Microsoft's login...).
+IDP = re.compile(
+    r"^https://(accounts\.google\.com|login\.microsoftonline\.com|login\.live\.com|appleid\.apple\.com)/", re.I
+)
+ACCOUNT_FIELD = re.compile(r"e-?mail|password|user\s*name|phone|mobile|search|otp|code|captcha", re.I)
+
+
+def sso_buttons(page):
+    """'Sign in / Continue with Google' (Microsoft, LinkedIn, Apple) buttons on this page."""
+    return [a for a in page.get("actions") or [] if a.get("kind") == "click" and SSO.search(a.get("label") or "")]
+
+
+def application_fields(page):
+    """Does the page hold anything of an application (not just the e-mail and password of an account)?"""
+    for a in page.get("actions") or []:
+        if a.get("kind") in {"select", "setdate", "upload"}:
+            return True
+        if a.get("kind") == "fill" and not ACCOUNT_FIELD.search(f"{a.get('label', '')} {a.get('input_type', '')}"):
+            return True
+    return False
+
+
 def sign_in_wall(page):
-    """A page that wants you to sign in or create an account first (a visible password box, or Workday's
-    sign-in step). The agent never types there: it waits for you."""
-    return bool(page.get("login") or SIGN_IN_STEP.search(page.get("text") or ""))
+    """A page that wants you to sign in or create an account first: a visible password box, Workday's sign-in
+    step, an identity provider's page, or only "Continue with Google"-style buttons and no application fields.
+    The agent never types there: it waits for you (or, when allowed, signs in with Google by clicks only)."""
+    return bool(
+        page.get("login")
+        or SIGN_IN_STEP.search(page.get("text") or "")
+        or IDP.match(page.get("url") or "")
+        or (sso_buttons(page) and not application_fields(page))
+    )
 
 
 def declaration_question(action):
@@ -895,11 +950,15 @@ def choose(page, candidate, exclude=(), history=()):
                 # name, "v4_..."). None of them: it is uploaded, or, if the page offers no upload, stop before
                 # sending one you didn't pick.
                 names = [norm(v) for k, v in candidate.items() if k.startswith("document.") and "cover" not in k]
-                mine = next((o for o in group if any(n and n in norm(o["label"]) for n in names)), None)
+                ours = [o for o in group if any(n and n in norm(o["label"]) for n in names)]
+                # The same file uploaded twice shows as two cards: either one chosen is yours chosen.
+                mine = next((o for o in ours if is_on(o)), ours[0] if ours else None)
                 if mine and not is_on(mine) and not touched(history, url, label=mine["label"]):
                     return decision("CLICK", mine)
-                if mine and not is_on(mine):
-                    # Clicked and still not selected: going on would send whichever résumé the site preselected.
+                # LinkedIn's cards report none chosen, even the one it has selected: there a click is all there is.
+                readable = any(is_on(o) for o in group)
+                if mine and not is_on(mine) and readable:
+                    # Clicked and another card shows as chosen: going on would send that résumé.
                     return decision(
                         "BLOCKED",
                         None,
@@ -924,13 +983,22 @@ def choose(page, candidate, exclude=(), history=()):
                         and h.get("kind") == "scroll"
                         and str(h.get("action")).startswith("Scroll up")
                     ]
-                    if picked and any(i > picked[-1] for i in ups):
-                        continue  # seen since the click (not selected then would have stopped the run above)
+                    mine_here = [h for h in history if h.get("url") == url]
+                    revisited = any(
+                        h.get("kind") == "scroll"
+                        and str(h.get("action")).startswith("Scroll up")
+                        and n.get("kind") in {"wait", "scroll"}
+                        and not str(n.get("action")).startswith("Scroll up")
+                        for h, n in zip(mine_here, mine_here[1:])
+                    )
+                    if picked or revisited:
+                        # Clicked already, or seen after scrolling back to it with nothing to do (not chosen, it
+                        # would have been clicked; another card chosen would have stopped the run above): carry on
+                        # rather than scroll back and forth (LinkedIn keeps the box scrolled from the step before).
+                        continue
                     up = next((o for o in actions if o.get("id") == "scroll_up"), None)
                     if up and len(ups) < 4:
                         return decision("SCROLL_UP", up)
-                    if picked:
-                        continue
                     return decision(
                         "BLOCKED",
                         None,

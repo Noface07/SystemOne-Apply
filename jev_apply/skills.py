@@ -6,6 +6,7 @@ answer is looked up, so one answer serves every wording.
 """
 
 import re
+from collections import Counter
 
 # canonical name: aliases (lower case). A skill matches as a whole word ("Go" never matches "good").
 VOCAB = {
@@ -163,7 +164,45 @@ def canonical(phrase):
     """The vocabulary name for a skill phrase ('React.js' -> 'React'), or the phrase itself."""
     key = re.sub(r"\s+", " ", (phrase or "").lower()).strip(" ?*.:")
     key = re.sub(r"\s*\((programming language|framework|language)\)$", "", key)
+    named = re.fullmatch(r"(.+?)\s*\(([^()]+)\)", key)  # "Natural Language Processing (NLP)": either name
+    if named and key not in ALIASES:
+        found = next((ALIASES[p.strip()] for p in named.groups() if p.strip() in ALIASES), None)
+        if found:
+            return found
     return ALIASES.get(key, key)
+
+
+# Skills that stand for one line of work: a job asking for ".NET Core" wants the résumé that makes the most of the
+# .NET family, not merely one that lists ".NET" once.
+FAMILIES = {
+    ".NET": [".NET", ".NET Core", ".NET Framework", "ASP.NET", "ASP.NET Core", "ASP.NET MVC", "Web API",
+             "Entity Framework", "LINQ", "WPF", "WinForms", "Blazor", ".NET MAUI", "Xamarin", "SignalR", "Dapper"],
+    "Generative AI": ["Generative AI", "Large Language Models", "LangChain", "LangGraph", "LlamaIndex", "RAG",
+                      "Prompt Engineering", "AI Agents", "OpenAI API", "Vector Databases", "Hugging Face", "NLP"],
+    "Machine Learning": ["Machine Learning", "Artificial Intelligence", "Deep Learning", "PyTorch", "TensorFlow",
+                         "Keras", "scikit-learn", "XGBoost", "ONNX", "MLOps", "Computer Vision"],
+    "Industrial Automation": ["Industrial Automation", "SCADA", "PLC", "PLC Programming", "HMI", "DCS", "MES",
+                              "OPC UA", "OPC DA", "Modbus", "DNP3", "IEC 61850", "IEC 60870-5-104", "BACnet",
+                              "Profinet", "EtherCAT", "Siemens TIA Portal", "Siemens S7", "Allen-Bradley",
+                              "Ignition", "WinCC", "Industrial IoT", "BMS"],
+}  # fmt: skip
+FAMILY_OF = {name: family for family, names in FAMILIES.items() for name in names}
+
+
+def family(name):
+    """The line of work a skill belongs to ('ASP.NET MVC' -> '.NET'), or the skill itself."""
+    return FAMILY_OF.get(name, name)
+
+
+def counts(text):
+    """How often a text names each vocabulary skill (every alias, whole words)."""
+    low = (text or "").lower()
+    found = Counter()
+    for alias, name in ALIASES.items():
+        n = len(re.findall(rf"(?<![a-z0-9+#.]){re.escape(alias)}(?![a-z0-9+#-])", low))
+        if n:
+            found[name] += n
+    return found
 
 
 def prominent(title, description, limit=5):
@@ -202,7 +241,15 @@ ASKED = re.compile(
 def asked_skill(question):
     """The skill a 'How many years of experience with X?' question asks about, as a vocabulary name, or None."""
     found = ASKED.search(re.sub(r"\byear'?s'?\b", "years", question or "", flags=re.I))
-    return canonical(found[1]) if found else None
+    if not found:
+        return None
+    name = canonical(found[1])
+    if name not in VOCAB:
+        # "Microsoft Azure in a cloud-native environment": the one skill the phrase names, if it names one.
+        named = set(mentioned(found[1]))
+        if len(named) == 1:
+            return named.pop()
+    return name
 
 
 def years_question(skill):

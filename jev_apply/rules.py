@@ -123,6 +123,8 @@ def money(t, action):
     if re.search(r"take[- ]?home|in[- ]?hand|\bnet\b|hike|increment|percent|%", t):
         return "ASK_USER"
     when = "expected" if EXPECTED.search(t) else "current" if CURRENT.search(t) else None
+    if when is None and re.search(r"\byour (annual |yearly |total )?ctc\b", t) and not re.search(r"\bnew\b|offer", t):
+        when = "current"  # "What is your annual CTC (in lakhs)?": the CTC you have, as Indian forms mean it
     if when is None:
         return None
     part = (

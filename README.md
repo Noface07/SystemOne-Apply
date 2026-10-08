@@ -192,6 +192,59 @@ never-fill list anyway.
 
 ---
 
+## The web app
+
+```bash
+uv run --extra ui jev-apply ui          # opens http://127.0.0.1:8765
+```
+
+Everything the commands do, in one place:
+
+- **Overview:** applications sent, per day and per résumé, open questions, the decision model's state.
+- **Find jobs:** LinkedIn Easy Apply search per résumé track (read without logging in), with the years each job
+  asks, the skills it names and the résumé that fits it. Hidden: closed jobs, senior titles, too many years, jobs
+  you applied to. Tick the ones you want and start applying.
+- **Live batch:** each job as a card while it runs (résumé used, the step it is on, why it stopped), the log, a
+  Stop button and "rerun stopped jobs".
+- **Questions:** QUESTIONS.md as cards; options are buttons, answers save straight to the file.
+- **History:** every application and every run report, field by field, with the model's confidence.
+- **Profile:** edit each track's profile.json as a form (jobs and education as cards, skills as tags, years per
+  skill as a table). Shared facts (notice period, CTC, years per skill) can be saved to every track at once; a
+  track's headline, skills, jobs and résumé stay its own. Each save is checked by loading it, and the previous
+  version is kept in data/<track>/.backups/. Add any field (with a description the decision model reads), a
+  section, a job or a document; upload a track's résumé (PDF, Word or text); or start a new track for another
+  kind of role from your shared facts.
+- **Inbox:** everything a run left for you: jobs to finish (with why), drafted answers to read, open questions.
+- **Insights:** per résumé track, how many runs end submitted and the commonest reasons the rest stop.
+- **Autopilot (System):** every day at a set time, search each track, apply to the best-scoring good fits
+  (`jev-apply autopilot`, scheduled with Windows Task Scheduler; `--dry` searches and picks without applying).
+- **Safety settings (System):** per track: auto-submit, how sure the model must be, applications per company,
+  consent boxes, waits (data/<track>/policy.json, overrides only).
+- **Preferences (Find jobs):** blocked companies and words (also stop batches and autopilot), preferred cities,
+  remote only, saved searches. Each job shows a match score and the salary when the posting states one.
+- **Paste job links (Find jobs):** LinkedIn, Greenhouse, Lever or Ashby links, checked like search results.
+- **Keyword coverage and match reasons:** per job, which skills it names your matched résumé covers, has related
+  skills for, or misses, and why it scores as it does. Dismiss a job and searches and autopilot never show it again.
+- **Answer bank (Questions):** every saved answer, from QUESTIONS.md, each track's answers.json and answers saved
+  while applying, with how often runs used it; edit or delete in place.
+- **Receipts:** after a submit, what the site showed (its text and a screenshot) is kept with the run report.
+- **Signing in:** a sign-in page (a password box, "Continue with Google"-style buttons, Google's or Microsoft's
+  own sign-in) makes the run wait for you. With "Sign in with Google for me" on (System → Safety settings), it
+  clicks Continue with Google, your profile e-mail's account and Google's basic-sharing confirmation itself.
+  It never types into a sign-in page; a password, code or wider access request is always yours.
+- **Claude usage (Insights):** each Claude call's stage, time, tokens and cost (runs/claude-usage.jsonl).
+- **Draft profile from résumé (Profile → Documents):** reads the résumé (code, then Claude for gaps) and shows
+  what differs from your profile; only the values you tick are applied.
+- **Clef controls (System):** start or stop the model, GPU memory and the memory Windows can spare.
+- **System:** switch the decision model (Clef, Laya, Jev, a chat model) and set its keys and paths (saved to
+  .env; keys are never shown again, only their last 4 characters), Clef's server and memory, your tracks.
+
+A batch started here is the same `jev-apply batch --submit --browser chrome` process, so every guard applies. The
+app listens on 127.0.0.1 only and every API call carries a per-session token, so no other website can drive it.
+The API (`jev_apply/web/server.py`) is the contract a hosted version would keep.
+
+---
+
 ## Running applications
 
 | Command | What it does |

@@ -65,6 +65,23 @@ class ChromeTransport:
         self.tall()
         return True
 
+    def back_to_open_tab(self):
+        """A pop-up this run worked in has closed (Google's sign-in window does, once you're in): go back to the
+        last of this run's tabs that is still open. True when it switched."""
+        alive = {
+            t["targetId"] for t in self._cdp("Target.getTargets").get("targetInfos", []) if t.get("type") == "page"
+        }
+        if self.target in alive:
+            return False
+        while self.opened and self.opened[-1] not in alive:
+            self.opened.pop()
+        if not self.opened:
+            return False
+        self.target = self.opened[-1]
+        self.session = self._cdp("Target.attachToTarget", targetId=self.target, flatten=True)["sessionId"]
+        self._cdp("Target.activateTarget", targetId=self.target)
+        return True
+
     def call(self, method, **params):
         return self._cdp(method, session_id=self.session, **params)
 

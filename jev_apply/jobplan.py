@@ -3,6 +3,8 @@ description will ask about that your profile has no years for, which answers its
 settles, and which jobs wait because you applied to that company recently. Plain rules; nothing is sent.
 """
 
+import re
+from collections import Counter
 from dataclasses import dataclass, field
 
 from . import applied, planner, rules, skills
@@ -33,20 +35,36 @@ def knows(profile):
     return names
 
 
+RESUME_FACTS = re.compile(r"(skills|headline|work\.current_title|experience\.|projects\.|summary)")
+
+
+def emphasis(profile):
+    """How much a track's résumé makes of each line of work: how often its skills, headline and job summaries name
+    each skill family. Two résumés may both list ".NET"; the one that names it a dozen times is the .NET one."""
+    text = " ".join(f.value for k, f in profile.facts.items() if RESUME_FACTS.match(k))
+    found = Counter()
+    for name, n in skills.counts(text).items():
+        found[skills.family(name)] += n
+    for name in knows(profile):  # listed once at least, whatever the wording
+        found[skills.family(name)] += 0 if found[skills.family(name)] else 1
+    return found
+
+
 def scores_for(info, tracks):
-    """Each track's fit: every skill of the job its résumé lists, weighted by how few tracks list it (a skill all
-    of them list says nothing), and the job title's skills five times as much (the title says what the role is)."""
-    known = {folder: knows(p) for folder, p in tracks.items()}
-    in_title = set(skills.mentioned(info.title))
-    out = {}
-    for folder in tracks:
-        points = 0.0
-        for skill in skills.mentioned(f"{info.title} {info.description}"):
-            if skill in known[folder]:
-                sharing = sum(1 for k in known.values() if skill in k)
-                points += (5.0 if skill in in_title else 1.0) / sharing
-        out[folder] = round(points, 2)
-    return out
+    """Each track's fit: for every skill of the job, that track's share of the emphasis the résumés put on the
+    skill's family (the résumé naming it most gets 1, one naming it a fifth as often 0.2), and the job title's
+    skills five times as much (the title says what the role is)."""
+    made = {folder: emphasis(p) for folder, p in tracks.items()}
+    in_title = {skills.family(s) for s in skills.mentioned(info.title)}
+    out = {folder: 0.0 for folder in tracks}
+    for skill in skills.mentioned(f"{info.title} {info.description}"):
+        key = skills.family(skill)
+        most = max(m[key] for m in made.values())
+        if not most:
+            continue
+        for folder in tracks:
+            out[folder] += (5.0 if key in in_title else 1.0) * made[folder][key] / most
+    return {folder: round(points, 2) for folder, points in out.items()}
 
 
 def choose_track(info, tracks, default):
@@ -86,6 +104,19 @@ def form_answers(questions, profile):
         if exact:
             out[q.label] = planner.option_text(exact[0])
     return out
+
+
+def blocked(company, title, text, prefs):
+    """Why your search preferences (data/search.json) rule a job out, a company or a word you blocked, or None."""
+    key = company_key(company)
+    for name in prefs.get("blocked_companies") or []:
+        if company_key(name) and company_key(name) == key:
+            return f"you blocked {name}"
+    low = f"{title} {text}".lower()
+    for word in prefs.get("blocked_keywords") or []:
+        if word.strip() and re.search(rf"(?<![a-z0-9]){re.escape(word.strip().lower())}(?![a-z0-9])", low):
+            return f"mentions '{word.strip()}', which you blocked"
+    return None
 
 
 def spread(plans, applied_path, policy):

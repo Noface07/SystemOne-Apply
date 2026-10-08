@@ -37,6 +37,14 @@ SUBMITTED = re.compile(
 FINAL = re.compile(r"submit|send|finish|complete|confirm|done|review and|final", re.I)
 
 
+# Google's confirmation buttons, and what Google would share beyond your name, e-mail, language and picture.
+GOOGLE_GO = re.compile(r"\s*(continue|allow|confirm|next)\s*", re.I)
+GOOGLE_WIDE = re.compile(
+    r"\b(google drive|gmail|contacts|calendar|photos|youtube|see, edit|edit, create|delete|manage your|send email)\b",
+    re.I,
+)
+
+
 class Stop(Exception):
     """You chose to stop."""
 
@@ -77,6 +85,8 @@ class Agent:
         self.optional_skipped = []  # unattended: optional fields no fact answers, left empty
         self.inbox = []  # unattended: required questions left for you, saved for `jev-apply answer`
         self.pending = None
+        self.claude = []  # Claude calls this run made (drafts): time, tokens, cost
+        self.receipt = None  # the site's page right after Submit: text and a screenshot
         self.status = "ready"
         self.started = time.perf_counter()
         self.page = browser.observe()
@@ -154,8 +164,11 @@ class Agent:
             )
             return
         if operation == "BLOCKED":
-            if planner.sign_in_wall(self.page) and self.unattended and self.wait_for_login():
-                return  # signed in: carry on from the form
+            if planner.sign_in_wall(self.page):
+                if self.policy.google_sign_in and self.sign_in_with_google():
+                    return  # signed in with Google: carry on from the form
+                if self.unattended and self.wait_for_login():
+                    return  # signed in: carry on from the form
             self.handover(
                 d.get("reason")
                 or "The agent needs you here: a login, CAPTCHA/OTP, a question your profile can't answer, or the "
@@ -420,6 +433,7 @@ class Agent:
             return True
         confirmed = self.wait_for_confirmation()
         self.status = "submitted" if confirmed else "submitted (no confirmation seen)"
+        self.capture_receipt(confirmed)
         applied.record(
             self.applied_path(),
             [self.start_url, before["url"]],
@@ -428,6 +442,25 @@ class Agent:
             company=self.company,
         )
         return True
+
+    def capture_receipt(self, confirmed):
+        """Keep what the site showed right after Submit: its text and a screenshot, saved with the run report.
+        Nothing is clicked; a failure only means no receipt."""
+        import base64
+
+        shot = None
+        try:
+            shot = base64.b64decode(self.browser.call("Page.captureScreenshot", format="png")["data"])
+        except Exception:  # an older browser, a closed tab: the text is still kept
+            pass
+        self.receipt = {
+            "at": datetime.now().isoformat(timespec="seconds"),
+            "url": self.page.get("url"),
+            "title": self.page.get("title"),
+            "confirmed": bool(confirmed),
+            "text": (self.page.get("text") or "")[:6000],
+            "_png": shot,
+        }
 
     def needs_a_person(self):
         """Does this form's Submit run a challenge only a person can answer? Lever always does (hCaptcha); any
@@ -572,6 +605,11 @@ class Agent:
                 draft, meta = model.draft_text(action, self.page, self.profile)
             except (RuntimeError, ValueError) as error:  # the drafting model failing must not stop the form
                 draft, meta = None, {"reason": str(error)}
+            if str(meta.get("model") or "").startswith("claude-code"):
+                keep = ("latency_ms", "api_ms", "input_tokens", "output_tokens", "cache_read_tokens",
+                        "cache_write_tokens", "cost_usd", "ok", "reason", "model")  # fmt: skip
+                self.claude.append({"stage": "draft", "question": self.question(action)[:140],
+                                    **{k: meta.get(k) for k in keep if meta.get(k) is not None}})  # fmt: skip
             if draft:
                 text = self.ui.edit_draft(self.question(action), draft)
                 resolved = (text, "draft" if text == draft else "you") if text else None
@@ -799,6 +837,60 @@ class Agent:
             except StalePage:
                 self.handover("The page did not finish loading.", observe=False)
 
+    def sign_in_with_google(self):
+        """At a sign-in wall with "Continue with Google": click it, choose the Google account whose address is your
+        profile's e-mail, and confirm Google's page sharing only your name, e-mail, language and picture. Clicks
+        only, each once. Anything Google wants typed (an address, a password, a code) or wider access is left for
+        you (False: the run then waits for you as at any sign-in). True once the site is past its sign-in."""
+        fact = self.profile.facts.get("personal.email")
+        email = (fact.value if fact else "").strip().lower()
+        if not email:
+            return False
+        done = set()
+        for _ in range(12):
+            page = self.page
+            url = page.get("url") or ""
+            on_google = url.startswith("https://accounts.google.com/")
+            if not on_google and not planner.sign_in_wall(page):
+                self.ui.event("Signed in with Google: continuing.")
+                return True
+            if not on_google:
+                target = next((a for a in planner.sso_buttons(page) if "google" in a["label"].lower()), None)
+                what = "Continue with Google"
+            elif page.get("login") or any(a.get("kind") == "fill" for a in page.get("actions") or []):
+                self.ui.event("Google asks for something typed (an address, password or code): that's yours.")
+                return False
+            else:
+                target = next((a for a in page["actions"] if a.get("kind") == "click"
+                               and email in (a.get("label") or "").lower()), None)  # fmt: skip
+                what = f"Choose {email}"
+                if target is None:
+                    target = next((a for a in page["actions"] if a.get("kind") == "click"
+                                   and a.get("role") in {"button", "link"}
+                                   and GOOGLE_GO.fullmatch(a.get("label") or "")), None)  # fmt: skip
+                    what = "Continue (Google shares your name, e-mail and picture)"
+                    if target is not None and GOOGLE_WIDE.search(page.get("text") or ""):
+                        self.ui.event("Google asks to share more than your name and e-mail: that's yours to decide.")
+                        return False
+            if target is None or (url, target["label"]) in done:
+                return False  # nothing safe to click, or the same click again: never retried
+            done.add((url, target["label"]))
+            try:
+                self.browser.act(target, page)
+            except (ExecutionUncertain, StalePage):
+                return False
+            self.history.append({"step": len(self.history) + 1, "action": what, "kind": "click",
+                                 "context": "google sign-in", "source": "google sign-in", "url": url,
+                                 "page_changed": None})  # fmt: skip
+            for _ in range(10):  # Google's windows and redirects take a moment
+                time.sleep(1)
+                try:
+                    self.page = self.browser.observe()
+                    break
+                except StalePage:
+                    continue
+        return False
+
     def wait_for_login(self):
         """Unattended, at a sign-in page: alert the candidate, show the tab and wait for them to sign in or create
         the account (once per company portal; the browser keeps the session). True once the page is past it."""
@@ -908,6 +1000,15 @@ class Agent:
             if q
         ]
         report["pending_total"] = self.profile.add_pending(self.inbox, done)
+        report["claude"] = self.claude
+        if self.receipt:
+            receipt = {k: v for k, v in self.receipt.items() if not k.startswith("_")}
+            head = f"{receipt['at']}  {receipt['url']}\n{receipt['title']}\n\n"
+            (folder / "receipt.txt").write_text(head + receipt["text"] + "\n", encoding="utf-8")
+            if self.receipt.get("_png"):
+                (folder / "receipt.png").write_bytes(self.receipt["_png"])
+                receipt["screenshot"] = "receipt.png"
+            report["receipt"] = {k: v for k, v in receipt.items() if k != "text"} | {"text": receipt["text"][:1500]}
         Path(report["path"]).write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
         self.ui.review(report)
         return report

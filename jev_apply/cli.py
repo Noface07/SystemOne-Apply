@@ -1,6 +1,7 @@
 """jev-apply run <job-url> | jev-apply batch <file of urls> | jev-apply check"""
 
 import argparse
+import json
 import os
 import sys
 from pathlib import Path
@@ -41,9 +42,9 @@ def load(args):
     return profile, policy
 
 
-def backend_problem():
-    """What stops the configured decision model from running, or None."""
-    name = (os.environ.get("DECISION_BACKEND", "laya") or "laya").strip().lower()
+def backend_problem(name=None):
+    """What stops the configured decision model (or `name`) from running, or None."""
+    name = (name or os.environ.get("DECISION_BACKEND", "laya") or "laya").strip().lower()
     if name == "typesafe":
         return None if os.environ.get("TYPESAFE_API_KEY") else "set TYPESAFE_API_KEY in .env (see .env.example)"
     if name == "clef":
@@ -197,7 +198,13 @@ def plan_batch(urls, loaded, default):
             gaps += plan.skill_gaps
             plans.append(plan)
     folder = default_profile.questions_path.parent if default_profile.questions_path else Path(default)
-    jobplan.spread(plans, folder / "applied.json", default_policy)
+    prefs_file = folder / "search.json"
+    prefs = json.loads(prefs_file.read_text(encoding="utf-8")) if prefs_file.is_file() else {}
+    for plan in plans:
+        why = jobplan.blocked(plan.info.company, plan.info.title, plan.info.description, prefs) if plan.info else None
+        if why:
+            plan.deferred = why
+    jobplan.spread([p for p in plans if not p.deferred], folder / "applied.json", default_policy)
     print(f"Plan for {len(plans)} job(s):")
     for n, plan in enumerate(plans, 1):
         who = f"{plan.info.company[:22]} · {plan.info.title[:40]}" if plan.info else plan.url[:64]
@@ -471,6 +478,15 @@ def answer(args):
     return 0
 
 
+def ui_cmd(args):
+    try:
+        from .web.server import serve
+    except ImportError:
+        sys.exit("The web app needs its extra: run `uv sync --extra ui` (or `uv run --extra ui jev-apply ui`).")
+    serve(port=args.port, open_browser=not args.no_browser)
+    return 0
+
+
 def main(argv=None):
     load_environment()
     parser = argparse.ArgumentParser(prog="jev-apply", description="Fill job applications from your own data.")
@@ -536,7 +552,22 @@ def main(argv=None):
     )
     many.add_argument("--browser-profile", default="~/.jev-apply/browser")
     many.add_argument("--runs", default="runs", help="where run reports are written")
+    pilot = sub.add_parser("autopilot", help="search every track, apply to the best fits (data/autopilot.json)")
+    pilot.add_argument("--dry", action="store_true", help="search and pick, but don't apply")
+    face = sub.add_parser("ui", help="open the web app: find jobs, run and watch batches, answer questions, history")
+    face.add_argument("--port", type=int, default=8765)
+    face.add_argument("--no-browser", action="store_true", help="don't open a browser tab")
     args = parser.parse_args(argv)
+    if args.command == "ui":
+        return ui_cmd(args)
+    if args.command == "autopilot":
+        from .web.features import run_autopilot
+
+        summary = run_autopilot(dry=args.dry)
+        print(json.dumps({k: v for k, v in summary.items() if k != "picked"}, indent=2, ensure_ascii=False))
+        for job in summary["picked"]:
+            print(f"  {job.get('score') or 0:>3}  {job.get('company', '')[:24]:<24} {job.get('title', '')[:50]}")
+        return 0
     if args.command == "batch":
         return batch(args)
     if args.command == "check":

@@ -814,3 +814,83 @@ def test_a_saved_resume_scrolled_out_of_view_is_scrolled_back_to_never_uploaded_
     tried = [{"kind": "scroll", "action": "Scroll up inside the form panel", "url": url}] * 4
     d = model.choose(shown, "goal", tried, candidate)
     assert d["operation"] == "BLOCKED" and "saved list" in d["reason"]
+
+
+def test_linkedin_resume_cards_show_no_choice_so_one_click_on_yours_is_enough(laya):
+    # LinkedIn's résumé cards all report unchecked, even the selected one: click yours once and go on.
+    candidate = {**CANDIDATE, "document.resume": "Aarav_Sharma_GenAI.pdf"}
+    cards = [
+        {
+            "id": f"c{n}",
+            "node": n,
+            "kind": "click",
+            "role": "radio",
+            "label": label,
+            "checked": "false",
+            "context": "Resume*",
+        }  # fmt: skip
+        for n, label in ((1, "Aarav_Sharma_GenAI.pdf"), (2, "Aarav_Sharma_GenAI.pdf"), (3, "Resume-.pdf"))
+    ]
+    url = "https://www.linkedin.com/jobs/view/1/"
+    shown = {**page(*cards, button(4, "Next")), "url": url}
+    assert model.choose(shown, "goal", [], candidate)["action"]["id"] == "c1"
+    clicked = [{"kind": "click", "action": "Aarav_Sharma_GenAI.pdf", "url": url, "context": "Resume*"}]
+    assert model.choose(shown, "goal", clicked, candidate)["action"]["label"] == "Next"
+
+
+def test_a_preselected_resume_seen_after_scrolling_back_is_not_scrolled_to_again(laya):
+    # LinkedIn keeps the form box scrolled from the step before, so its preselected résumé (yours) starts above the
+    # visible part. Scrolled back once and found chosen, the run goes on instead of scrolling up and down forever.
+    candidate = {**CANDIDATE, "document.resume": "Aarav_Sharma_Resume_CSharp_DotNET.pdf"}
+    listing = "PDF v4_Aarav_Sharma_Resume_CSharp_DotNET.pdf 10/6/2026 PDF Aarav_Sharma_GenAI.pdf 10/1/2026"
+    card = {"id": "c1", "node": 1, "kind": "click", "role": "radio", "label": "Aarav_Sharma_GenAI.pdf",
+            "checked": "false", "context": listing}  # fmt: skip
+    up = {"id": "scroll_up", "kind": "scroll", "label": "Scroll up inside the form panel", "delta": -300}
+    url = "https://www.linkedin.com/jobs/view/1/"
+    shown = {**page(card, up, button(3, "Next")), "url": url}
+    assert model.choose(shown, "goal", [], candidate)["operation"] == "SCROLL_UP"
+    seen = [
+        {"kind": "scroll", "action": "Scroll up inside the form panel", "url": url},
+        {"kind": "wait", "action": "Wait for the page to update", "url": url},
+        {"kind": "scroll", "action": "Scroll down inside the form panel", "url": url},
+    ]
+    assert model.choose(shown, "goal", seen, candidate)["operation"] != "SCROLL_UP"
+
+
+def test_a_duplicate_copy_of_your_resume_chosen_counts_as_yours(laya):
+    candidate = {**CANDIDATE, "document.resume": "Aarav_Sharma_GenAI.pdf"}
+    cards = [
+        {
+            "id": f"c{n}",
+            "node": n,
+            "kind": "click",
+            "role": "radio",
+            "label": label,
+            "checked": checked,
+            "context": "Resume*",
+        }  # fmt: skip
+        for n, label, checked in (
+            (1, "Aarav_Sharma_GenAI.pdf", "false"),
+            (2, "Aarav_Sharma_GenAI.pdf", "true"),
+            (3, "v4_Aarav_Sharma_DotNET.pdf", "false"),
+        )
+    ]
+    url = "https://www.linkedin.com/jobs/view/1/"
+    clicked = [{"kind": "click", "action": "Aarav_Sharma_GenAI.pdf", "url": url, "context": "Resume*"}]
+    d = model.choose({**page(*cards, button(4, "Next")), "url": url}, "goal", clicked, candidate)
+    assert d["operation"] != "BLOCKED" and d["action"]["label"] == "Next"
+
+
+def test_are_you_from_a_place_is_answered_from_your_city_state_or_country():
+    facts = planner.Facts({"personal.city": "Udaipur", "personal.state": "Rajasthan", "personal.country": "India"})
+    yes_no = [{"kind": "click", "role": "button", "label": o} for o in ("Yes", "No")]
+
+    def said(question):
+        found = planner.profile_answer(question, yes_no, facts)
+        return found[0]["label"] if found else None
+
+    assert said("Are you from Mumbai ?") == "No"
+    assert said("Are you based in Udaipur?") == "Yes"
+    assert said("Are you currently located in India?") == "Yes"
+    assert said("Are you from Mumbai or nearby?") is None  # not one place: the model (or you) decides
+    assert said("Are you willing to relocate to Mumbai?") is None

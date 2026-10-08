@@ -77,3 +77,52 @@ def test_applications_are_spread_across_companies(tmp_path):
     fresh = [jobplan.Plan("x1", JobInfo("x1", "linkedin", "Zuci Systems"), "d")]
     assert all(not p.deferred for p in jobplan.spread(fresh, path, Policy(per_company=0)))  # 0 turns it off
     assert applied.company_of({"title": "C# Developer | Tata Electronics | LinkedIn"}) == "Tata Electronics"
+
+
+def test_a_resume_that_merely_lists_a_skill_loses_to_the_one_built_around_it():
+    # Both list C# and .NET; only one is a .NET résumé. A tie used to go to the first track (automation).
+    automation = profile(
+        headline="Industrial IoT engineer: SCADA, OPC UA, Modbus", skills=["C#", ".NET", "SCADA", "OPC UA"]
+    )
+    dotnet = profile(
+        headline="C# / .NET backend developer", skills=["C#", ".NET 8", "ASP.NET Core Web API", "Entity Framework"]
+    )
+    tracks = {"data/automation": automation, "data/dotnet": dotnet}
+    job = JobInfo("u", "linkedin", "Acme", "Dotnet Developer", ".NET Core, ASP.NET MVC and SQL Server; C# a must.")
+    assert jobplan.choose_track(job, tracks, "data/automation")[0] == "data/dotnet"
+    job = JobInfo("u", "linkedin", "Acme", "SCADA Engineer", "OPC UA, Modbus, PLC integration; some C#.")
+    assert jobplan.choose_track(job, tracks, "data/dotnet")[0] == "data/automation"
+    assert skills.family("ASP.NET MVC") == ".NET" and skills.family("Python") == "Python"
+
+
+def test_a_skill_named_with_its_abbreviation_matches_either_name():
+    assert skills.canonical("Natural Language Processing (NLP)") == "NLP"
+    assert skills.canonical("Large Language Models (LLM)") == "Large Language Models"
+    assert answers("How many years of work experience do you have with NLP?",
+                   "How many years of work experience do you have with Natural Language Processing (NLP)?")  # fmt: skip
+
+
+def test_a_saved_skill_answer_serves_a_question_with_more_words_around_the_skill():
+    saved = "How many years of hands-on experience do you have with Microsoft Azure in a cloud-native environment?"
+    assert answers(saved, "How many years of work experience do you have with Microsoft Azure?")
+    assert not answers(saved, "How many years of work experience do you have with AWS?")
+    # Two skills named: no single skill, so no match by skill.
+    assert skills.asked_skill("How many years of experience do you have with Python and Django?") != "Python"
+
+
+def test_batch_planning_defers_blocked_companies(tmp_path, monkeypatch):
+    from jev_apply import cli, jobinfo
+
+    (tmp_path / "search.json").write_text(json.dumps({"blocked_companies": ["Talentgigs"]}), encoding="utf-8")
+    track = tmp_path / "dotnet"
+    track.mkdir()
+    (track / "profile.json").write_text(json.dumps({**BASE, "skills": ["C#"]}), encoding="utf-8")
+    (tmp_path / "profile.example.json").write_text("{}", encoding="utf-8")
+    loaded = {str(track): cli.load(cli.argparse.Namespace(data=str(track), profile=None, answers=None, policy=None))}
+    info = {
+        "u1": JobInfo("u1", "linkedin", "Talentgigs", ".NET Developer", "C#"),
+        "u2": JobInfo("u2", "linkedin", "Acme", ".NET Developer", "C#"),
+    }
+    monkeypatch.setattr(jobinfo, "fetch", lambda url, client=None: info[url])
+    plans = cli.plan_batch(["u1", "u2"], loaded, str(track))
+    assert plans[0].deferred == "you blocked Talentgigs" and not plans[1].deferred

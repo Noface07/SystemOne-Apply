@@ -64,6 +64,20 @@ Read this before changing `agent.py`, `browser.py`, `snapshot.js` or `policy.py`
     the profile doesn't list, and Yes/No claims (rule 12). A question a later run fills leaves the open list.
     When QUESTIONS.md shows a question this could have handled, fix the rule and add a test, don't just answer it.
 
+20. **The web app adds no second path to a submit.** `jev_apply/web` starts batches only as the
+    `jev-apply batch` process (`web/batches.py`), so rules 1-19 hold unchanged. It listens on 127.0.0.1, refuses
+    other Host headers and needs the per-session token on every `/api` call; keep all three. Everything shown from
+    a job page is escaped (`html` in `static/app.js`). Autopilot (`web/features.run_autopilot`) only picks jobs
+    and starts that same process. Blocked companies and words (`data/search.json`) are deferred in
+    `cli.plan_batch` too, so no batch applies to them, however it is started.
+
+21. **Sign-ins are clicks at most, never typing.** A sign-in wall (`planner.sign_in_wall`: a password box, Workday's
+    sign-in step, an identity provider's page, or only "Continue with Google"-style buttons with no application
+    fields) waits for the candidate. With `google_sign_in` on, `Agent.sign_in_with_google` may click the Google
+    button, the account whose address is the profile's e-mail (never another), and Google's confirmation only
+    when it shares no more than name, e-mail, language and picture; each click once. Anything to type, or wider
+    access, goes back to the candidate.
+
 ## Checks
 
 ```bash

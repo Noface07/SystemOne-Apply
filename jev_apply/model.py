@@ -15,6 +15,7 @@ import math
 import os
 import re
 import time
+from pathlib import Path
 
 import httpx
 
@@ -379,18 +380,21 @@ def draft_text(action, page, profile):
     return house_style(text) or None, meta
 
 
-def claude_code(system, payload, model=None, stdin=None, timeout=None):
+def claude_code(system, payload, model=None, stdin=None, timeout=None, stage="other"):
     """One answer from the Claude Code CLI (`claude -p`) on the candidate's own Claude login, no API key. It runs
     with no tools and no MCP servers, from an empty folder: whatever the input says (job pages, résumés and
     screenshots are untrusted), Claude can only write text back, never read or run anything.
-    Returns (text or None, meta). `stdin` replaces the JSON payload, e.g. stream-json messages with images."""
+    Returns (text or None, meta). `stdin` replaces the JSON payload, e.g. stream-json messages with images.
+    Every call's time, tokens and cost go to runs/claude-usage.jsonl (`stage`: draft, learn, judge...)."""
     import shutil
     import subprocess
     import tempfile
 
     exe = os.environ.get("CLAUDE_CODE_BIN") or shutil.which("claude")
     if not exe:
-        return None, {"model": None, "reason": "the claude CLI (Claude Code) isn't installed or on PATH"}
+        return None, log_claude(
+            stage, {"model": None, "reason": "the claude CLI (Claude Code) isn't installed or on PATH"}
+        )
     model = model or os.environ.get("TEXT_MODEL") or "sonnet"
     command = [exe, "-p", "--tools", "", "--strict-mcp-config", "--no-session-persistence", "--model", model]
     command += ["--output-format", "json", "--system-prompt", system]
@@ -409,7 +413,8 @@ def claude_code(system, payload, model=None, stdin=None, timeout=None):
                 timeout=timeout or int(os.environ.get("CLAUDE_CODE_TIMEOUT") or 180),
             )
     except (OSError, subprocess.TimeoutExpired) as error:
-        return None, {"model": f"claude-code/{model}", "reason": f"claude CLI failed: {error}"}
+        meta = {"model": f"claude-code/{model}", "latency_ms": round((time.perf_counter() - started) * 1000)}
+        return None, log_claude(stage, {**meta, "reason": f"claude CLI failed: {error}"})
     meta = {"model": f"claude-code/{model}", "latency_ms": round((time.perf_counter() - started) * 1000)}
     reply = None
     for line in reversed((done.stdout or "").strip().splitlines() or [""]):  # stream-json: the last "result" line
@@ -421,15 +426,42 @@ def claude_code(system, payload, model=None, stdin=None, timeout=None):
             reply = candidate
             break
     if reply is None:
-        return None, {**meta, "reason": f"claude CLI gave no JSON: {(done.stdout or done.stderr).strip()[:160]!r}"}
+        reason = f"claude CLI gave no JSON: {(done.stdout or done.stderr).strip()[:160]!r}"
+        return None, log_claude(stage, {**meta, "reason": reason})
+    usage = reply.get("usage") or {}
+    meta.update(
+        input_tokens=usage.get("input_tokens"),
+        output_tokens=usage.get("output_tokens"),
+        cache_read_tokens=usage.get("cache_read_input_tokens"),
+        cache_write_tokens=usage.get("cache_creation_input_tokens"),
+        cost_usd=reply.get("total_cost_usd"),
+        api_ms=reply.get("duration_api_ms"),
+    )
     if reply.get("is_error") or done.returncode:
-        return None, {**meta, "reason": f"claude CLI error: {str(reply.get('result'))[:160]!r}"}
-    return str(reply.get("result") or ""), meta
+        return None, log_claude(stage, {**meta, "reason": f"claude CLI error: {str(reply.get('result'))[:160]!r}"})
+    return str(reply.get("result") or ""), log_claude(stage, meta)
+
+
+def log_claude(stage, meta):
+    """Append one Claude call (stage, time, tokens, cost, ok) to runs/claude-usage.jsonl. Returns meta."""
+    meta = {**meta, "stage": stage, "ok": "reason" not in meta}
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        return meta  # tests never write to your usage log
+    try:
+        path = Path(os.environ.get("JEV_CLAUDE_LOG") or "runs/claude-usage.jsonl")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        from datetime import datetime
+
+        with path.open("a", encoding="utf-8") as log:
+            log.write(json.dumps({"at": datetime.now().isoformat(timespec="seconds"), **meta}) + "\n")
+    except OSError:
+        pass  # usage logging never stops an application
+    return meta
 
 
 def draft_with_claude_code(context):
     """Draft an open answer through the Claude Code CLI (see claude_code: no tools, empty folder)."""
-    content, meta = claude_code(DRAFT, context)
+    content, meta = claude_code(DRAFT, context, stage="draft")
     if content is None:
         return None, meta
     text = read_draft(content)
