@@ -10,6 +10,7 @@
   "auto_submit": false,
   "submit_drafts": false,
   "login_wait_s": 900,
+  "answer_wait_s": 300,
   "google_sign_in": false,
   "confirm_wait_s": 15,
   "per_company": 1,
@@ -38,6 +39,6 @@
   ],
 
   "submit_patterns": [
-    "submit", "send application", "apply", "finish", "complete", "confirm and", "send"
+    "submit", "send application", "apply", "finish", "complete", "confirm and", "send", "i'm interested", "i\u2019m interested", "i am interested"
   ]
 }

@@ -201,12 +201,22 @@ uv run --extra ui jev-apply ui          # opens http://127.0.0.1:8765
 Everything the commands do, in one place:
 
 - **Overview:** applications sent, per day and per résumé, open questions, the decision model's state.
-- **Find jobs:** LinkedIn Easy Apply search per résumé track (read without logging in), with the years each job
-  asks, the skills it names and the résumé that fits it. Hidden: closed jobs, senior titles, too many years, jobs
-  you applied to. Tick the ones you want and start applying.
-- **Live batch:** each job as a card while it runs (résumé used, the step it is on, why it stopped), the log, a
+- **Find jobs:** name the roles you'd take (your résumés suggest some, but don't limit the search), then the
+  filters: locations, date posted, on-site / hybrid / remote, years asked, Easy Apply only (off by default), senior
+  titles. Sources: LinkedIn (read without logging in) and, when switched on, hiring.cafe (its search pages are read
+  in a background tab of your Chrome; see `jev_apply/web/hiringcafe.py`). The same posting found on both is listed
+  once. Each job shows the years it asks, the skills it names and the résumé that fits it best. Jobs posted in the
+  last 24 hours come first ("Newest first"; "Best match" sorts by score). Results arrive live and only changed
+  rows redraw. Hidden: closed jobs, senior titles, too many years, jobs you applied to. Tick the ones you want and
+  start applying.
+- **Batches:** every batch, newest first, including ones from earlier sessions (rebuilt from runs/batches/).
+  Open one to follow it live: each job as a card (résumé used, the step it is on, why it stopped), the log, a
   Stop button and "rerun stopped jobs".
-- **Questions:** QUESTIONS.md as cards; options are buttons, answers save straight to the file.
+- **Questions:** QUESTIONS.md as cards; options are buttons, answers save straight to the file. When a running
+  job reaches a required question nothing on file answers, it puts it here at once and waits (Safety settings:
+  "Wait for your answers", 5 minutes by default) with a desktop notification; answer it and the run carries on
+  with the same form. No answer in time: the job stops as before. Jobs that stopped on questions you've since
+  answered are offered here and in the Inbox: "Re-run them".
 - **History:** every application and every run report, field by field, with the model's confidence.
 - **Profile:** edit each track's profile.json as a form (jobs and education as cards, skills as tags, years per
   skill as a table). Shared facts (notice period, CTC, years per skill) can be saved to every track at once; a
@@ -216,8 +226,9 @@ Everything the commands do, in one place:
   kind of role from your shared facts.
 - **Inbox:** everything a run left for you: jobs to finish (with why), drafted answers to read, open questions.
 - **Insights:** per résumé track, how many runs end submitted and the commonest reasons the rest stop.
-- **Autopilot (System):** every day at a set time, search each track, apply to the best-scoring good fits
-  (`jev-apply autopilot`, scheduled with Windows Task Scheduler; `--dry` searches and picks without applying).
+- **Autopilot (System):** every day at a set time, run the saved search you marked "Use for autopilot" (its roles,
+  locations, sources and filters), take the good fits newest first, then by score, and apply (`jev-apply
+  autopilot`, scheduled with Windows Task Scheduler; `--dry` searches and picks without applying).
 - **Safety settings (System):** per track: auto-submit, how sure the model must be, applications per company,
   consent boxes, waits (data/<track>/policy.json, overrides only).
 - **Preferences (Find jobs):** blocked companies and words (also stop batches and autopilot), preferred cities,

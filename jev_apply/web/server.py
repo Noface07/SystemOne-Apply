@@ -5,12 +5,15 @@ It listens on 127.0.0.1 only. It can start batches that submit applications, so 
 session token baked into the page, and requests for any other host are refused (no other website, and no
 DNS-rebinding trick, can drive it)."""
 
+import asyncio
+import json
 import re
 import secrets
+import time
 from pathlib import Path
 
 from fastapi import Body, FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import batches, data, features, jobs, manage
@@ -28,9 +31,11 @@ def create_app(token=None, port=8765):
     async def guard(request: Request, call_next):
         if request.headers.get("host") not in hosts:
             return JSONResponse({"detail": "unknown host"}, status_code=403)
-        if request.url.path.startswith("/api/") and not secrets.compare_digest(
-            request.headers.get("x-jev-token", ""), token
-        ):
+        # A browser's EventSource can't send headers, so a live stream (…/events) carries the token in its query.
+        given = request.headers.get("x-jev-token", "")
+        if not given and request.url.path.endswith("/events"):
+            given = request.query_params.get("token", "")
+        if request.url.path.startswith("/api/") and not secrets.compare_digest(given, token):
             return JSONResponse({"detail": "missing or wrong session token"}, status_code=401)
         response = await call_next(request)
         response.headers["X-Frame-Options"] = "DENY"
@@ -135,6 +140,8 @@ def create_app(token=None, port=8765):
             "open_questions": open_q,
             "recent": apps[:8],
             "active_batch": batches.active(),
+            "waiting_for_answers": batches.waiting(),
+            "rerun_ready": len(features.rerun_ready()),
         }
 
     # ---- history and runs -----------------------------------------------------------------------------------
@@ -163,7 +170,7 @@ def create_app(token=None, port=8765):
     @app.post("/api/questions/{index}")
     def answer(index: int, body: dict = Body(...)):
         try:
-            return data.answer_question(index, body.get("answer", ""))
+            return data.answer_question(index, body.get("answer", ""), body.get("question"))
         except IndexError:
             raise HTTPException(404, "no such question") from None
 
@@ -171,25 +178,46 @@ def create_app(token=None, port=8765):
 
     @app.get("/api/search/defaults")
     def search_defaults():
-        return {"queries": jobs.default_queries(), "boards": bool(jobs.boards_file())}
+        suggestions = jobs.default_queries()
+        return {"suggestions": suggestions, "roles": jobs.as_roles(suggestions), "boards": bool(jobs.boards_file())}
 
     @app.post("/api/search")
     def search(body: dict = Body(...)):
-        queries = {k: [q for q in v if q.strip()] for k, v in (body.get("queries") or {}).items() if v}
-        if not queries:
-            raise HTTPException(400, "pick at least one track and search words")
-        known = {t["id"] for t in data.tracks()}
-        if not set(queries) <= known:
-            raise HTTPException(400, "unknown track")
+        if body.get("queries") is not None:  # the older shape: {track: [search words]}
+            queries = {k: [q for q in v if q.strip()] for k, v in (body.get("queries") or {}).items() if v}
+            if not set(queries) <= {t["id"] for t in data.tracks()}:
+                raise HTTPException(400, "unknown track")
+            body = {**body, "roles": jobs.as_roles(queries)}
+        roles = [r[:80] for r in jobs.as_roles(body.get("roles") if isinstance(body.get("roles"), list) else [])][:30]
+        if not roles:
+            raise HTTPException(400, "name at least one role to search for")
+        locations = [str(x).strip()[:80] for x in body.get("locations") or [body.get("location") or "India"]][:10]
+        sources = [x for x in body.get("sources") or ["linkedin"] if x in jobs.SOURCES]
+        if not sources:
+            raise HTTPException(400, "switch on at least one source (LinkedIn or hiring.cafe)")
         task = jobs.start_search(
-            queries,
-            location=body.get("location") or "India",
+            roles,
+            locations=[x for x in locations if x] or ["India"],
             posted=body.get("posted") or "week",
             max_years=body.get("max_years"),
-            easy_apply=body.get("easy_apply", True),
-            include_senior=body.get("include_senior", False),
+            easy_apply=bool(body.get("easy_apply", False)),
+            include_senior=bool(body.get("include_senior", False)),
+            workplaces=[w for w in body.get("workplaces") or [] if w in jobs.WORKPLACE],
+            sources=sources,
         )
         return {"id": task}
+
+    @app.post("/api/search/{task_id}/stop")
+    def search_stop(task_id: str):
+        if not jobs.stop_search(task_id):
+            raise HTTPException(404, "no such search")
+        return {"stopping": True}
+
+    @app.get("/api/search/{task_id}/events")
+    async def search_events(task_id: str, request: Request):
+        if not jobs.get_search(task_id):
+            raise HTTPException(404, "no such search")
+        return live(request, lambda: jobs.get_search(task_id), "jobs", "key")
 
     @app.get("/api/search/{task_id}")
     def search_status(task_id: str):
@@ -284,6 +312,10 @@ def create_app(token=None, port=8765):
         years = int(system["years"]) if system.get("years") is not None else None
         return {"id": jobs.start_links(urls, max_years=years)}
 
+    @app.get("/api/rerun")
+    def rerun():
+        return {"jobs": features.rerun_ready()}
+
     @app.get("/api/dismissed")
     def dismissed_list():
         return features.dismissed()
@@ -344,7 +376,8 @@ def create_app(token=None, port=8765):
         if not path:
             raise HTTPException(404, "no data/boards.txt")
         lines = path.read_text(encoding="utf-8").splitlines()
-        found, problems = jobs.scan_boards(lines, body.get("keywords") or (), body.get("max_years"))
+        keywords = [str(k)[:80] for k in body.get("keywords") or body.get("roles") or ()][:30]
+        found, problems = jobs.scan_boards(lines, keywords, body.get("max_years"))
         return {"jobs": found, "problems": problems, "file": data.rel(path)}
 
     # ---- batches --------------------------------------------------------------------------------------------
@@ -362,6 +395,12 @@ def create_app(token=None, port=8765):
         except (RuntimeError, ValueError) as error:
             raise HTTPException(409, str(error)) from None
 
+    @app.get("/api/batches/{batch_id}/events")
+    async def batch_events(batch_id: str, request: Request):
+        if not batches.get(batch_id):
+            raise HTTPException(404, "no such batch")
+        return live(request, lambda: batches.get(batch_id, log_all=True), "jobs", "n", log=True)
+
     @app.get("/api/batches/{batch_id}")
     def batch_state(batch_id: str):
         found = batches.get(batch_id)
@@ -376,6 +415,57 @@ def create_app(token=None, port=8765):
         return {"stopped": True}
 
     return app
+
+
+FINAL = {"done", "failed", "stopped"}
+STREAM_S = 600  # a stream ends after this long; the browser reconnects by itself and gets the whole state again
+
+
+def live(request, snapshot, items, key, log=False):
+    """Server-sent events for a search or a batch: the whole state first, then only what changed: the items (jobs)
+    whose content changed, the head (state, progress, problems...) when it changed, and new log lines. The page
+    patches just those, instead of redrawing everything on a timer."""
+
+    async def events():
+        sent, head_sent, log_sent, started, quiet = {}, None, 0, time.monotonic(), 0.0
+        first = True
+        while time.monotonic() - started < STREAM_S:
+            if await request.is_disconnected():
+                return
+            snap = snapshot()
+            if snap is None:
+                yield "event: gone\ndata: {}\n\n"
+                return
+            changed = []
+            for item in snap.get(items) or []:
+                body = json.dumps(item, sort_keys=True, default=str)
+                if sent.get(item[key]) != body:
+                    sent[item[key]] = body
+                    changed.append(item)
+            lines = snap.pop("log", None) if log else None
+            head = {k: v for k, v in snap.items() if k != items}
+            head_json = json.dumps(head, sort_keys=True, default=str)
+            new_lines = []
+            if lines is not None:
+                total = snap.get("log_n", len(lines))
+                new_lines = lines[-(total - log_sent) :] if total > log_sent else []
+                new_lines = new_lines[-400:] if first else new_lines
+                log_sent = total
+            if first or changed or head_json != head_sent or new_lines:
+                head_sent = head_json
+                message = {**head, items: changed, "full": first, "log_add": new_lines}
+                yield f"data: {json.dumps(message, default=str)}\n\n"
+                first, quiet = False, 0.0
+            elif quiet > 15:
+                yield ": still here\n\n"  # keeps proxies and the browser from timing the stream out
+                quiet = 0.0
+            if snap.get("state") in FINAL and not changed and not new_lines:
+                yield "event: end\ndata: {}\n\n"
+                return
+            await asyncio.sleep(0.4)
+            quiet += 0.4
+
+    return StreamingResponse(events(), media_type="text/event-stream", headers={"X-Accel-Buffering": "no"})
 
 
 def _count(items, key):

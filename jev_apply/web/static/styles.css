@@ -354,3 +354,30 @@ table.data tr.click:hover td { background: var(--panel-2); }
 @keyframes scan { from { transform: translateX(-100%); } to { transform: translateX(100%); } }
 @keyframes shimmer { to { background-position: -200% 0; } }
 @media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
+
+/* role-first Find jobs, live results, batches list */
+.filters { display: flex; gap: 14px; flex-wrap: wrap; align-items: flex-end; margin-top: 14px; }
+.filters .sep { width: 1px; align-self: stretch; background: var(--line-2); }
+.suggest { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; margin-top: 8px; font-size: 12.5px; }
+.suggest .chip { cursor: pointer; border: 0; font-weight: 500; }
+.suggest .chip:hover { filter: brightness(1.15); }
+.row-chips { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
+.row-chips:empty { display: none; }
+.chip.fresh { --c: var(--blue); }
+.back { display: inline-block; margin-bottom: 10px; color: var(--muted); text-decoration: none; font-size: 13px; font-weight: 600; }
+.back:hover { color: var(--text); }
+.batch-row .meta { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.batch-row:hover { background: var(--panel-2); }
+
+/* a page that takes a moment: the one you left fades at once, then a loader */
+main.leaving > * { opacity: .45; pointer-events: none; transition: opacity .12s; }
+.page-loading { display: flex; align-items: center; gap: 10px; color: var(--muted); font-weight: 600; padding: 6px 2px; }
+.spinner { width: 16px; height: 16px; border-radius: 99px; border: 2px solid var(--line-2); border-top-color: var(--accent); animation: spin .7s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* a run waiting for your answers */
+.needs.waiting-answer { border-color: color-mix(in srgb, var(--amber) 55%, var(--line)); }
+.needs.waiting-answer a { font-weight: 600; margin-left: 4px; }
+.card.q.waiting-q { border-color: color-mix(in srgb, var(--amber) 60%, var(--line)); box-shadow: 0 0 0 3px color-mix(in srgb, var(--amber) 18%, transparent); }
+nav .count.pulse { animation: ping 1.4s infinite; box-shadow: 0 0 0 0 var(--amber); background: var(--amber); }
+.rerun-banner { display: flex; align-items: center; gap: 10px; }

@@ -3,16 +3,30 @@
 
 const TOKEN = document.querySelector('meta[name="jev-token"]').content;
 const main = document.getElementById("main");
-const state = { system: null, tracks: [], timers: [], search: null, selected: new Map(), filter: "fit", submit: true };
+const state = { system: null, tracks: [], timers: [], streams: [], search: null, selected: new Map(), filter: "fit", sort: "newest", submit: true };
 
 // ---- helpers --------------------------------------------------------------------------------------------------
 
+// Each page visit gets its own AbortController. A page's reads still in flight when you move on are cancelled and
+// never resolve, so a slow page can't draw itself over the one you went to. Writes are never cancelled.
+let nav = new AbortController();
+const NEVER = new Promise(() => {});
+
 async function api(path, { method = "GET", body } = {}) {
-  const res = await fetch(`/api${path}`, {
-    method,
-    headers: { "X-Jev-Token": TOKEN, ...(body ? { "Content-Type": "application/json" } : {}) },
-    body: body ? JSON.stringify(body) : undefined,
-  });
+  const signal = method === "GET" ? nav.signal : undefined;
+  let res;
+  try {
+    res = await fetch(`/api${path}`, {
+      method,
+      signal,
+      headers: { "X-Jev-Token": TOKEN, ...(body ? { "Content-Type": "application/json" } : {}) },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+  } catch (e) {
+    if (signal?.aborted) return NEVER;
+    throw e;
+  }
+  if (signal?.aborted) return NEVER;
   if (res.status === 401 && !sessionStorage.getItem("jev-reloaded")) {
     sessionStorage.setItem("jev-reloaded", "1"); // the app restarted with a new session token: pick it up
     location.reload();
@@ -23,7 +37,17 @@ async function api(path, { method = "GET", body } = {}) {
     const detail = await res.json().catch(() => ({}));
     throw new Error(detail.detail || `${res.status} ${res.statusText}`);
   }
-  return res.json();
+  const data = await res.json();
+  return signal?.aborted ? NEVER : data;
+}
+
+// Polled views redraw only when what they show has changed: an identical redraw every second resets hover,
+// focus, text selection and open <details>, which is what made the live pages flicker.
+function changed(slot, value) {
+  const now = JSON.stringify(value);
+  if (state.drawn?.[slot] === now) return false;
+  (state.drawn ||= {})[slot] = now;
+  return true;
 }
 
 const ESC = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
@@ -38,13 +62,23 @@ function out(v) {
 function html(strings, ...vals) {
   return raw(strings.reduce((acc, s, i) => acc + s + (i < vals.length ? out(vals[i]) : ""), ""));
 }
-const mount = (el, view) => { el.innerHTML = view.__html; return el; };
+const mount = (el, view) => {
+  el.innerHTML = view.__html;
+  if (el === main) {
+    main.classList.remove("leaving");
+    if (view !== LOADER) main.__nav = nav; // this visit's page has drawn: no loader needed
+  }
+  return el;
+};
 const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
 const safeUrl = (u) => (/^https?:\/\//i.test(u || "") ? u : "#");
 
 function every(ms, fn) { fn(); const id = setInterval(fn, ms); state.timers.push(id); return id; }
-function clearTimers() { state.timers.forEach(clearInterval); state.timers = []; }
+function clearTimers() {
+  state.timers.forEach(clearInterval); state.timers = [];
+  state.streams.forEach((es) => es.close()); state.streams = [];
+}
 
 function toast(message, color = "var(--accent)") {
   const el = document.createElement("div");
@@ -122,6 +156,10 @@ async function refreshShell() {
     q.hidden = !ov.open_questions;
     q.textContent = ov.open_questions;
     $("#nav-live").hidden = !ov.active_batch;
+    state.waiting = ov.waiting_for_answers || [];
+    state.rerunReady = ov.rerun_ready || 0;
+    q.classList.toggle("pulse", state.waiting.length > 0);
+    noticeWaiting(state.waiting);
     api("/queue").then((qd) => { const n = $("#nav-inbox"); n.hidden = !qd.items.length; n.textContent = qd.items.length; }).catch(() => {});
     state.activeBatch = ov.active_batch;
     const clef = system.clef;
@@ -138,16 +176,65 @@ async function refreshShell() {
   } catch (e) { /* the page still works; the badge waits for the next refresh */ }
 }
 
+// A run waiting for your answers: say so once per question set, here and as a desktop notification.
+function noticeWaiting(waiting) {
+  const key = waiting.map((w) => `${w.batch}:${w.n}:${w.questions.join("|")}`).join(";");
+  if (!key || key === state.waitingKey) { state.waitingKey = key || state.waitingKey; return; }
+  state.waitingKey = key;
+  const n = waiting.reduce((a, w) => a + w.questions.length, 0);
+  const text = `A run is waiting for your answer${n > 1 ? `s to ${n} questions` : ""}: ${waiting[0].questions[0]}`;
+  toast(`${text} (Questions)`, "var(--amber)");
+  try {
+    if (window.Notification && Notification.permission === "granted") {
+      const note = new Notification("jev-apply needs an answer", { body: text, tag: "jev-waiting" });
+      note.onclick = () => { window.focus(); location.hash = "#/questions"; };
+    }
+  } catch { /* notifications unavailable */ }
+  if (onPage("questions") && !document.activeElement?.matches?.("input, textarea")) questions();
+}
+
+function askNotifications() {
+  try { if (window.Notification && Notification.permission === "default") Notification.requestPermission(); } catch { /* no notifications */ }
+}
+
+function rerunBanner(jobs) {
+  if (!jobs?.length) return "";
+  return html`<div class="banner ok rerun-banner"><span>${icon.play}</span>
+    <span><b>${jobs.length} job${jobs.length > 1 ? "s" : ""} stopped on questions you've now answered.</b> <span class="muted">Run ${jobs.length > 1 ? "them" : "it"} again and your answers fill in.</span></span>
+    <button class="btn sm primary" id="rerun-ready" style="margin-left:auto">${icon.play}Re-run ${jobs.length > 1 ? "them" : "it"}</button></div>`;
+}
+
+function wireRerun(jobs) {
+  const b = $("#rerun-ready");
+  if (b) b.onclick = () => confirmBatch(jobs.map((j) => j.url), `Re-run ${jobs.length} job${jobs.length > 1 ? "s" : ""}?`);
+}
+
 const pages = { "": overview, find, batch: batchPage, inbox: inboxPage, questions, profile: profilePage, history, insights: insightsPage, settings };
 
 async function route() {
   clearTimers();
+  main.onclick = null; // page-level click handlers (the batch page) belong to the page you left
+  nav.abort();
+  const mine = (nav = new AbortController());
+  state.drawn = {};
   const [name, arg] = location.hash.replace(/^#\/?/, "").split("/");
   $$("#nav a").forEach((a) => a.classList.toggle("on", a.dataset.page === (name || "overview")));
   const page = pages[name] || overview;
   main.scrollTo?.(0, 0);
-  try { await page(arg); } catch (e) { mount(main, html`<div class="card empty">${icon.x}Couldn't load this page: ${e.message}</div>`); }
+  // The page you left fades at once (and takes no clicks); if the new one hasn't drawn within 150 ms, a loader
+  // takes its place, so a slow page never leaves the previous one standing.
+  main.classList.add("leaving");
+  const slow = setTimeout(() => { if (mine === nav && main.__nav !== mine) mount(main, LOADER); }, 150);
+  try { await page(arg); } catch (e) {
+    if (mine === nav) mount(main, html`<div class="card empty">${icon.x}Couldn't load this page: ${e.message}</div>`);
+  } finally {
+    if (mine === nav) { clearTimeout(slow); main.classList.remove("leaving"); } // e.g. "stay on this page" in Profile
+  }
 }
+const LOADER = html`<div class="page-loading" role="status" aria-live="polite"><span class="spinner"></span>Loading…</div>
+  <div class="grid g4" style="margin-top:16px">${[1, 2, 3, 4].map(() => html`<div class="card kpi"><div class="sk" style="width:55%"></div><div class="sk" style="height:28px;margin-top:12px;width:35%"></div></div>`)}</div>
+  <div class="card" style="margin-top:16px">${[1, 2, 3].map(() => html`<div class="sk" style="height:18px;margin:10px 0"></div>`)}</div>`;
+const onPage = (prefix) => location.hash.replace(/^#\/?/, "").startsWith(prefix);
 
 // ---- overview -------------------------------------------------------------------------------------------------
 
@@ -206,43 +293,103 @@ async function overview() {
     </div>`);
 }
 
+// ---- live streams ---------------------------------------------------------------------------------------------
+
+// A search or a batch is followed over server-sent events: the whole state once, then only what changed. Streams
+// close when you leave the page (route → clearTimers).
+function stream(path, { message, end }) {
+  const es = new EventSource(`/api${path}${path.includes("?") ? "&" : "?"}token=${encodeURIComponent(TOKEN)}`);
+  state.streams.push(es);
+  es.onmessage = (e) => { try { message(JSON.parse(e.data)); } catch (err) { console.error(err); } };
+  const finish = () => { es.close(); end?.(); };
+  es.addEventListener("end", finish);
+  es.addEventListener("gone", finish);
+  es.onerror = () => {
+    // The browser reconnects by itself after a dropped connection. Closed for good: the app restarted (new
+    // token: api() reloads the page) or the search/batch is gone.
+    if (es.readyState === EventSource.CLOSED) api("/system").catch(() => {});
+  };
+  return es;
+}
+
+// Patch a list in place: one element per key, in `keys` order. An element is redrawn only when its content
+// (sig) changed, and moved only when it's out of place, so nothing flickers, and open panels, focus and hover stay.
+function reconcile(parent, keys, sigOf, htmlOf) {
+  const have = new Map([...parent.children].map((el) => [el.dataset.k, el]));
+  keys.forEach((k, i) => {
+    const sig = sigOf(k);
+    let el = have.get(k);
+    if (!el || el.dataset.sig !== sig) {
+      const tpl = document.createElement("template");
+      tpl.innerHTML = htmlOf(k).__html.trim();
+      const fresh = tpl.content.firstElementChild;
+      fresh.dataset.k = k;
+      fresh.dataset.sig = sig;
+      if (el) el.replaceWith(fresh); else parent.append(fresh);
+      el = fresh;
+    }
+    have.delete(k);
+    if (parent.children[i] !== el) parent.insertBefore(el, parent.children[i] || null);
+  });
+  have.forEach((el) => el.remove());
+}
+
+function setHtml(el, view) { if (el && el.__last !== view.__html) { el.__last = view.__html; el.innerHTML = view.__html; } }
+
 // ---- find jobs ------------------------------------------------------------------------------------------------
+
+const FORM_KEY = "jev-find-form";
+const SOURCE_NAMES = { linkedin: "LinkedIn", hiringcafe: "hiring.cafe", board: "company board" };
+const WORKPLACE_NAMES = { onsite: "On-site", hybrid: "Hybrid", remote: "Remote" };
+
+function saveForm() { try { localStorage.setItem(FORM_KEY, JSON.stringify(state.findForm)); } catch { /* private window */ } }
 
 async function find() {
   if (!state.findForm) {
     const [defaults, system, tracks] = await Promise.all([api("/search/defaults"), api("/system"), api("/tracks")]);
     state.tracks = tracks;
+    let kept = null;
+    try { kept = JSON.parse(localStorage.getItem(FORM_KEY) || "null"); } catch { kept = null; }
     state.findForm = {
-      queries: defaults.queries,
-      on: Object.fromEntries(Object.keys(defaults.queries).map((k) => [k, true])),
-      posted: "week", location: "India", maxYears: system.years != null ? Math.floor(system.years) : 2,
-      easy: true, senior: false, boards: defaults.boards,
+      roles: defaults.roles, locations: ["India"], posted: "week", workplaces: [],
+      maxYears: system.years != null ? Math.floor(system.years) : 2, easy: false, senior: false,
+      sources: { linkedin: true, hiringcafe: false },
+      ...(kept && Array.isArray(kept.roles) ? kept : {}),
+      suggestions: defaults.suggestions, boards: defaults.boards,
     };
   }
   renderFind();
-  if (state.search && state.search.state !== "done") pollSearch();
+  if (state.search?.id && state.search.state !== "done") followSearch(state.search.id);
+}
+
+function chipBox(list, attr, placeholder) {
+  return html`<div class="tags" data-box="${attr}">${list.map((w, i) => html`<span class="chip">${w}<button data-del="${i}" title="Remove">×</button></span>`)}
+    <input type="text" placeholder="${placeholder}" data-add></div>`;
 }
 
 function renderFind() {
   const f = state.findForm;
+  const suggest = Object.entries(f.suggestions || {}).map(([t, words]) => [t, words.filter((w) => !f.roles.includes(w))]).filter(([, w]) => w.length);
   mount(main, html`
-    <div class="page-head"><div><h1>Find jobs</h1><p class="sub">LinkedIn Easy Apply, read without logging in. Each job gets the résumé that fits it best.</p></div></div>
+    <div class="page-head"><div><h1>Find jobs</h1><p class="sub">Name the roles you'd take. Every job that fits your filters is listed; each one shows which résumé fits it best and what it asks that your résumés don't.</p></div></div>
     <div class="card">
-      <div class="grid g3" id="tracks">${Object.entries(f.queries).map(([id, words]) => html`
-        <div class="track-pick ${f.on[id] ? "" : "off"}" data-track="${id}">
-          <header>${trackChip(id)}<label class="toggle" style="margin-left:auto" title="Search for this résumé"><input type="checkbox" data-on ${f.on[id] ? "checked" : ""}></label></header>
-          <div class="file">${(state.tracks.find((t) => t.id === id) || {}).resume || ""}</div>
-          <div class="tags">${words.map((w, i) => html`<span class="chip">${w}<button data-del="${i}" title="Remove">×</button></span>`)}
-            <input type="text" placeholder="Add search words…" data-add></div>
-        </div>`)}</div>
-      <div style="display:flex;gap:16px;flex-wrap:wrap;align-items:flex-end;margin-top:16px">
+      <label class="field"><span>Roles</span>${chipBox(f.roles, "roles", "Add a role, then Enter (e.g. Solutions Engineer)")}</label>
+      ${suggest.length ? html`<div class="suggest"><span class="muted">From your résumés:</span>${suggest.map(([t, words]) => words.map((w) => html`<button class="chip t-${trackKey(t)}" data-suggest="${w}" title="Add this role">+ ${w}</button>`))}</div>` : ""}
+      <div class="filters">
+        <label class="field" style="min-width:220px;flex:1"><span>Locations</span>${chipBox(f.locations, "locations", "City or country, then Enter")}</label>
         <label class="field"><span>Posted</span><div class="seg" id="posted">${["day", "week", "month"].map((p) => html`<button data-p="${p}" class="${f.posted === p ? "on" : ""}">${{ day: "24 hours", week: "Past week", month: "Past month" }[p]}</button>`)}</div></label>
-        <label class="field" style="width:170px"><span>Location</span><input type="text" id="loc" value="${f.location}"></label>
-        <label class="field" style="width:130px"><span>Max years asked</span><input type="number" id="years" min="0" max="20" step="1" value="${f.maxYears}"></label>
+        <label class="field"><span>Workplace <span class="faint">(none = any)</span></span><div class="seg" id="workplace">${Object.entries(WORKPLACE_NAMES).map(([k, l]) => html`<button data-w="${k}" class="${f.workplaces.includes(k) ? "on" : ""}">${l}</button>`)}</div></label>
+        <label class="field" style="width:120px"><span>Max years asked</span><input type="number" id="years" min="0" max="20" step="1" value="${f.maxYears ?? ""}"></label>
+      </div>
+      <div class="filters">
+        <span class="muted" style="font-size:12.5px;font-weight:600">Sources</span>
+        <label class="toggle"><input type="checkbox" data-src="linkedin" ${f.sources.linkedin ? "checked" : ""}>LinkedIn</label>
+        <label class="toggle" title="Opens hiringcafe.com in a background tab of your Chrome to read its search results"><input type="checkbox" data-src="hiringcafe" ${f.sources.hiringcafe ? "checked" : ""}>hiring.cafe <span class="faint">(uses your Chrome)</span></label>
+        <span class="sep"></span>
         <label class="toggle"><input type="checkbox" id="easy" ${f.easy ? "checked" : ""}>Easy Apply only</label>
         <label class="toggle"><input type="checkbox" id="senior" ${f.senior ? "checked" : ""}>Include senior titles</label>
         <span style="flex:1"></span>
-        ${f.boards ? html`<button class="btn" id="boards">Scan company boards</button>` : ""}
+        ${f.boards ? html`<button class="btn" id="boards">Company boards</button>` : ""}
         <button class="btn primary" id="go">${icon.search}Search</button>
       </div>
       <div id="prefs-panel"></div>
@@ -256,20 +403,29 @@ function renderFind() {
     <div id="results" style="margin-top:16px"></div>
     <div id="dock-slot"></div>`);
 
-  $$(".track-pick").forEach((card) => {
-    const id = card.dataset.track;
-    $("[data-on]", card).onchange = (e) => { f.on[id] = e.target.checked; card.classList.toggle("off", !e.target.checked); };
-    $$("[data-del]", card).forEach((b) => (b.onclick = () => { f.queries[id].splice(+b.dataset.del, 1); renderFind(); }));
-    const add = $("[data-add]", card);
+  $$("[data-box]").forEach((box) => {
+    const list = f[box.dataset.box];
+    $$("[data-del]", box).forEach((b) => (b.onclick = (e) => { e.preventDefault(); list.splice(+b.dataset.del, 1); saveForm(); renderFind(); }));
+    const add = $("[data-add]", box);
     add.onkeydown = (e) => {
-      if (e.key === "Enter" && add.value.trim()) { f.queries[id].push(add.value.trim()); renderFind(); $(`[data-track="${CSS.escape(id)}"] [data-add]`)?.focus(); }
+      if (e.key !== "Enter" || !add.value.trim()) return;
+      e.preventDefault();
+      add.value.split(/[;|]/).map((v) => v.trim()).filter((v) => v && !list.includes(v)).forEach((v) => list.push(v));
+      saveForm(); renderFind();
+      $(`[data-box="${box.dataset.box}"] [data-add]`)?.focus();
     };
   });
-  $$("#posted button").forEach((b) => (b.onclick = () => { f.posted = b.dataset.p; $$("#posted button").forEach((x) => x.classList.toggle("on", x === b)); }));
-  $("#loc").oninput = (e) => (f.location = e.target.value);
-  $("#years").oninput = (e) => (f.maxYears = e.target.value === "" ? null : +e.target.value);
-  $("#easy").onchange = (e) => (f.easy = e.target.checked);
-  $("#senior").onchange = (e) => (f.senior = e.target.checked);
+  $$("[data-suggest]").forEach((b) => (b.onclick = () => { f.roles.push(b.dataset.suggest); saveForm(); renderFind(); }));
+  $$("#posted button").forEach((b) => (b.onclick = () => { f.posted = b.dataset.p; saveForm(); $$("#posted button").forEach((x) => x.classList.toggle("on", x === b)); }));
+  $$("#workplace button").forEach((b) => (b.onclick = () => {
+    const w = b.dataset.w;
+    f.workplaces = f.workplaces.includes(w) ? f.workplaces.filter((x) => x !== w) : [...f.workplaces, w];
+    b.classList.toggle("on", f.workplaces.includes(w)); saveForm();
+  }));
+  $$("[data-src]").forEach((i) => (i.onchange = () => { f.sources[i.dataset.src] = i.checked; saveForm(); }));
+  $("#years").oninput = (e) => { f.maxYears = e.target.value === "" ? null : +e.target.value; saveForm(); };
+  $("#easy").onchange = (e) => { f.easy = e.target.checked; saveForm(); };
+  $("#senior").onchange = (e) => { f.senior = e.target.checked; saveForm(); };
   $("#go").onclick = startSearch;
   $("#links").oninput = (e) => (state.linksText = e.target.value);
   $("#links-go").onclick = async () => {
@@ -277,11 +433,9 @@ function renderFind() {
     if (!urls.length) return toast("Paste at least one job link (starting with http).", "var(--amber)");
     try {
       const { id } = await api("/links", { method: "POST", body: { urls } });
-      state.search = { id, state: "reading", jobs: [], progress: [0, urls.length], problems: [] };
-      state.selected.clear();
+      newSearch(id, "reading");
       state.filter = "all";
-      renderResults();
-      pollSearch();
+      followSearch(id);
     } catch (e) { toast(e.message, "var(--red)"); }
   };
   if ($("#boards")) $("#boards").onclick = () => { state.boardsOpen = !state.boardsOpen; renderBoards(); };
@@ -290,33 +444,51 @@ function renderFind() {
   renderResults();
 }
 
+function newSearch(id, phase = "searching") {
+  state.search = { id, state: phase, progress: [0, 0], problems: [], jobs: new Map(), order: [] };
+  state.boardJobs = [];
+  state.selected.clear();
+  renderResults();
+}
+
 async function startSearch() {
   const f = state.findForm;
-  const queries = Object.fromEntries(Object.entries(f.queries).filter(([id, w]) => f.on[id] && w.length));
-  if (!Object.keys(queries).length) return toast("Turn on at least one résumé track with search words.", "var(--amber)");
+  const sources = Object.entries(f.sources).filter(([, on]) => on).map(([k]) => k);
+  if (!f.roles.length) return toast("Add at least one role to search for.", "var(--amber)");
+  if (!sources.length) return toast("Switch on LinkedIn or hiring.cafe.", "var(--amber)");
   try {
-    const { id } = await api("/search", { method: "POST", body: { queries, location: f.location, posted: f.posted, max_years: f.maxYears, easy_apply: f.easy, include_senior: f.senior } });
-    state.search = { id, state: "searching", jobs: [], progress: [0, 0], problems: [] };
-    state.selected.clear();
-    renderResults();
-    pollSearch();
+    const { id } = await api("/search", { method: "POST", body: {
+      roles: f.roles, locations: f.locations, posted: f.posted, workplaces: f.workplaces, max_years: f.maxYears,
+      easy_apply: f.easy, include_senior: f.senior, sources } });
+    newSearch(id);
+    if (f.sources.hiringcafe) toast("hiring.cafe opens in a background tab of your Chrome.");
+    followSearch(id);
   } catch (e) { toast(e.message, "var(--red)"); }
 }
 
-function pollSearch() {
-  const id = every(1200, async () => {
-    if (!state.search || !location.hash.startsWith("#/find")) return clearInterval(id);
-    try {
-      state.search = { ...(await api(`/search/${state.search.id}`)), boards: state.search.boards };
-      if (state.search.state === "done") {
-        clearInterval(id);
-        const fits = state.search.jobs.filter((j) => j.fit);
-        toast(`${fits.length} good fits out of ${state.search.jobs.length} jobs found.`, "var(--green)");
+function followSearch(id) {
+  stream(`/search/${id}/events`, {
+    message: (m) => {
+      const s = state.search;
+      if (!s || s.id !== id) return;
+      if (m.full) { s.jobs = new Map(); s.order = []; }
+      for (const j of m.jobs) {
+        if (!s.jobs.has(j.key)) s.order.push(j.key);
+        s.jobs.set(j.key, j);
       }
-      renderResults();
-    } catch (e) { clearInterval(id); toast(e.message, "var(--red)"); }
+      Object.assign(s, { state: m.state, progress: m.progress, problems: m.problems, params: m.params });
+      if (m.state === "done" && !s.announced) {
+        s.announced = true;
+        const all = [...s.jobs.values()];
+        toast(`${all.filter((j) => j.fit).length} good fits out of ${all.length} jobs (${all.filter((j) => j.fresh).length} posted in the last 24 hours).`, "var(--green)");
+      }
+      scheduleResults();
+    },
   });
 }
+
+let resultsFrame = 0;
+function scheduleResults() { if (!resultsFrame) resultsFrame = requestAnimationFrame(() => { resultsFrame = 0; updateResults(); }); }
 
 async function renderBoards() {
   const slot = $("#boards-panel");
@@ -326,7 +498,7 @@ async function renderBoards() {
   try { b = await api("/boards"); } catch (e) { return toast(e.message, "var(--red)"); }
   const logo = { greenhouse: "GH", lever: "LV", ashby: "AS" };
   mount(slot, html`<div class="card" style="margin-top:16px">
-    <div class="card-head"><div><h2>Company boards</h2><p class="sub">Companies' own careers pages on Greenhouse, Lever or Ashby: no login needed, often jobs LinkedIn doesn't show. ${b.own ? html`Saved in <span class="mono">${b.file}</span>.` : html`These are examples; your first change saves your own list.`}</p></div>
+    <div class="card-head"><div><h2>Company boards</h2><p class="sub">Companies' own careers pages on Greenhouse, Lever or Ashby: no login needed, often jobs LinkedIn doesn't show. A job matches when its title names one of your roles. ${b.own ? html`Saved in <span class="mono">${b.file}</span>.` : html`These are examples; your first change saves your own list.`}</p></div>
       <button class="btn primary" id="scan-boards" ${b.boards.length ? "" : "disabled"}>${icon.search}Scan ${b.boards.length} board${b.boards.length === 1 ? "" : "s"}</button></div>
     <div class="board-list">${b.boards.map((x) => html`<span class="board"><b>${logo[x.provider]}</b><a href="${safeUrl(x.url)}" target="_blank" rel="noopener">${x.token}</a><button data-delboard="${x.entry}" title="Remove">×</button></span>`)}</div>
     <div style="display:flex;gap:8px;margin-top:14px"><input type="text" id="board-new" placeholder="Paste a careers-page link (job-boards.greenhouse.io/acme, jobs.lever.co/acme, jobs.ashbyhq.com/acme) or greenhouse:acme"><button class="btn" id="board-add">Add</button></div>
@@ -352,87 +524,152 @@ async function renderBoards() {
 async function scanBoards() {
   toast("Reading your company boards…");
   try {
-    const res = await api("/boards/scan", { method: "POST", body: { max_years: state.findForm.maxYears } });
-    state.search = state.search || { id: null, state: "done", jobs: [], progress: [0, 0], problems: [] };
-    state.search.boards = res.jobs.map((j) => ({ ...j, key: j.url, fit: true, state: "read", board: true }));
+    const res = await api("/boards/scan", { method: "POST", body: { roles: state.findForm.roles, max_years: state.findForm.maxYears } });
+    if (!state.search) newSearch(null, "done");
+    state.boardJobs = res.jobs.map((j) => ({ ...j, key: j.url, fit: true, state: "read", board: true, provider: "board" }));
     toast(`${res.jobs.length} jobs from company boards.`, "var(--green)");
     renderResults();
   } catch (e) { toast(e.message, "var(--red)"); }
 }
 
+function allJobs() {
+  const s = state.search;
+  return s ? [...s.order.map((k) => s.jobs.get(k)), ...(state.boardJobs || [])] : [];
+}
+
+function jobGroups(jobs) {
+  return {
+    fit: jobs.filter((j) => j.fit),
+    fresh: jobs.filter((j) => j.fresh && !j.known && !j.dismissed),
+    all: jobs,
+    hidden: jobs.filter((j) => (j.state === "read" && !j.fit) || j.known || j.dismissed),
+  };
+}
+
+// While a search runs, rows keep their place (24-hour jobs first, then as found) so nothing jumps around; when it
+// finishes they're sorted: newest first, or best match.
+function ordered(list, busy) {
+  const fresh = (j) => (j.fresh ? 0 : 1);
+  if (busy) return [...list].sort((a, b) => fresh(a) - fresh(b));
+  if (state.sort === "match") return [...list].sort((a, b) => (b.score ?? -1) - (a.score ?? -1));
+  return [...list].sort((a, b) => fresh(a) - fresh(b) || (b.score ?? -1) - (a.score ?? -1) || (a.age_hours ?? 1e9) - (b.age_hours ?? 1e9));
+}
+
 function renderResults() {
   const box = $("#results");
   if (!box) return;
-  const s = state.search;
-  if (!s) {
-    mount(box, html`<div class="card empty">${icon.search}Pick your tracks and search. Results show the years each job asks, the skills it names and the résumé that fits.</div>`);
+  if (!state.search) {
+    mount(box, html`<div class="card empty">${icon.search}Add your roles and search. Every job lists the years it asks, the skills it names and the résumé that fits it best.</div>`);
     return renderDock();
   }
-  const jobs = [...(s.jobs || []), ...(s.boards || [])];
-  const groups = {
-    fit: jobs.filter((j) => j.fit),
-    all: jobs,
-    hidden: jobs.filter((j) => (j.state === "read" && !j.fit) || j.known || j.off_track || j.dismissed),
+  mount(box, html`<div class="card"><div id="res-head"></div><div id="res-body"></div></div>`);
+  box.onclick = async (e) => {
+    const t = e.target.closest("button");
+    if (!t) return;
+    if (t.dataset.f) { state.filter = t.dataset.f; updateResults(); }
+    else if (t.dataset.sort) { state.sort = t.dataset.sort; updateResults(); }
+    else if (t.id === "stop-search") {
+      t.disabled = true;
+      try { await api(`/search/${state.search.id}/stop`, { method: "POST" }); toast("Stopping: what's found so far stays listed."); }
+      catch (err) { t.disabled = false; toast(err.message, "var(--red)"); }
+    }
+    else if (t.id === "pick-fits") { jobGroups(allJobs()).fit.forEach((j) => state.selected.set(j.key || j.url, j)); updateResults(true); renderDock(); }
+    else if (t.id === "pick-none") { state.selected.clear(); updateResults(true); renderDock(); }
+    else if (t.dataset.dismiss || t.dataset.undismiss) {
+      const key = t.dataset.dismiss || t.dataset.undismiss;
+      const job = allJobs().find((x) => (x.key || x.url) === key);
+      const undo = !!t.dataset.undismiss;
+      try {
+        await api("/dismiss", { method: "POST", body: { key, title: job?.title, company: job?.company, undo } });
+        Object.assign(job, undo ? { dismissed: false, why_not: null, fit: !job.known && !job.closed } : { dismissed: true, why_not: "dismissed by you", fit: false });
+        state.selected.delete(key);
+        toast(undo ? "Shown again." : "Dismissed: it won't come back in searches or autopilot.", undo ? "var(--accent)" : "var(--gray)");
+        updateResults(); renderDock();
+      } catch (err) { toast(err.message, "var(--red)"); }
+    }
   };
-  const shown = [...(groups[state.filter] || jobs)].sort((a, b) => (b.score ?? -1) - (a.score ?? -1));
-  const [done, total] = s.progress || [0, 0];
-  const busy = s.state !== "done";
-  mount(box, html`
-    <div class="card">
-      <div class="card-head" style="flex-wrap:wrap">
-        <div style="display:flex;align-items:center;gap:12px">
-          <div class="seg" id="filter">${[["fit", "Good fits"], ["all", "All"], ["hidden", "Hidden"]].map(([k, l]) => html`<button data-f="${k}" class="${state.filter === k ? "on" : ""}">${l} <span class="faint">${groups[k].length}</span></button>`)}</div>
-          ${busy ? html`<span class="chip s-running live"><i></i>${s.state === "searching" ? "Searching LinkedIn" : `Reading jobs ${done}/${total}`}</span>` : ""}
-        </div>
-        <div style="display:flex;gap:8px">${groups.fit.length ? html`<button class="btn sm" id="pick-fits">Select all good fits</button>` : ""}<button class="btn sm ghost" id="pick-none">Clear</button></div>
-      </div>
-      ${busy && total ? html`<div class="progress" style="margin-bottom:14px"><span style="width:${(done / total) * 100}%"></span></div>` : ""}
-      ${(s.problems || []).map((p) => html`<div class="banner warn">${p}</div>`)}
-      ${shown.length ? html`<table class="results"><thead><tr><th></th><th>Match</th><th>Role</th><th>Asks</th><th>Keyword coverage</th><th>Résumé</th><th></th></tr></thead><tbody>
-        ${shown.map((j) => {
-          const key = j.key || j.url;
-          const dim = j.state === "read" && !j.fit;
-          return html`<tr class="${dim ? "dim" : ""}">
-            <td><input type="checkbox" class="pick" data-key="${key}" ${state.selected.has(key) ? "checked" : ""} ${j.known ? "disabled" : ""}></td>
-            <td>${j.score != null ? html`<span class="score" style="--s:${j.score}">${j.score}</span>` : j.state === "listed" ? html`<div class="sk" style="width:30px"></div>` : ""}</td>
-            <td><div class="t"><a href="${safeUrl(j.url)}" target="_blank" rel="noopener">${j.title}</a></div>
-              <div class="muted" style="font-size:12.5px">${j.company} · ${j.location}${j.posted ? ` · ${ago(j.posted)}` : ""}${j.board ? " · company board" : ""}</div>
-              ${j.salary ? html`<span class="chip s-submitted" style="margin-top:6px"><i></i>${j.salary}</span>` : ""}
-              ${j.known ? html`<span class="chip s-submitted" style="margin-top:6px"><i></i>Already applied</span>` : ""}
-              ${j.why_not ? html`<span class="chip s-deferred" style="margin-top:6px"><i></i>${j.why_not}</span>` : ""}
-              ${j.recent_company ? html`<span class="chip s-review" style="margin-top:6px"><i></i>Applied to ${j.company} recently</span>` : ""}</td>
-            <td class="mono" style="white-space:nowrap">${j.state === "listed" ? html`<div class="sk" style="width:40px"></div>` : j.min_years != null ? `${j.min_years}+ yrs` : html`<span class="faint">—</span>`}</td>
-            <td>${j.coverage ? html`<div class="cov"><b>${j.coverage.pct ?? "—"}%</b> covered</div>
-                <div class="skills">${j.coverage.covered.slice(0, 6).map((k) => html`<span class="chip cov-yes" title="On your résumé">${k}</span>`)}${j.coverage.related.slice(0, 4).map((k) => html`<span class="chip cov-near" title="Related to your résumé">${k}</span>`)}${j.coverage.missing.slice(0, 5).map((k) => html`<span class="chip cov-no" title="Not on your résumé">${k}</span>`)}</div>`
-              : html`<div class="skills">${(j.skills || []).slice(0, 7).map((k) => html`<span class="chip plain">${k}</span>`)}</div>`}
-              ${j.reasons?.length ? html`<details class="why"><summary>Why this score</summary><ul>${j.reasons.map((r) => html`<li class="${r.good ? "good" : "bad"}">${r.text}</li>`)}</ul></details>` : ""}</td>
-            <td>${j.track ? trackChip(j.track) : j.state === "listed" ? html`<div class="sk" style="width:60px"></div>` : ""}</td>
-            <td style="white-space:nowrap"><a class="btn ghost sm" href="${safeUrl(j.url)}" target="_blank" rel="noopener" title="Open the posting">${icon.link}</a>
-              ${j.dismissed ? html`<button class="btn ghost sm" data-undismiss="${key}" title="Show it again">Undo</button>` : html`<button class="btn ghost sm" data-dismiss="${key}" title="Not interested: hide it from searches and autopilot">${icon.x}</button>`}</td></tr>`;
-        })}</tbody></table>`
-        : html`<div class="empty">${busy ? "Looking…" : "Nothing here."}</div>`}
-    </div>`);
-  $$("#filter button").forEach((b) => (b.onclick = () => { state.filter = b.dataset.f; renderResults(); }));
-  $$("[data-dismiss], [data-undismiss]", box).forEach((b) => (b.onclick = async () => {
-    const key = b.dataset.dismiss || b.dataset.undismiss;
-    const job = jobs.find((x) => (x.key || x.url) === key);
-    const undo = !!b.dataset.undismiss;
-    try {
-      await api("/dismiss", { method: "POST", body: { key, title: job?.title, company: job?.company, undo } });
-      Object.assign(job, undo ? { dismissed: false, why_not: null, fit: !job.known && !job.closed } : { dismissed: true, why_not: "dismissed by you", fit: false });
-      state.selected.delete(key);
-      toast(undo ? "Shown again." : "Dismissed: it won't come back in searches or autopilot.", undo ? "var(--accent)" : "var(--gray)");
-      renderResults();
-    } catch (e) { toast(e.message, "var(--red)"); }
-  }));
-  $$(".pick", box).forEach((c) => (c.onchange = () => {
-    const job = jobs.find((j) => (j.key || j.url) === c.dataset.key);
+  box.onchange = (e) => {
+    const c = e.target.closest(".pick");
+    if (!c) return;
+    const job = allJobs().find((j) => (j.key || j.url) === c.dataset.key);
     c.checked ? state.selected.set(c.dataset.key, job) : state.selected.delete(c.dataset.key);
     renderDock();
-  }));
-  if ($("#pick-fits")) $("#pick-fits").onclick = () => { groups.fit.forEach((j) => state.selected.set(j.key || j.url, j)); renderResults(); };
-  $("#pick-none").onclick = () => { state.selected.clear(); renderResults(); };
-  renderDock();
+  };
+  if (!box.__wired) box.addEventListener("toggle", (e) => {
+    const d = e.target.closest?.("[data-why]");
+    if (!d) return;
+    state.whyOpen ||= new Set();
+    d.open ? state.whyOpen.add(d.dataset.why) : state.whyOpen.delete(d.dataset.why);
+  }, true);
+  box.__wired = true;
+  updateResults();
+}
+
+function updateResults(force = false) {
+  const head = $("#res-head"), body = $("#res-body");
+  const s = state.search;
+  if (!head || !body || !s) return;
+  const jobs = allJobs();
+  const groups = jobGroups(jobs);
+  const busy = s.state !== "done";
+  const [done, total] = s.progress || [0, 0];
+  const phase = { searching: "Searching LinkedIn", "searching hiring.cafe": "Searching hiring.cafe", stopping: "Stopping…" }[s.state] || `Reading jobs ${done}/${total}`;
+  setHtml(head, html`
+    <div class="card-head" style="flex-wrap:wrap">
+      <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+        <div class="seg" id="filter">${[["fit", "Good fits"], ["fresh", "Last 24 hours"], ["all", "All"], ["hidden", "Hidden"]].map(([k, l]) => html`<button data-f="${k}" class="${state.filter === k ? "on" : ""}">${l} <span class="faint">${groups[k].length}</span></button>`)}</div>
+        <div class="seg">${[["newest", "Newest first"], ["match", "Best match"]].map(([k, l]) => html`<button data-sort="${k}" class="${(state.sort || "newest") === k ? "on" : ""}">${l}</button>`)}</div>
+        ${busy && s.id ? html`<span class="chip s-running live"><i></i>${phase}</span>` : ""}
+      </div>
+      <div style="display:flex;gap:8px">${groups.fit.length ? html`<button class="btn sm" id="pick-fits">Select all good fits</button>` : ""}<button class="btn sm ghost" id="pick-none">Clear</button>${busy && s.id ? html`<button class="btn sm danger" id="stop-search" ${s.state === "stopping" ? "disabled" : ""}>${icon.stop}Stop search</button>` : ""}</div>
+    </div>
+    ${busy && total ? html`<div class="progress" style="margin-bottom:14px"><span style="width:${(done / total) * 100}%"></span></div>` : ""}
+    ${busy && s.id ? html`<p class="muted" style="font-size:12.5px;margin:-4px 0 12px">Rows stay in place while jobs are read; they're sorted when the search finishes.</p>` : ""}
+    ${(s.problems || []).map((p) => html`<div class="banner warn">${p}</div>`)}`);
+  const shown = ordered(groups[state.filter] || jobs, busy);
+  if (!shown.length) { setHtml(body, html`<div class="empty">${busy ? "Looking…" : "Nothing here."}</div>`); return; }
+  if (!$("#res-rows", body)) {
+    body.__last = null;
+    mount(body, html`<table class="results"><thead><tr><th></th><th>Match</th><th>Role</th><th>Posted</th><th>Asks</th><th>Keyword coverage</th><th>Résumé</th><th></th></tr></thead><tbody id="res-rows"></tbody></table>`);
+  }
+  const byKey = new Map(shown.map((j) => [j.key || j.url, j]));
+  const sel = (k) => (state.selected.has(k) ? "1" : "0") + (state.whyOpen?.has(k) ? "1" : "0");
+  reconcile($("#res-rows", body), [...byKey.keys()], (k) => (force ? Math.random() : "") + sel(k) + JSON.stringify(byKey.get(k)), (k) => jobRow(byKey.get(k)));
+}
+
+function posted(j) {
+  if (j.age_hours == null) return j.posted ? ago(j.posted) : "";
+  if (j.age_hours < 1) return "just now";
+  if (j.age_hours < 24) return `${Math.round(j.age_hours)}h ago`;
+  return `${Math.round(j.age_hours / 24)}d ago`;
+}
+
+function jobRow(j) {
+  const key = j.key || j.url;
+  const dim = j.state === "read" && !j.fit;
+  const source = SOURCE_NAMES[j.board ? "board" : j.provider] || "";
+  return html`<tr class="${dim ? "dim" : ""}">
+    <td><input type="checkbox" class="pick" data-key="${key}" ${state.selected.has(key) ? "checked" : ""} ${j.known ? "disabled" : ""}></td>
+    <td>${j.score != null ? html`<span class="score" style="--s:${j.score}">${j.score}</span>` : j.state === "listed" ? html`<div class="sk" style="width:30px"></div>` : ""}</td>
+    <td><div class="t"><a href="${safeUrl(j.url)}" target="_blank" rel="noopener">${j.title || j.url}</a></div>
+      <div class="muted" style="font-size:12.5px">${j.company}${j.location ? ` · ${j.location}` : ""}${source ? ` · ${source}` : ""}${j.query ? html` · <span class="faint">for “${j.query}”</span>` : ""}</div>
+      <div class="row-chips">
+        ${j.fresh ? html`<span class="chip fresh"><i></i>New</span>` : ""}
+        ${j.salary ? html`<span class="chip s-submitted"><i></i>${j.salary}</span>` : ""}
+        ${j.known ? html`<span class="chip s-submitted"><i></i>Already applied</span>` : ""}
+        ${j.account ? html`<span class="chip plain" title="${j.portal} asks you to create an account; the run waits for you to sign in once">Needs an account</span>` : ""}
+        ${j.why_not ? html`<span class="chip s-deferred"><i></i>${j.why_not}</span>` : ""}
+        ${j.recent_company ? html`<span class="chip s-review"><i></i>Applied to ${j.company} recently</span>` : ""}
+      </div></td>
+    <td class="mono" style="white-space:nowrap">${posted(j) || html`<span class="faint">—</span>`}</td>
+    <td class="mono" style="white-space:nowrap">${j.state === "listed" ? html`<div class="sk" style="width:40px"></div>` : j.min_years != null ? `${j.min_years}+ yrs` : html`<span class="faint">—</span>`}</td>
+    <td>${j.coverage ? html`<div class="cov">${j.coverage.pct == null ? html`<span class="faint">No skills named</span>` : html`<b>${j.coverage.pct}%</b> covered`}</div>
+        <div class="skills">${j.coverage.covered.slice(0, 6).map((k) => html`<span class="chip cov-yes" title="On your résumé">${k}</span>`)}${j.coverage.related.slice(0, 4).map((k) => html`<span class="chip cov-near" title="Related to your résumé">${k}</span>`)}${j.coverage.missing.slice(0, 5).map((k) => html`<span class="chip cov-no" title="Not on your résumé">${k}</span>`)}</div>`
+      : html`<div class="skills">${(j.skills || []).slice(0, 7).map((k) => html`<span class="chip plain">${k}</span>`)}</div>`}
+      ${j.reasons?.length ? html`<details class="why" data-why="${key}" ${state.whyOpen?.has(key) ? "open" : ""}><summary>Why this score</summary><ul>${j.reasons.map((r) => html`<li class="${r.good ? "good" : "bad"}">${r.text}</li>`)}</ul></details>` : ""}</td>
+    <td>${j.track ? trackChip(j.track) : j.state === "listed" ? html`<div class="sk" style="width:60px"></div>` : ""}</td>
+    <td style="white-space:nowrap"><a class="btn ghost sm" href="${safeUrl(j.url)}" target="_blank" rel="noopener" title="Open the posting">${icon.link}</a>
+      ${j.board ? "" : j.dismissed ? html`<button class="btn ghost sm" data-undismiss="${key}" title="Show it again">Undo</button>` : html`<button class="btn ghost sm" data-dismiss="${key}" title="Not interested: hide it from searches and autopilot">${icon.x}</button>`}</td></tr>`;
 }
 
 function renderDock() {
@@ -461,6 +698,7 @@ function confirmBatch(urls, title = "Start applying?") {
     <div class="actions"><button class="btn ghost" data-close>Cancel</button><button class="btn primary" id="confirm-go">${icon.play}Start</button></div>`,
   (el, close) => {
     $("#confirm-go", el).onclick = async () => {
+      askNotifications(); // so a run waiting for your answer can tell you, even in another window
       try {
         const { id } = await api("/batches", { method: "POST", body: { urls, submit: state.submit } });
         close();
@@ -472,89 +710,147 @@ function confirmBatch(urls, title = "Start applying?") {
   });
 }
 
-// ---- live batch -----------------------------------------------------------------------------------------------
+// ---- batches --------------------------------------------------------------------------------------------------
+
+const OUTCOMES = [["submitted", "Submitted", "var(--green)"], ["review", "Left for you", "var(--amber)"], ["stopped", "Stopped", "var(--red)"], ["deferred", "Deferred / not run", "var(--gray)"]];
+function outcome(counts, k) {
+  const c = (x) => counts[x] || 0;
+  if (k === "deferred") return c("deferred") + c("not_run") + c("closed");
+  if (k === "stopped") return c("stopped") + c("failed");
+  if (k === "review") return c("review") + c("ready_to_submit") + c("ready_to_check");
+  return c(k);
+}
 
 async function batchPage(id) {
-  if (!id) {
+  if (id) return batchDetail(id);
+  mount(main, html`<div class="page-head"><div><h1>Batches</h1><p class="sub">Every batch you started, newest first. Open one to follow it live or read how it went.</p></div>
+      <a class="btn primary" href="#/find">${icon.search}Find jobs</a></div>
+    <div class="card"><div class="list" id="batch-list"><div class="sk" style="height:40px"></div></div></div>`);
+  every(3000, async () => {
     const list = await api("/batches");
-    const pick = state.activeBatch || list[0]?.id;
-    if (pick) { location.replace(`#/batch/${pick}`); return; }
-    mount(main, html`<div class="page-head"><div><h1>Live batch</h1><p class="sub">Batches you start from the UI appear here, live.</p></div></div>
-      <div class="card empty">${icon.play}No batch has run yet in this session.<div style="margin-top:14px"><a class="btn primary" href="#/find">${icon.search}Find jobs to apply to</a></div></div>`);
-    return;
-  }
-  let follow = true;
-  const draw = async () => {
-    let b;
-    try { b = await api(`/batches/${id}`); } catch (e) { return mount(main, html`<div class="card empty">${e.message}</div>`); }
-    const finished = ["done", "failed", "stopped"].includes(b.state);
-    const count = (k) => b.jobs.filter((j) => statusKey(j.state) === k).length;
-    const doneN = b.jobs.filter((j) => !["waiting", "running"].includes(j.state)).length;
-    const pct = Math.round((doneN / Math.max(1, b.jobs.length)) * 100);
-    const consoleEl = $("#console");
-    const atBottom = !consoleEl || consoleEl.scrollTop + consoleEl.clientHeight >= consoleEl.scrollHeight - 30;
-    mount(main, html`
-      <div class="page-head">
-        <div class="live-head">
-          <div class="ring" style="--p:${pct}"><b>${doneN}/${b.jobs.length}</b></div>
-          <div><h1>${finished ? "Batch finished" : "Applying…"}</h1>
-            <p class="sub">${statusChip(b.state, !finished)} ${b.phase} · started ${ago(b.started)} · auto-submit ${b.submit ? "on" : "off"}</p></div>
-        </div>
-        <div style="display:flex;gap:8px">
-          ${finished ? html`<button class="btn" id="rerun">${icon.play}Rerun stopped jobs</button>` : html`<button class="btn danger" id="stop">${icon.stop}Stop</button>`}
-        </div>
-      </div>
-      <div class="grid g4" style="margin-bottom:16px">
-        ${[["submitted", "Submitted", "var(--green)"], ["review", "Left for you", "var(--amber)"], ["stopped", "Stopped", "var(--red)"], ["deferred", "Deferred / closed", "var(--gray)"]].map(([k, l, c]) => html`
-          <div class="card kpi" style="--kpi-glow:color-mix(in srgb, ${c} 25%, transparent)"><div class="label">${l}</div><div class="value" style="color:${c}">${k === "deferred" ? count("deferred") + count("not_run") : k === "stopped" ? count("stopped") + count("failed") : k === "review" ? count("review") + count("ready_to_submit") : count(k)}</div></div>`)}
-      </div>
-      <div class="jobs">${b.jobs.map((j) => {
-        const k = statusKey(j.state);
-        const last = (j.events || []).filter((e) => !/^(résumé|submitted|review|stopped|failed|deferred|ready to submit)\b/.test(e)).slice(-1)[0];
-        return html`<div class="job ${k}">
-          <div class="top"><span class="n">#${j.n}</span>${statusChip(j.state, k === "running")}</div>
-          <div class="who">${j.title || j.url.replace(/^https?:\/\/(www\.)?/, "").slice(0, 60)}${j.company ? html`<small>${j.company}</small>` : ""}</div>
-          <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">${j.track ? trackChip(j.track.includes("/") ? j.track : `data/${j.track}`) : ""}
-            ${j.seconds ? html`<span class="chip plain">${j.seconds}s</span>` : ""}
-            <a class="btn ghost sm" href="${safeUrl(j.url)}" target="_blank" rel="noopener" style="margin-left:auto">${icon.link}</a></div>
-          ${j.needs ? html`<div class="needs">${j.needs}</div>` : last && k !== "waiting" ? html`<div class="ev">${last}</div>` : ""}
-          ${j.result && !j.needs ? html`<div class="ev">${j.result}</div>` : ""}
-        </div>`;
-      })}</div>
-      <details class="card" style="margin-top:16px" ${state.consoleOpen ? "open" : ""} id="console-box">
-        <summary style="cursor:pointer;font-weight:600">Live log <span class="faint">(${b.log.length} lines)</span></summary>
-        <div class="console" id="console" style="margin-top:12px">${b.log.map((l) => html`<div class="${/submitted|SUBMITTED/.test(l) ? "ok" : /needs you|stopped|failed|Traceback/i.test(l) ? "bad" : /^\[\d+\/\d+\]/.test(l) ? "hl" : ""}">${l || " "}</div>`)}</div>
-      </details>`);
-    $("#console-box").ontoggle = (e) => (state.consoleOpen = e.target.open);
-    const c = $("#console");
-    if (c && (atBottom || follow)) { c.scrollTop = c.scrollHeight; follow = false; }
-    if ($("#stop")) $("#stop").onclick = () => modal(html`<h2 style="font-size:18px">Stop this batch?</h2><p class="muted">The job in progress stops where it is (nothing half-submitted is sent). Jobs not reached stay unapplied.</p>
+    if (!changed("batches", list)) return;
+    const box = $("#batch-list");
+    if (!box) return;
+    if (!list.length) return setHtml(box, html`<div class="empty">${icon.play}No batch yet. Pick jobs in Find jobs and press Start applying.</div>`);
+    reconcile(box, list.map((b) => b.id), (k) => JSON.stringify(list.find((b) => b.id === k)), (k) => batchRow(list.find((b) => b.id === k)));
+  });
+}
+
+function batchRow(b) {
+  const running = ["starting", "planning", "running"].includes(b.state);
+  const when = new Date(b.started);
+  return html`<a class="row batch-row" href="#/batch/${b.id}" style="text-decoration:none;color:inherit">
+    <div style="min-width:0"><div class="title">${when.toLocaleDateString(undefined, { day: "numeric", month: "short" })} · ${when.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" })}
+      <span class="faint" style="font-weight:400">· ${b.jobs} job${b.jobs === 1 ? "" : "s"}${b.submit === true ? " · auto-submit" : b.submit === false ? " · review before submit" : ""}</span></div>
+      <div class="meta">${statusChip(b.state, running)}${running ? b.phase : ""}
+        ${OUTCOMES.map(([k, l, c]) => (outcome(b.counts, k) ? html`<span class="chip plain" style="color:${c}">${l} ${outcome(b.counts, k)}</span>` : ""))}</div></div>
+    <span class="muted">${running ? "Watch live →" : "Open →"}</span></a>`;
+}
+
+function batchDetail(id) {
+  mount(main, html`
+    <a class="back" href="#/batch">← All batches</a>
+    <div class="page-head" id="b-head"></div>
+    <div class="grid g4" style="margin-bottom:16px" id="b-kpis"></div>
+    <div class="jobs" id="b-jobs"></div>
+    <details class="card" style="margin-top:16px" ${state.consoleOpen ? "open" : ""} id="console-box">
+      <summary style="cursor:pointer;font-weight:600">Live log <span class="faint" id="log-n"></span></summary>
+      <div class="console" id="console" style="margin-top:12px"></div>
+    </details>`);
+  $("#console-box").ontoggle = (e) => (state.consoleOpen = e.target.open);
+  let b = null;
+  main.onclick = (e) => {
+    if (!b) return;
+    if (e.target.closest("#stop")) modal(html`<h2 style="font-size:18px">Stop this batch?</h2><p class="muted">The job in progress stops where it is (nothing half-submitted is sent). Jobs not reached stay unapplied.</p>
       <div class="actions"><button class="btn ghost" data-close>Keep going</button><button class="btn danger" id="really">${icon.stop}Stop batch</button></div>`,
-      (el, close) => ($("#really", el).onclick = async () => { await api(`/batches/${id}/stop`, { method: "POST" }); close(); toast("Batch stopped."); draw(); }));
-    if ($("#rerun")) $("#rerun").onclick = () => {
+      (el, close) => ($("#really", el).onclick = async () => { await api(`/batches/${id}/stop`, { method: "POST" }); close(); toast("Batch stopped."); }));
+    if (e.target.closest("#rerun")) {
       const urls = b.jobs.filter((j) => ["stopped", "failed", "review", "not_run"].includes(statusKey(j.state))).map((j) => j.url);
       if (!urls.length) return toast("Nothing to rerun: every job finished.", "var(--green)");
       confirmBatch(urls, `Rerun ${urls.length} job${urls.length > 1 ? "s" : ""}?`);
-    };
-    if (finished) { state.timers.forEach(clearInterval); state.timers = []; refreshShell(); }
+    }
   };
-  every(1200, draw);
+  stream(`/batches/${id}/events`, {
+    message: (m) => {
+      if (m.full || !b) b = { ...m, jobs: [], log: [] };
+      const byN = new Map(b.jobs.map((j) => [j.n, j]));
+      m.jobs.forEach((j) => byN.set(j.n, j));
+      b = { ...b, ...m, jobs: [...byN.values()].sort((x, y) => x.n - y.n), log: m.full ? m.log_add : [...b.log, ...m.log_add].slice(-2000) };
+      patchBatch(b, m.log_add, m.full);
+    },
+    end: () => refreshShell(),
+  });
+}
+
+function patchBatch(b, newLines, full) {
+  const finished = ["done", "failed", "stopped"].includes(b.state);
+  const counts = {};
+  b.jobs.forEach((j) => { const k = statusKey(j.state); counts[k] = (counts[k] || 0) + 1; });
+  const doneN = b.jobs.filter((j) => !["waiting", "running"].includes(j.state)).length;
+  const pct = Math.round((doneN / Math.max(1, b.jobs.length)) * 100);
+  setHtml($("#b-head"), html`
+    <div class="live-head">
+      <div class="ring" style="--p:${pct}"><b>${doneN}/${b.jobs.length}</b></div>
+      <div><h1>${finished ? "Batch finished" : "Applying…"}</h1>
+        <p class="sub">${statusChip(b.state, !finished)} ${b.phase} · started ${ago(b.started)}${b.submit === true ? " · auto-submit on" : b.submit === false ? " · auto-submit off" : ""}</p></div>
+    </div>
+    <div style="display:flex;gap:8px">${finished ? html`<button class="btn" id="rerun">${icon.play}Rerun stopped jobs</button>` : html`<button class="btn danger" id="stop">${icon.stop}Stop</button>`}</div>`);
+  setHtml($("#b-kpis"), html`${OUTCOMES.map(([k, l, c]) => html`
+    <div class="card kpi" style="--kpi-glow:color-mix(in srgb, ${c} 25%, transparent)"><div class="label">${l}</div><div class="value" style="color:${c}">${outcome(counts, k)}</div></div>`)}`);
+  const byN = new Map(b.jobs.map((j) => [String(j.n), j]));
+  reconcile($("#b-jobs"), [...byN.keys()], (k) => JSON.stringify(byN.get(k)), (k) => jobCard(byN.get(k)));
+  const c = $("#console");
+  if (c) {
+    const atBottom = c.scrollTop + c.clientHeight >= c.scrollHeight - 30;
+    if (full) c.innerHTML = "";
+    const frag = document.createDocumentFragment();
+    newLines.forEach((l) => {
+      const d = document.createElement("div");
+      d.className = /submitted|SUBMITTED/.test(l) ? "ok" : /needs you|stopped|failed|Traceback/i.test(l) ? "bad" : /^\[\d+\/\d+\]/.test(l) ? "hl" : "";
+      d.textContent = l || " ";
+      frag.append(d);
+    });
+    c.append(frag);
+    while (c.childElementCount > 2000) c.firstElementChild.remove();
+    if (atBottom || full) c.scrollTop = c.scrollHeight;
+    $("#log-n").textContent = `(${b.log_n ?? b.log.length} lines)`;
+  }
+}
+
+function jobCard(j) {
+  const k = statusKey(j.state);
+  const last = (j.events || []).filter((e) => !/^(résumé|submitted|review|stopped|failed|deferred|ready to submit)\b/.test(e)).slice(-1)[0];
+  return html`<div class="job ${k}">
+    <div class="top"><span class="n">#${j.n}</span>${statusChip(j.state, k === "running")}</div>
+    <div class="who">${j.title || j.url.replace(/^https?:\/\/(www\.)?/, "").slice(0, 60)}${j.company ? html`<small>${j.company}</small>` : ""}</div>
+    <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">${j.track ? trackChip(j.track.includes("/") ? j.track : `data/${j.track}`) : ""}
+      ${j.seconds ? html`<span class="chip plain">${j.seconds}s</span>` : ""}
+      <a class="btn ghost sm" href="${safeUrl(j.url)}" target="_blank" rel="noopener" style="margin-left:auto">${icon.link}</a></div>
+    ${j.waiting ? html`<div class="needs waiting-answer">Waiting for your answer: ${j.waiting.split(" | ").join(" · ")} <a href="#/questions">Answer now →</a></div>`
+      : j.needs ? html`<div class="needs">${j.needs}</div>` : last && k !== "waiting" ? html`<div class="ev">${last}</div>` : ""}
+    ${j.result && !j.needs ? html`<div class="ev">${j.result}</div>` : ""}
+  </div>`;
 }
 
 // ---- questions ------------------------------------------------------------------------------------------------
 
 async function questions() {
   if (state.qTab === "bank") return answerBank();
-  const list = await api("/questions");
-  const open = list.filter((q) => !q.answer);
+  const [list, rerun, ov] = await Promise.all([api("/questions"), api("/rerun"), api("/overview")]);
+  const waitingQs = (ov.waiting_for_answers || []).flatMap((w) => w.questions);
+  const isWaiting = (q) => waitingQs.some((w) => q.question.startsWith(w.slice(0, 78)));
+  const open = list.filter((q) => !q.answer).sort((a, b) => isWaiting(b) - isWaiting(a)); // a waiting run first
   const done = list.filter((q) => q.answer);
   const tab = state.qTab || "open";
   const shown = tab === "open" ? open : done;
   mount(main, html`
     <div class="page-head"><div><h1>Questions</h1><p class="sub">Answer once: every later form that asks the same question fills it itself.</p></div>
       <div class="seg" id="qtab"><button data-t="open" class="${tab === "open" ? "on" : ""}">Open <span class="faint">${open.length}</span></button><button data-t="bank" class="${tab === "bank" ? "on" : ""}">Answer bank</button></div></div>
+    ${waitingQs.length ? html`<div class="banner warn"><span>${icon.chat}</span><span><b>A run is waiting for ${waitingQs.length > 1 ? "these answers" : "this answer"}.</b> <span class="muted">Answer below and it carries on by itself.</span></span></div>` : ""}
+    ${rerunBanner(rerun.jobs)}
     <div class="qs">${shown.length ? shown.map((q) => html`
-      <div class="card q" data-i="${q.index}">
+      <div class="card q ${isWaiting(q) && !q.answer ? "waiting-q" : ""}" data-i="${q.index}" data-q="${q.question}">
+        ${isWaiting(q) && !q.answer ? html`<span class="chip s-review live" style="margin-bottom:8px"><i></i>A run is waiting for this</span>` : ""}
         <div class="text">${q.question}</div>
         ${q.urls?.length ? html`<div class="muted" style="font-size:12.5px">Asked on ${q.urls.length} job${q.urls.length > 1 ? "s" : ""}: ${q.urls.slice(0, 3).map((u, i) => html`<a href="${safeUrl(u)}" target="_blank" rel="noopener">${i ? ", " : ""}${u.replace(/^https?:\/\/(www\.)?/, "").split("?")[0].slice(0, 46)}</a>`)}</div>` : ""}
         ${q.options?.length
@@ -562,14 +858,15 @@ async function questions() {
           : html`<div class="answer-row"><input type="text" value="${q.answer}" placeholder="Your answer…" data-a><button class="btn primary" data-save>${icon.check}Save</button></div>`}
       </div>`) : html`<div class="card empty">${icon.check}${tab === "open" ? "No open questions. Every form can finish without you." : "No answers yet."}</div>`}</div>`);
   $$("#qtab button").forEach((b) => (b.onclick = () => { state.qTab = b.dataset.t; questions(); }));
+  wireRerun(rerun.jobs);
   $$(".q").forEach((card) => {
     const save = async (answer) => {
       try {
-        await api(`/questions/${card.dataset.i}`, { method: "POST", body: { answer } });
+        await api(`/questions/${card.dataset.i}`, { method: "POST", body: { answer, question: card.dataset.q } });
         card.classList.add("saved");
         toast("Saved. Later forms will use it.", "var(--green)");
         refreshShell();
-        setTimeout(questions, 500);
+        setTimeout(() => onPage("questions") && questions(), 500);
       } catch (e) { toast(e.message, "var(--red)"); }
     };
     $$("[data-o]", card).forEach((b) => (b.onclick = () => save(b.dataset.o)));
@@ -1133,7 +1430,7 @@ window.addEventListener("beforeunload", (e) => { if (dirty()) { e.preventDefault
 // ---- inbox: everything that needs you ------------------------------------------------------------------------
 
 async function inboxPage() {
-  const q = await api("/queue");
+  const [q, rerun] = await Promise.all([api("/queue"), api("/rerun")]);
   const tab = state.inboxTab || "all";
   const shown = q.items.filter((i) => tab === "all" || i.kind === tab);
   const jobsN = q.items.filter((i) => i.kind === "job").length;
@@ -1142,6 +1439,7 @@ async function inboxPage() {
   mount(main, html`
     <div class="page-head"><div><h1>Inbox</h1><p class="sub">Everything a run left for you, in one place. Clear an item once you've handled it.</p></div>
       <div class="seg" id="itab">${[["all", "All", q.items.length], ["job", "Jobs to finish", jobsN], ["draft", "Drafts to read", draftsN]].map(([k, l, n]) => html`<button data-t="${k}" class="${tab === k ? "on" : ""}">${l} <span class="faint">${n}</span></button>`)}</div></div>
+    ${rerunBanner(rerun.jobs)}
     ${q.open_questions ? html`<a class="banner warn" href="#/questions" style="text-decoration:none">${icon.chat}<b>${q.open_questions} open question${q.open_questions > 1 ? "s" : ""}</b><span class="muted">Answer them once and every later form fills them →</span></a>` : ""}
     <div class="qs">${shown.length ? shown.map((i) => i.kind === "job" ? html`
       <div class="card inbox-item">
@@ -1162,6 +1460,7 @@ async function inboxPage() {
       </div>`) : html`<div class="card empty">${icon.check}Nothing waiting on you.</div>`}</div>`);
   $$("#itab button").forEach((b) => (b.onclick = () => { state.inboxTab = b.dataset.t; inboxPage(); }));
   $$("[data-done]").forEach((b) => (b.onclick = async () => { await api(`/queue/${encodeURIComponent(b.dataset.done)}`, { method: "POST", body: {} }); refreshShell(); inboxPage(); }));
+  wireRerun(rerun.jobs);
   $$("[data-rerun]").forEach((b) => (b.onclick = () => confirmBatch([b.dataset.rerun], "Run this job again?")));
   $$("[data-run]").forEach((b) => (b.onclick = () => openRun(b.dataset.run)));
 }
@@ -1243,7 +1542,7 @@ async function renderSystemExtras() {
       <div style="display:flex;justify-content:flex-end;margin-top:12px"><button class="btn primary" id="saf-save">${icon.check}Save safety settings</button></div>
     </div>
     <div class="card" style="margin-top:16px">
-      <div class="card-head"><div><h2>Autopilot</h2><p class="sub">Every day at a set time: search each track, take the best-scoring good fits and apply. Your PC must be on and Chrome able to open (Windows Task Scheduler runs it).</p></div>
+      <div class="card-head"><div><h2>Autopilot</h2><p class="sub">Every day at a set time: run your saved role search, take the good fits (newest first, then best match) and apply. Your PC must be on and Chrome able to open (Windows Task Scheduler runs it).</p></div>
         ${auto.scheduled ? html`<span class="chip s-submitted"><i></i>Scheduled · next ${auto.scheduled.next_run || ""}</span>` : html`<span class="chip s-deferred"><i></i>Off</span>`}</div>
       <div class="safety">
         <div class="frow"><span class="flabel">On</span><span class="finput"><label class="toggle"><input type="checkbox" id="ap-on" ${c.enabled ? "checked" : ""}>${c.enabled ? "On" : "Off"}</label></span><span></span></div>
@@ -1252,7 +1551,7 @@ async function renderSystemExtras() {
         <div class="frow"><span class="flabel">Jobs per day (max)</span><span class="finput"><input type="number" id="ap-max" min="1" max="50" value="${c.max_jobs}" style="max-width:120px"></span><span></span></div>
         <div class="frow"><span class="flabel">Minimum match score</span><span class="finput"><input type="number" id="ap-min" min="0" max="100" value="${c.min_score}" style="max-width:120px"><small>0-100, as shown in Find jobs. Weaker matches are skipped even if there's room.</small></span><span></span></div>
         <div class="frow"><span class="flabel">Look at jobs posted</span><span class="finput"><select id="ap-posted" style="max-width:200px"><option value="day" ${c.posted === "day" ? "selected" : ""}>In the last 24 hours</option><option value="week" ${c.posted === "week" ? "selected" : ""}>In the last week</option></select></span><span></span></div>
-        <div class="frow"><span class="flabel">Auto-submit</span><span class="finput"><label class="toggle"><input type="checkbox" id="ap-submit" ${c.submit ? "checked" : ""}>${c.submit ? "On" : "Off: fill and leave for me"}</label><small>Search words come from the saved search you mark "use for autopilot" in Find jobs, else each track's defaults.</small></span><span></span></div>
+        <div class="frow"><span class="flabel">Auto-submit</span><span class="finput"><label class="toggle"><input type="checkbox" id="ap-submit" ${c.submit ? "checked" : ""}>${c.submit ? "On" : "Off: fill and leave for me"}</label><small>Autopilot runs the saved search you mark "Use for autopilot" in Find jobs (its roles, locations, sources and filters), else each résumé's suggested roles. Jobs posted in the last 24 hours are taken first.</small></span><span></span></div>
       </div>
       ${auto.last ? html`<div class="banner" style="margin-top:12px">Last run ${ago(auto.last.started)}: ${auto.last.found} found, ${auto.last.fits} good fits, ${auto.last.picked.length} picked${auto.last.submitted ? `, ${auto.last.submitted.length} submitted` : ""}${auto.last.dry ? " (preview only)" : ""}.</div>` : ""}
       <div style="display:flex;justify-content:flex-end;margin-top:12px"><button class="btn primary" id="ap-save">${icon.check}Save autopilot</button></div>
@@ -1323,9 +1622,9 @@ async function renderPrefs() {
         const name = $("#ss-name", el).value.trim();
         if (!name) return;
         const auto = $("#ss-auto", el).checked;
-        const queries = Object.fromEntries(Object.entries(f.queries).filter(([id]) => f.on[id]));
+        const sources = Object.entries(f.sources).filter(([, on]) => on).map(([k]) => k);
         const list = (auto ? p.saved_searches.map((s) => ({ ...s, autopilot: false })) : p.saved_searches).filter((s) => s.name !== name);
-        list.push({ name, queries, posted: f.posted, location: f.location, max_years: f.maxYears, easy: f.easy, autopilot: auto });
+        list.push({ name, roles: [...f.roles], locations: [...f.locations], posted: f.posted, workplaces: [...f.workplaces], max_years: f.maxYears, easy: f.easy, senior: f.senior, sources, autopilot: auto });
         close();
         save({ saved_searches: list });
         toast(`Saved "${name}".`, "var(--green)");
@@ -1336,8 +1635,13 @@ async function renderPrefs() {
     e.preventDefault();
     const s = p.saved_searches[+a.dataset.loadsearch];
     const f = state.findForm;
-    Object.keys(f.queries).forEach((id) => { f.on[id] = id in s.queries; if (s.queries[id]) f.queries[id] = [...s.queries[id]]; });
-    Object.assign(f, { posted: s.posted || f.posted, location: s.location || f.location, maxYears: s.max_years ?? f.maxYears, easy: s.easy ?? f.easy });
+    const roles = s.roles || Object.values(s.queries || {}).flat(); // older saved searches: words per track
+    Object.assign(f, {
+      roles: [...new Set(roles)], locations: s.locations || (s.location ? [s.location] : f.locations), posted: s.posted || f.posted,
+      workplaces: s.workplaces || [], maxYears: s.max_years ?? f.maxYears, easy: s.easy ?? false, senior: s.senior ?? false,
+      sources: s.sources ? { linkedin: s.sources.includes("linkedin"), hiringcafe: s.sources.includes("hiringcafe") } : { linkedin: true, hiringcafe: false },
+    });
+    saveForm();
     renderFind();
     toast(`Loaded "${s.name}". Press Search.`);
   }));

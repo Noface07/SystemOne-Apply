@@ -33,6 +33,8 @@ SAFETY = [
     ("auto_consent", "Tick plain privacy/terms boxes", "Declarations (criminal record...) are always asked."),
     ("google_sign_in", "Sign in with Google for me", "Clicks only: your account, basic profile sharing. Never types."),
     ("login_wait_s", "Wait at a sign-in page (s)", "How long a run waits for you to sign in. 0 stops at once."),
+    ("answer_wait_s", "Wait for your answers (s)", "A required question nothing on file answers: the run waits "
+     "this long for you to answer it in Questions, then carries on. 0: it stops, to re-run later."),
     ("confirm_wait_s", "Wait for the site's confirmation (s)", "After Submit."),
 ]  # fmt: skip
 SAFETY_FIELDS = {s[0] for s in SAFETY}
@@ -313,7 +315,8 @@ def queue():
     """What needs you, newest first: jobs a run left for you (with why), drafted answers to read and the open
     questions. Jobs you've since applied to and items you've marked done are left out."""
     _, done = _inbox_state()
-    applied_keys = {a["key"] for a in data.applications()}
+    apps, stems = data.applications(), data.resume_track()
+    applied_keys = {a["key"] for a in apps}
     seen, items = set(), []
     for r in data.run_reports():
         if not r["job"] or r["job"] in seen:
@@ -322,7 +325,7 @@ def queue():
         status = str(r["status"])
         if r["job"] in applied_keys and not status.startswith("submitted"):
             continue
-        detail = data.run_detail(r["id"]) or {}
+        detail = data.run_detail(r["id"], apps, stems) or {}
         drafts = [f for f in detail.get("fields") or [] if f.get("source") == "draft"]
         for f in drafts:
             iid = f"draft:{r['id']}:{hashlib.md5(f['label'].encode()).hexdigest()[:10]}"
@@ -343,6 +346,43 @@ def queue():
                               "at": r["at"], "status": status, "reason": r["reason"], "left": r["left"]})  # fmt: skip
     questions = [q for q in data.questions() if not q["answer"]]
     return {"items": items[:200], "open_questions": len(questions)}
+
+
+RERUN_DAYS = 30  # older stops are likely closed jobs by now
+
+
+def rerun_ready():
+    """Jobs whose latest run stopped on questions you've all answered since: re-run, they fill those answers in.
+    A run records the questions it stopped on (report "waiting_on"); for older runs, the questions QUESTIONS.md
+    lists as asked on that job's pages. Jobs you've applied to since, or dismissed, are left out."""
+    from .. import applied, inbox
+    from ..profile import same_question
+
+    entries = inbox.read(data.data_dir() / "QUESTIONS.md")
+    answered = [e for e in entries if e["answer"]]
+    applied_keys = {a["key"] for a in data.applications()}
+    gone = set(dismissed())
+    since = (datetime.now() - timedelta(days=RERUN_DAYS)).isoformat()
+    latest, out = {}, []
+    for r in data.run_reports():  # newest first: the first run of each job is its latest
+        key = applied.job_key(r["url"] or "")
+        if key and key not in latest:
+            latest[key] = r
+    for key, r in latest.items():
+        status = str(r["status"])
+        if (r["at"] or "") < since or status.startswith(("submitted", "applied", "already")):
+            continue
+        if key in applied_keys or r["job"] in applied_keys or key in gone:
+            continue
+        report = data.read_report(data.runs_dir() / r["id"] / "report.json") or {}
+        waiting = report.get("waiting_on")
+        if waiting is None:
+            pages = {r["url"], report.get("final_url")}
+            waiting = [e["question"] for e in entries if pages & set(e.get("urls") or [])]
+        if waiting and all(any(same_question(a["question"], w) for a in answered) for w in waiting):
+            out.append({"url": r["url"], "run": r["id"], "at": r["at"], "track": r["track"], "status": status,
+                        "questions": waiting[:6]})  # fmt: skip
+    return out
 
 
 def mark_done(item_id, done=True):
@@ -512,24 +552,55 @@ def last_autopilot():
     return json.loads(found[-1].read_text(encoding="utf-8")) if found else None
 
 
+def autopilot_search(tracks=()):
+    """The saved search marked for autopilot, as a role search: its roles, locations, workplaces, sources and
+    filters. An older saved search (search words per track) gives its words as roles. Without one: each track's
+    suggested roles on LinkedIn in India."""
+    from . import jobs
+
+    prefs = get_prefs()
+    chosen = next((s for s in reversed(prefs.get("saved_searches") or []) if s.get("autopilot")), None)
+    if not chosen:
+        defaults = jobs.default_queries()
+        return {"name": None, "roles": jobs.as_roles({t: defaults.get(t) or [] for t in tracks}),
+                "locations": ["India"], "workplaces": [], "sources": ["linkedin"], "easy": False, "senior": False,
+                "max_years": None}  # fmt: skip
+    return {
+        "name": chosen.get("name"),
+        "roles": jobs.as_roles(chosen.get("roles") or chosen.get("queries") or []),
+        "locations": chosen.get("locations") or [chosen.get("location") or "India"],
+        "workplaces": [w for w in chosen.get("workplaces") or [] if w in jobs.WORKPLACE],
+        "sources": [s for s in chosen.get("sources") or ["linkedin"] if s in jobs.SOURCES] or ["linkedin"],
+        "easy": bool(chosen.get("easy", False)),
+        "senior": bool(chosen.get("senior", False)),
+        "max_years": chosen.get("max_years"),
+    }
+
+
 def run_autopilot(dry=False, wait_s=900):
-    """One autopilot round: search each track (your saved preferences apply), take the best-scoring good fits up
-    to max_jobs, apply to them in one batch and write a summary to runs/autopilot/. Returns the summary."""
+    """One autopilot round: run the saved role search marked for autopilot (your blocked companies and words
+    apply), take the good fits newest first (posted in the last 24 hours before older), then by score, up to
+    max_jobs, apply to them in one batch and write a summary to runs/autopilot/. Returns the summary."""
     from . import jobs
 
     config = get_autopilot()["config"]
-    prefs = get_prefs()
     tracks = config["tracks"] or [t["id"] for t in data.tracks()]
-    defaults = jobs.default_queries()
-    # The saved search you marked for autopilot (its words per track), else each track's default words.
-    chosen = next((s for s in reversed(prefs.get("saved_searches") or []) if s.get("autopilot")), {})
-    saved = chosen.get("queries") or {}
-    queries = {t: saved.get(t) or defaults.get(t) or [] for t in tracks}
+    search = autopilot_search(tracks)
     started = datetime.now()
     system = data.system()
-    years = int(system["years"]) if system.get("years") is not None else None
-    location = chosen.get("location") or "India"
-    task = jobs.start_search(queries, location=location, posted=config["posted"], max_years=years)
+    years = search["max_years"]
+    if years is None and system.get("years") is not None:
+        years = int(system["years"])
+    task = jobs.start_search(
+        search["roles"],
+        locations=search["locations"],
+        posted=config["posted"],
+        max_years=years,
+        easy_apply=search["easy"],
+        include_senior=search["senior"],
+        workplaces=search["workplaces"],
+        sources=search["sources"],
+    )
     deadline = time.monotonic() + wait_s
     while time.monotonic() < deadline:
         found = jobs.get_search(task)
@@ -538,14 +609,16 @@ def run_autopilot(dry=False, wait_s=900):
         time.sleep(2)
     fits = sorted(
         (j for j in found["jobs"] if j.get("fit") and (j.get("score") or 0) >= config["min_score"]),
-        key=lambda j: -(j.get("score") or 0),
+        key=lambda j: (not j.get("fresh"), -(j.get("score") or 0)),
     )
     picked = fits[: config["max_jobs"]]
     summary = {
         "started": started.isoformat(timespec="seconds"),
+        "search": search["name"],
+        "roles": search["roles"],
         "found": len(found["jobs"]),
         "fits": len(fits),
-        "picked": [{k: j.get(k) for k in ("url", "title", "company", "track", "score")} for j in picked],
+        "picked": [{k: j.get(k) for k in ("url", "title", "company", "track", "score", "fresh")} for j in picked],
         "dry": dry,
     }
     if picked and not dry:

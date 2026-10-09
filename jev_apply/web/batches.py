@@ -1,6 +1,9 @@
 """Batches started from the UI: the same `jev-apply batch` the command line runs, as its own process, so every
 guard (auto_submit gate, applied.json, captcha, unattended defaults) applies unchanged. Its output is read line by
-line into a live state per job: the plan, the résumé used, events, and the result."""
+line into a live state per job: the plan, the résumé used, events, and the result.
+
+Every batch leaves its job list and its output in runs/batches/ (<id>.txt, <id>.log). Batches from earlier sessions
+are rebuilt from those files by replaying the log, so the Batches page lists them all and opens any of them."""
 
 import os
 import re
@@ -80,23 +83,103 @@ def start(urls, tracks, submit=True):
     return batch_id
 
 
-def get(batch_id):
+def get(batch_id, log_all=False):
+    """One batch's state (this session's, or an earlier one rebuilt from its files), or None."""
     with _lock:
         b = _batches.get(batch_id)
-        if b is None:
-            return None
-        return {k: v for k, v in b.items() if not k.startswith("_")} | {
-            "jobs": [dict(j, events=list(j["events"][-12:])) for j in b["jobs"]],
-            "log": b["log"][-400:],
-        }
+        if b is not None:
+            return _view(b, log_all)
+    b = from_disk(batch_id)
+    return _view(b, log_all) if b else None
+
+
+def _view(b, log_all=False):
+    return {k: v for k, v in b.items() if not k.startswith("_")} | {
+        "jobs": [dict(j, events=list(j["events"][-12:])) for j in b["jobs"]],
+        "log": list(b["log"]) if log_all else b["log"][-400:],
+        "log_n": len(b["log"]),
+    }
+
+
+ID = re.compile(r"^(\d{8})-(\d{6})-[0-9a-f]{4}$")
+_disk = {}  # batch id -> (file stamps, rebuilt batch): the list doesn't replay every log on every visit
+
+
+def from_disk(batch_id):
+    """A batch from an earlier session, rebuilt from runs/batches/<id>.txt and .log by replaying its output."""
+    found = ID.match(batch_id or "")
+    jobs_file = folder() / f"{batch_id}.txt"
+    if not found or not jobs_file.is_file():
+        return None
+    log_file = folder() / f"{batch_id}.log"
+    stamp = tuple((f.stat().st_mtime, f.stat().st_size) for f in (jobs_file, log_file) if f.is_file())
+    cached = _disk.get(batch_id)
+    if cached and cached[0] == stamp:
+        return cached[1]
+    urls = [u.strip() for u in jobs_file.read_text(encoding="utf-8").splitlines() if u.strip()]
+    started = datetime.strptime(found[1] + found[2], "%Y%m%d%H%M%S")
+    b = {
+        "id": batch_id, "state": "starting", "phase": "", "submit": None, "started": started.isoformat(),
+        "ended": None, "jobs": [{"n": n, "url": u, "state": "waiting", "events": []} for n, u in enumerate(urls, 1)],
+        "log": [], "exit": None, "past": True,
+    }  # fmt: skip
+    current, finished = None, False
+    if log_file.is_file():
+        for line in log_file.read_text(encoding="utf-8", errors="replace").splitlines():
+            b["log"].append(line)
+            current = _apply(b, line, current)
+            finished = finished or line.strip().startswith("Batch done")
+        b["ended"] = datetime.fromtimestamp(log_file.stat().st_mtime).isoformat(timespec="seconds")
+    b["state"] = "done" if finished else "stopped"
+    b["phase"] = "Done" if finished else "Ended before it finished (stopped, or the app was closed)"
+    for job in b["jobs"]:
+        if job["state"] in {"waiting", "running"}:
+            job["state"] = "not run"
+    _disk[batch_id] = (stamp, b)
+    return b
+
+
+def waiting():
+    """The running batch's jobs waiting for your answers: [{n, title, company, questions}]."""
+    with _lock:
+        live = [b for b in _batches.values() if b["state"] in {"starting", "planning", "running"}]
+        return [
+            {"batch": b["id"], "n": j["n"], "title": j.get("title") or j["url"], "company": j.get("company"),
+             "questions": j["waiting"].split(" | ")}
+            for b in live
+            for j in b["jobs"]
+            if j.get("waiting")
+        ]  # fmt: skip
+
+
+def counts(b):
+    """How many of a batch's jobs ended each way."""
+    out = {}
+    for job in b["jobs"]:
+        state = job["state"].replace(" ", "_")
+        out[state] = out.get(state, 0) + 1
+    return out
+
+
+def _row(b, past):
+    return {k: b[k] for k in ("id", "state", "phase", "started", "ended", "submit")} | {
+        "jobs": len(b["jobs"]),
+        "counts": counts(b),
+        "past": past,
+    }
 
 
 def listing():
+    """Every batch, newest first: this session's (live) and earlier ones from runs/batches/."""
     with _lock:
-        return [
-            {k: b[k] for k in ("id", "state", "started", "ended", "submit")} | {"jobs": len(b["jobs"])}
-            for b in sorted(_batches.values(), key=lambda b: b["started"], reverse=True)
-        ]
+        live = {b["id"]: _row(b, False) for b in _batches.values()}
+    rows = list(live.values())
+    for path in folder().glob("*.txt"):
+        if path.stem not in live:
+            b = from_disk(path.stem)
+            if b:
+                rows.append(_row(b, True))
+    return sorted(rows, key=lambda r: r["started"], reverse=True)
 
 
 def stop(batch_id):
@@ -176,6 +259,10 @@ def _apply(b, line, current):
             return current
         job, message = b["jobs"][n - 1], event[3].strip()
         job["events"].append(message)
+        if message.startswith("waiting for your answers"):
+            job["waiting"] = message.split("): ", 1)[-1]  # the questions, " | " between them
+        elif message.startswith(("answered:", "no answer in time")):
+            job.pop("waiting", None)
         if message.startswith("résumé:"):
             job["resume"] = message.split("(", 1)[-1].rstrip(")")
             job["track"] = message.split()[1]
@@ -185,6 +272,7 @@ def _apply(b, line, current):
             if kind == "needs you":
                 job["needs"] = result[2]
             else:
+                job.pop("waiting", None)  # the job ended: nothing waits any more
                 job["state"] = kind.replace(" ", "_")
                 job["result"] = result[2]
                 if job.get("started"):

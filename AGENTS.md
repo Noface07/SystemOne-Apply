@@ -54,8 +54,9 @@ Read this before changing `agent.py`, `browser.py`, `snapshot.js` or `policy.py`
     Claude's additions.
 17. **A captcha is never solved.** A form whose Submit runs one (Lever, any hCaptcha) ends at
     "ready to submit (captcha)" with the tab left open; the batch moves on.
-18. **Reading ahead sends nothing.** `scan` and `preflight` only read public board APIs and pages; `bench.py`
-    blocks every saving or submitting request in the browser.
+18. **Reading ahead sends nothing.** `scan`, `preflight` and Find jobs only read public board APIs and pages
+    (hiring.cafe's search pages are opened in a background Chrome tab and only read); `bench.py` blocks every
+    saving or submitting request in the browser.
 19. **QUESTIONS.md holds only what the résumé and the job page can't settle.** Before a question is asked, a rule
     maps it to a profile fact (certifications, notice period, a skill's years under another name: "REST APIs" is
     your "REST API"), or, when it asks to list, describe or give examples, it is drafted (DRAFT_ANSWER) from the

@@ -713,3 +713,46 @@ def test_answers_from_the_form_are_used_for_that_run_only(make_agent):
     agent.finish = finish
     agent.run()
     assert agent.profile.saved_answer("Notice Period") is None  # never saved beyond the run
+
+
+def test_an_unattended_run_waits_for_your_answers_then_carries_on(make_agent, monkeypatch, tmp_path):
+    from jev_apply import inbox
+
+    agent = make_agent([make_page()], ui=UnattendedFakeUI(handover=False), answer_wait_s=60)
+    question = "What is your notice period in days?"
+    agent.inbox = [{"question": question, "kind": "text", "urls": ["https://x.test/job"]}]
+    agent.skipped.add(("doc", 1, "Notice period"))
+
+    def you_answer(seconds):  # while the run waits, you answer in the app (it writes QUESTIONS.md)
+        entries = inbox.read(tmp_path / "QUESTIONS.md")
+        assert [e["question"] for e in entries] == [question]  # it was put there before waiting
+        entries[0]["answer"] = "15"
+        inbox.write(tmp_path / "QUESTIONS.md", entries)
+
+    monkeypatch.setattr(loop.time, "sleep", you_answer)
+    agent.status = "stopped"
+    assert agent.wait_for_answers()
+    assert agent.status == "ready" and agent.profile.saved_answer(question) == "15"
+    assert not agent.skipped and not agent.inbox  # what was set aside for want of the answer is offered again
+    assert agent.history[-1]["action"] == "The candidate answered 1 question(s)"
+
+
+def test_the_answer_wait_gives_up_and_the_job_records_what_it_waits_on(make_agent, monkeypatch, tmp_path):
+    clock = iter(range(0, 10_000, 30))
+    monkeypatch.setattr(loop.time, "sleep", lambda s: None)
+    monkeypatch.setattr(loop.time, "monotonic", lambda: next(clock))
+    agent = make_agent([make_page()], ui=UnattendedFakeUI(handover=False), answer_wait_s=120)
+    question = "Are you open to night shifts?"
+    agent.inbox = [{"question": question, "kind": "choice", "options": ["Yes", "No"], "urls": ["https://x.test/j"]}]
+    assert not agent.wait_for_answers()
+    agent.status = "stopped"
+    assert agent.finish()["waiting_on"] == [question]
+    assert not make_agent([make_page()], ui=UnattendedFakeUI(), answer_wait_s=0).wait_for_answers()
+
+
+def test_a_run_waits_for_answers_a_few_times_at_most(make_agent, monkeypatch):
+    agent = make_agent([make_page()], ui=UnattendedFakeUI(handover=False), answer_wait_s=60)
+    agent.answer_rounds = loop.ANSWER_ROUNDS
+    agent.inbox = [{"question": "Anything?", "kind": "text", "urls": []}]
+    monkeypatch.setattr(loop.time, "sleep", lambda s: pytest.fail("no more waiting"))
+    assert not agent.wait_for_answers()

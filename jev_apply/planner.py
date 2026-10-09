@@ -63,10 +63,12 @@ HAS_SKILL = re.compile(
     r"[^?]{0,30}?(?:experience |knowledge )?(?:with|in|on|using) ([^?*✱]+)",
     re.I,
 )
-SUBMIT = re.compile(r"\b(submit|apply|send application|finish|complete application)\b", re.I)
+# "I'm interested" is Zoho Recruit's Apply (and other sites'): on a posting it opens the form, as Apply does.
+INTERESTED = r"i(?:['’]m| am) interested"
+SUBMIT = re.compile(rf"\b(submit|apply|send application|finish|complete application|{INTERESTED})\b", re.I)
 APPLY_BUTTON = re.compile(
     r"^\W*(easy\s+)?apply\b|^\W*(submit|send application|finish|complete application|continue applying|"
-    r"resume application)\b",
+    rf"resume application|{INTERESTED})\b",
     re.I,
 )
 BACK = re.compile(r"\b(back|previous|prev|cancel)\b", re.I)

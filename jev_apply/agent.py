@@ -21,6 +21,7 @@ from .profile import native_date, safe_id, same_question
 from .questions import GOAL, SPECIAL
 
 FILLS = {"fill", "select", "setdate", "upload"}
+ANSWER_ROUNDS = 3  # a form that keeps asking new questions waits for you at most this often in one run
 # What sites say once an application went through.
 # A challenge a person must answer before the form sends: hCaptcha's frame or its response field.
 CAPTCHA_CHECK = (
@@ -84,6 +85,7 @@ class Agent:
         self.skipped_questions = {}
         self.optional_skipped = []  # unattended: optional fields no fact answers, left empty
         self.inbox = []  # unattended: required questions left for you, saved for `jev-apply answer`
+        self.answer_rounds = 0  # times this run waited for your answers (ANSWER_ROUNDS at most)
         self.pending = None
         self.claude = []  # Claude calls this run made (drafts): time, tokens, cost
         self.receipt = None  # the site's page right after Submit: text and a screenshot
@@ -105,10 +107,15 @@ class Agent:
         added = {q: a for q, a in self.answers.items() if not self.profile.saved_answer(q)}
         self.profile.saved.update(added)
         try:
-            while self.status == "ready":
-                self.tick()
-        except Stop:
-            self.status = "stopped"
+            while True:
+                try:
+                    while self.status == "ready":
+                        self.tick()
+                except Stop:
+                    self.status = "stopped"
+                # About to stop on questions only you can answer: wait for your answers, then carry on here.
+                if not (self.unattended and self.status in {"stopped", "review"} and self.wait_for_answers()):
+                    break
         finally:
             for question in added:
                 self.profile.saved.pop(question, None)
@@ -891,6 +898,83 @@ class Agent:
                     continue
         return False
 
+    def open_questions(self):
+        """The required questions this page still needs and nothing on file answers, once each."""
+        out, seen = [], set()
+        for entry in self.inbox + self.unanswered_entries():
+            question = entry["question"]
+            if question in seen or self.profile.saved_answer(question):
+                continue
+            seen.add(question)
+            out.append(entry)
+        return out
+
+    def answers_given(self, entries):
+        """{question: your answer} for those of `entries` answered in QUESTIONS.md so far."""
+        from . import inbox
+
+        found = {}
+        for entry in inbox.read(self.profile.questions_path):
+            if not entry["answer"]:
+                continue
+            for wanted in entries:
+                if wanted["question"] not in found and same_question(entry["question"], wanted["question"]):
+                    found[wanted["question"]] = entry["answer"]
+        return found
+
+    def wait_for_answers(self):
+        """Unattended, about to stop on questions only you can answer: put them in QUESTIONS.md now, then wait
+        (policy.answer_wait_s) for you to answer them in the app or the file. All answered: they become saved
+        answers, what was set aside on this page is offered again, and the run carries on with this same form
+        (True). Otherwise False: the job stops as before, and is offered for a re-run once you answer."""
+        wait = self.policy.answer_wait_s
+        if wait <= 0 or not self.profile.questions_path or self.answer_rounds >= ANSWER_ROUNDS:
+            return False
+        try:
+            self.page = self.browser.observe()
+        except StalePage:
+            pass
+        entries = self.open_questions()
+        if not entries:
+            return False
+        self.answer_rounds += 1
+        self.profile.add_pending(entries)
+        asked = " | ".join(e["question"][:80] for e in entries)
+        self.ui.event(f"waiting for your answers (up to {max(1, wait // 60)} min, in Questions): {asked}")
+        deadline = time.monotonic() + wait
+        while time.monotonic() < deadline:
+            time.sleep(3)
+            given = self.answers_given(entries)
+            if len(given) < len(entries):
+                continue
+            self.profile.saved.update(given)  # your answers, typed by you: used as saved answers from here on
+            self.asked += [{"question": q, "answered": True, "saved": True} for q in given]
+            # What was set aside on this page was set aside for want of these answers: offer it all again.
+            self.skipped.clear()
+            self.vetoed.clear()
+            self.skipped_questions.clear()
+            self.no_review.clear()
+            self.inbox = [e for e in self.inbox if e["question"] not in given]
+            self.left = [x for x in self.left if x.get("url") != self.page["url"]]
+            if getattr(self.ui, "stopped", None):
+                self.ui.stopped = None
+            self.history.append(
+                {
+                    "step": len(self.history) + 1,
+                    "action": f"The candidate answered {len(given)} question(s)",
+                    "kind": "handover",
+                    "context": asked[:160],
+                    "source": "you",
+                    "page_changed": None,
+                    "url": self.page["url"],
+                }
+            )
+            self.status = "ready"
+            self.ui.event("answered: carrying on with this form")
+            return True
+        self.ui.event("no answer in time: the job stops here, and can be re-run once you answer")
+        return False
+
     def wait_for_login(self):
         """Unattended, at a sign-in page: alert the candidate, show the tab and wait for them to sign in or create
         the account (once per company portal; the browser keeps the session). True once the page is past it."""
@@ -1000,6 +1084,10 @@ class Agent:
             if q
         ]
         report["pending_total"] = self.profile.add_pending(self.inbox, done)
+        # The questions this job stopped on: once all are answered, the app offers to run it again.
+        report["waiting_on"] = list(
+            dict.fromkeys(e["question"] for e in self.inbox if not self.profile.saved_answer(e["question"]))
+        )
         report["claude"] = self.claude
         if self.receipt:
             receipt = {k: v for k, v in self.receipt.items() if not k.startswith("_")}

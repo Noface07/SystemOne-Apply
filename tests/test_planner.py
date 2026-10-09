@@ -894,3 +894,14 @@ def test_are_you_from_a_place_is_answered_from_your_city_state_or_country():
     assert said("Are you currently located in India?") == "Yes"
     assert said("Are you from Mumbai or nearby?") is None  # not one place: the model (or you) decides
     assert said("Are you willing to relocate to Mumbai?") is None
+
+
+def test_im_interested_opens_the_form_like_apply(laya):
+    # Zoho Recruit's postings have no Apply button: their way in is "I'm interested".
+    for label in ("I'm interested", "I am interested", "I’m Interested"):
+        assert choose(page(button(1, label)))["action"]["label"] == label
+    assert not planner.APPLY_BUTTON.search("Not interested")
+    # Held back like Apply: the submit gate counts it as submit-like, so on a form it's never clicked unseen.
+    from jev_apply.policy import Policy
+
+    assert Policy().submit_like({"role": "button", "label": "I'm interested"})

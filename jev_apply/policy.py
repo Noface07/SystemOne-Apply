@@ -63,7 +63,11 @@ NEVER_FILL = [
     "cvv",
     "uan",
 ]
-SUBMIT = ["submit", "send application", "apply", "finish", "complete", "confirm and", "send"]
+# "I'm interested" opens a form as Apply does (Zoho Recruit), so it is held back the same way once a form is open.
+SUBMIT = [
+    "submit", "send application", "apply", "finish", "complete", "confirm and", "send", "i'm interested",
+    "i’m interested", "i am interested",
+]  # fmt: skip
 # auto_consent: a required checkbox that only consents to a privacy notice or the site's terms may be ticked...
 CONSENT = [
     "privacy policy", "privacy notice", "privacy statement", "data privacy", "data protection", "personal data",
@@ -105,6 +109,11 @@ class Policy:
     # Unattended runs that reach a sign-in page alert you, show the tab and wait this long for you to sign in (or
     # create the account) before stopping the job. 0 stops at once. The agent never types into a login page.
     login_wait_s: int = 900
+    # Unattended runs about to stop on required questions nothing on file answers put them in QUESTIONS.md at once
+    # and wait this long for you to answer them (in the app's Questions page or the file). All answered: the run
+    # carries on with the same form, using your answers. Otherwise the job stops as before and is offered for a
+    # re-run once you answer. 0 stops at once.
+    answer_wait_s: int = 300
     # At a "Continue with Google" sign-in: click it, choose the Google account whose address is your profile's e-mail
     # and confirm Google's "share your name, email and picture" page. Clicks only: nothing is ever typed into Google
     # (an e-mail, password or code request waits for you), and wider access (Drive, Gmail...) is left for you.

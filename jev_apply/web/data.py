@@ -87,6 +87,28 @@ def norm(text):
     return re.sub(r"[^0-9a-z]", "", str(text or "").lower())
 
 
+_reports = {}  # report.json path -> ((mtime, size), parsed report)
+
+
+def read_report(path):
+    """A run report, parsed once and reused until its file changes. The Inbox, History and Overview all read every
+    report; parsing them all on each call (and once more per job) made the Inbox take seconds."""
+    try:
+        info = path.stat()
+    except OSError:
+        return None
+    stamp = (info.st_mtime_ns, info.st_size)
+    cached = _reports.get(path)
+    if cached and cached[0] == stamp:
+        return cached[1]
+    try:
+        report = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    _reports[path] = (stamp, report)
+    return report
+
+
 def run_reports():
     """Every run report, newest first, in a light shape for lists."""
     out = []
@@ -95,11 +117,9 @@ def run_reports():
         return out
     stems = resume_track()
     for path in sorted(folder.glob("*/report.json"), reverse=True):
-        try:
-            report = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
-        out.append(summary(path.parent.name, report, stems))
+        report = read_report(path)
+        if report is not None:
+            out.append(summary(path.parent.name, report, stems))
     return out
 
 
@@ -140,14 +160,14 @@ def run_at(run_id):
     return f"{found[1]}-{found[2]}-{found[3]}T{found[4]}:{found[5]}:{found[6]}" if found else None
 
 
-def run_detail(run_id):
-    """One run report in full, with each filled field's value, source and the model's confidence."""
+def run_detail(run_id, apps=None, stems=None):
+    """One run report in full, with each filled field's value, source and the model's confidence. `apps` and
+    `stems` are applications() and resume_track() when the caller already has them (the Inbox reads many runs)."""
     if not re.fullmatch(r"[\w.-]+", run_id or ""):
         return None
-    path = runs_dir() / run_id / "report.json"
-    if not path.is_file():
+    report = read_report(runs_dir() / run_id / "report.json")
+    if report is None:
         return None
-    report = json.loads(path.read_text(encoding="utf-8"))
     steps = []
     for h in report.get("history") or []:
         if h.get("kind") == "wait":
@@ -164,9 +184,9 @@ def run_detail(run_id):
                 "changed": h.get("page_changed"),
             }
         )
-    sent = next((a for a in applications() if a["run"] == run_id), None)
+    sent = next((a for a in (applications() if apps is None else apps) if a["run"] == run_id), None)
     return {
-        **summary(run_id, report),
+        **summary(run_id, report, stems),
         "title": sent["title"] if sent else None,
         "company": sent["company"] if sent else None,
         "final_url": report.get("final_url"),
@@ -226,16 +246,26 @@ def questions():
     return [{"index": i, **e} for i, e in enumerate(entries)]
 
 
-def answer_question(index, answer):
-    """Save your answer to one question in QUESTIONS.md (every later form reuses it)."""
+def answer_question(index, answer, question=None):
+    """Save your answer to one question in QUESTIONS.md (every later form reuses it). `question` (its text) finds
+    it even when a running batch has added questions since the page listed them and the numbers moved; the save
+    is read back and retried, as that batch may write the file at the same moment."""
     path = data_dir() / "QUESTIONS.md"
-    entries = inbox.read(path)
-    if not 0 <= index < len(entries):
-        raise IndexError("no such question")
-    entries[index]["answer"] = " ".join(str(answer or "").split())
-    inbox.write(path, entries)
-    _load.cache_clear()
-    return entries[index]
+    answer = " ".join(str(answer or "").split())
+    for _ in range(3):
+        entries = inbox.read(path)
+        found = next((i for i, e in enumerate(entries) if question and e["question"] == question), None)
+        if found is None:
+            if question or not 0 <= index < len(entries):
+                raise IndexError("no such question")
+            found = index
+        entries[found]["answer"] = answer
+        inbox.write(path, entries)
+        _load.cache_clear()
+        kept = next((e for e in inbox.read(path) if e["question"] == entries[found]["question"]), None)
+        if kept and kept["answer"] == answer:
+            return kept
+    return entries[found]
 
 
 MODELS = [
