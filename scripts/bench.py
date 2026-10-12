@@ -128,7 +128,12 @@ def main():
     scratch = Path(tempfile.mkdtemp())
     profile = real_profile(args.data, scratch)
     policy = Policy.load(Path(args.data) / "policy.json")
-    policy = replace(policy, auto_submit=False, max_actions=args.max_actions, login_wait_s=0)
+    # Nobody watches a bench run: no waiting at sign-ins or for answers (the teacher may still answer from the
+    # profile; its lessons stay in the scratch copy).
+    policy = replace(policy, auto_submit=False, max_actions=args.max_actions, login_wait_s=0, answer_wait_s=0)
+    from jev_apply.cli import prepare_model
+
+    prepare_model()  # Clef's server, or Laya, loaded before the first form (a batch does the same)
     facts = profile.candidate_state()
     results = []
     for number, url in enumerate(urls, 1):

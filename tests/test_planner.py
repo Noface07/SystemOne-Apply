@@ -1,8 +1,11 @@
 """The Laya backend's fixed form-walking procedure, with a fake Laya."""
 
+from pathlib import Path
+
 import pytest
 
-from jev_apply import laya_backend, model, planner
+from jev_apply import laya_backend, model, planner, rules
+from jev_apply.profile import Profile, safe_id
 
 CANDIDATE = {
     "personal.first_name": "Aarav",
@@ -262,6 +265,172 @@ def test_add_another_is_pressed_until_every_job_has_a_block(laya):
     assert model.choose(page(education, button(8, "Next")), "goal", [], candidate)["action"]["label"] == "Next"
 
 
+def test_a_draft_already_showing_every_job_gets_no_extra_block(laya):
+    """Xylem's saved draft came back with Work Experience 1 and 2: "Add Another" made a third, empty one."""
+    candidate = {**CANDIDATE, "experience.0.company": "Anexee", "experience.1.company": "Philips"}
+    title2 = {**fill(4, "Job Title", "Software Engineer"), "section": "Work Experience 2"}
+    add = button(7, "Add Another", section="Work Experience 2")
+    d = model.choose(page(title2, add, button(8, "Save and Continue")), "goal", [], candidate)
+    assert d["action"]["label"] != "Add Another"
+
+
+def test_a_site_error_is_waited_out_before_it_stops_the_run(laya):
+    """Workday showed "Something went wrong" for a moment right after signing in, and the run stopped."""
+    wait = {"id": "wait", "kind": "wait", "label": "Wait for the page to update"}
+    broken = {**page(button(1, "Back"), wait), "text": "Something went wrong. Please try again."}
+    started = [{"kind": "click", "action": "Apply", "url": "https://jobs.example/apply", "page_changed": True}]
+    assert model.choose(broken, "goal", started, CANDIDATE)["operation"] == "WAIT"
+    waited = started + [{"kind": "wait", "action": "Wait", "page_changed": False}] * 5
+    d = model.choose(broken, "goal", waited, CANDIDATE)
+    assert d["operation"] == "BLOCKED" and d["reason"] == planner.SITE_ERROR_REASON  # the agent reloads then
+
+
+def test_an_errors_banner_left_after_the_file_was_uploaded_gets_one_more_save(laya):
+    """MKS: Save pressed before the résumé was attached showed "Errors Found"; the résumé uploaded, the banner
+    stayed, no field marked any more: Save again, not a stop."""
+    url = "https://mksinst.wd1.myworkdayjobs.com/x/apply"
+    upload = {"id": "u1", "node": 4, "kind": "upload", "role": "button", "label": "Select files", "value": ""}
+    shown = {**page(upload, button(9, "Save and Continue")), "url": url, "text": "Errors Found. Fix the errors."}
+    history = [{"kind": "click", "action": "Save and Continue", "url": url},
+               {"kind": "upload", "action": "Select files", "url": url}]  # fmt: skip
+    d = model.choose(shown, "goal", history, {**CANDIDATE, "document.resume": "resume.pdf"})
+    assert d["operation"] == "CLICK" and d["action"]["label"] == "Save and Continue"
+
+
+def test_workday_application_questions_open_their_lone_select_one_buttons(laya):
+    """Xylem's Application Questions: each Yes/No question is one "Select One Required" button under it. It was
+    taken for a lone choice button and skipped, so none were ever opened."""
+    url = "https://xylem.wd5.myworkdayjobs.com/en-US/xylem-careers/job/x/apply"
+    q = "Are you eligible to work in the country in which this position is located?*"
+    shown = {**page(button(103, "Select One Required", context=q), button(9, "Save and Continue")), "url": url}
+    history = [{"kind": "wait", "action": "Wait", "url": url, "page_changed": False}]
+    d = model.choose(shown, "goal", history, CANDIDATE)
+    assert d["operation"] == "CLICK" and d["action"]["node"] == 103
+
+
+def test_each_same_named_select_one_button_is_opened_for_its_own_question(laya):
+    """Xylem: four questions, four buttons all named "Select One Required": only the first was ever opened."""
+    url = "https://xylem.wd5.myworkdayjobs.com/en-US/xylem-careers/job/x/apply"
+    first, second = "Are you eligible to work in the country?*", "Are you over 18 years of age?*"
+    shown = {**page(button(103, "Select One Required", context=first),
+                    button(104, "Select One Required", context=second), button(9, "Save and Continue")),
+             "url": url}  # fmt: skip
+    history = [{"kind": "wait", "action": "Wait", "url": url, "page_changed": False},
+               {"kind": "click", "action": "Select One Required", "context": first, "url": url},
+               {"kind": "click", "action": "Yes", "context": "", "url": url}]  # fmt: skip
+    d = model.choose(shown, "goal", history, CANDIDATE)
+    assert d["operation"] == "CLICK" and d["action"]["node"] == 104
+
+
+def test_each_skill_typed_into_a_workday_box_gets_its_own_enter(laya):
+    url = "https://xylem.wd5.myworkdayjobs.com/en-US/xylem-careers/job/x/apply"
+    box = {**fill(3, "Type to Add Skills", "OPC DA", placeholder="Search"), "multiple": True}
+    history = [{"kind": "fill", "action": "Type to Add Skills", "typed": "OPC UA", "url": url},
+               {"kind": "enter", "action": "Press Enter in 'Type to Add Skills'", "url": url},
+               {"kind": "fill", "action": "Type to Add Skills", "typed": "OPC DA", "url": url}]  # fmt: skip
+    d = model.choose({**page(box), "url": url}, "goal", history, CANDIDATE)
+    assert d["operation"] == "PRESS_ENTER"
+    # Its results (naming what was typed) are picked at once, not waited on
+    results = [opt(5, "OPC DA", ""), opt(6, "OPC DA Server", "")]
+    entered = history + [{"kind": "enter", "action": "Press Enter in 'Type to Add Skills'", "url": url}]
+    d = model.choose({**page(box, *results), "url": url}, "goal", entered, {**CANDIDATE, "skills": "OPC UA, OPC DA"})
+    assert d["operation"] != "WAIT"
+
+
+def test_workday_search_results_are_picked_by_what_was_typed(laya):
+    """Xylem: after Enter, Workday lists results ("OPC Unified Architecture (OPC UA) not checked"); the agent typed
+    on instead of picking one. Field of Study: "Computer and Information Sciences" for "Computer Science and
+    Engineering". "No Items." is never clicked."""
+    url = "https://xylem.wd5.myworkdayjobs.com/x/apply"
+    box = {**fill(3, "Type to Add Skills", "OPC UA", placeholder="Search"), "multiple": True}
+
+    def after_enter(field, typed, labels):
+        history = [{"kind": "fill", "action": field["label"], "typed": typed, "url": url},
+                   {"kind": "enter", "action": f"Press Enter in '{field['label']}'", "url": url}]  # fmt: skip
+        shown = {**page(field, *[opt(i + 10, x, "") for i, x in enumerate(labels)]), "url": url}
+        return model.choose(shown, "goal", history, {**CANDIDATE, "skills": "OPC UA, Python"})
+
+    d = after_enter(box, "OPC UA", ["OPC Unified Architecture (OPC UA) not checked", "OPC Communications not checked",
+                                    "OPC Data Access (DA) not checked"])  # fmt: skip
+    assert d["operation"] == "CLICK" and d["action"]["label"].startswith("OPC Unified Architecture")
+    d = after_enter(box, "Python", ["Python (Programming Language) not checked", "Python IDLE not checked",
+                                    "Maya Python not checked"])  # fmt: skip
+    assert d["action"]["label"].startswith("Python (Programming Language)")
+    study = fill(5, "Field of Study", "Computer Science and Engineering", placeholder="Search")
+    d = after_enter(study, "Computer Science and Engineering",
+                    ["Computer and Information Sciences", "Business Administration", "Mathematics"])
+    assert d["operation"] == "CLICK" and d["action"]["label"] == "Computer and Information Sciences"
+    d = after_enter(box, "Sharp7", ["No Items."])
+    assert d["action"]["label"] != "No Items."
+    # A skill box never takes a neighbouring skill
+    d = after_enter(box, "Siemens S7", ["Siemens S7-200 not checked", "Siemens Simatic not checked"])
+    assert d["action"]["label"] not in {"Siemens S7-200 not checked", "Siemens Simatic not checked"}
+    scada = "SCADA (Supervisory Control and Data Acquisition) not checked"
+    d = after_enter(box, "SCADA", ["Siemens WinCC SCADA not checked", scada])
+    assert d["action"]["label"] == scada
+    d = after_enter(box, "Kotlin", ["Kotlin Programming Language not checked", "Kotlin Multiplatform not checked"])
+    assert d["action"]["label"] == "Kotlin Programming Language not checked"
+
+
+def test_workday_websites_gets_your_github(laya):
+    """Xylem's "Websites: Add any relevant websites": Add once, then your GitHub in its URL box."""
+    url = "https://xylem.wd5.myworkdayjobs.com/x/apply"
+    candidate = {**CANDIDATE, "links.github": "https://github.com/Noface07"}
+    add = button(5, "Add", section="Websites", context="Websites Add any relevant websites.")
+    d = model.choose({**page(add, button(9, "Save and Continue")), "url": url}, "goal", [], candidate)
+    assert d["operation"] == "CLICK" and d["action"]["node"] == 5
+    profile = Profile({"links": {"github": "https://github.com/Noface07"}}, Path("."))
+    box = {"kind": "fill", "role": "textbox", "label": "URL", "section": "Websites 1", "input_type": "text"}
+    assert rules.match(box, profile, False, ()) == safe_id("links.github")
+
+
+def test_a_citizenship_list_never_takes_another_countrys_citizen(laya):
+    """Yokogawa: typing "Citizen" listed "Citizen (Angola)", "Citizen (Czechia)"..., and Czechia's was clicked as
+    "the same skill". Typed "India", the one for India and your status is taken."""
+    url = "https://yokogawa.wd3.myworkdayjobs.com/x/apply"
+    box = {**fill(3, "What is your Citizenship Status?", "", placeholder="Search"), "multiple": True}
+    candidate = {**CANDIDATE, "personal.citizenship_country": "India", "personal.citizenship_status": "Citizen"}
+
+    def after(typed, labels):
+        history = [{"kind": "fill", "action": box["label"], "typed": typed, "url": url},
+                   {"kind": "enter", "action": f"Press Enter in '{box['label']}'", "url": url}]  # fmt: skip
+        shown = {**page(box, *[opt(i + 10, x, "") for i, x in enumerate(labels)]), "url": url}
+        return model.choose(shown, "goal", history, candidate)
+
+    d = after("Citizen", ["Citizen (Angola) not checked", "Citizen (Czechia) not checked"])
+    assert d["action"]["label"] not in {"Citizen (Angola) not checked", "Citizen (Czechia) not checked"}
+    d = after("India", ["Permanent Resident (India) not checked", "Citizen (India) not checked"])
+    assert d["action"]["label"] == "Citizen (India) not checked"
+
+
+def test_a_chip_of_skills_glued_together_is_removed(laya):
+    """Xylem: the box kept its text, so one chip read "OPC UAOPC DAMoIMQTTBACnetDNP3EC 60870-5-104dbus"."""
+    url = "https://xylem.wd5.myworkdayjobs.com/x/apply"
+    candidate = {**CANDIDATE, "skills": "OPC UA, OPC DA, Modbus, MQTT, BACnet, DNP3"}
+    field = {**fill(3, "Type to Add Skills", "", placeholder="Search"), "multiple": True}
+    glued = {**button(7, "Remove: OPC UAOPC DAMoIMQTTBACnetDNP3EC 60870-5-104dbus"), "remove_chip": True}
+    real = {**button(8, "Remove: OPC Unified Architecture (OPC UA)"), "remove_chip": True}
+    d = model.choose({**page(field, real, glued), "url": url}, "goal", [], candidate)
+    assert d["operation"] == "CLICK" and d["action"]["node"] == 7
+    # "Citizen (India)" names two of your answers, and is one option: kept
+    citizen = {**button(9, "Remove: Citizen (India)"), "remove_chip": True}
+    mine = {**candidate, "personal.citizenship_country": "India", "personal.citizenship_status": "Citizen"}
+    d = model.choose({**page(field, citizen), "url": url}, "goal", [], mine)
+    assert d["action"]["node"] != 9
+
+
+def test_required_fields_reported_above_are_looked_for_before_save(laya):
+    """Xylem: "Add" put an Education block above the agent's place; Save was pressed with School and Degree empty."""
+    url = "https://xylem.wd5.myworkdayjobs.com/en-US/xylem-careers/job/x/apply"
+    up = {"id": "scroll_up", "kind": "scroll", "label": "Scroll up", "delta": -400, "x": 1, "y": 1}
+    shown = {**page(fill(4, "LinkedIn", "https://linkedin.com/in/x"), button(8, "Save and Continue"), up), "url": url,
+             "required_above": ["School or University", "Degree"]}  # fmt: skip
+    d = model.choose(shown, "goal", [], CANDIDATE)
+    assert d["operation"] == "SCROLL_UP"
+    looked = [{"kind": "scroll", "action": "Scroll up", "url": url}] * 4
+    assert model.choose(shown, "goal", looked, CANDIDATE)["action"]["label"] == "Save and Continue"  # then on
+
+
 def test_enter_is_pressed_in_a_search_prompt_that_shows_no_results(laya):
     school = fill(1, "School or University*", "Example", role="combobox", placeholder="Search")
     typed = [{"kind": "fill", "action": "School or University*"}]
@@ -318,6 +487,23 @@ def test_a_dropdown_list_without_context_takes_the_question_of_the_control_just_
     assert d["action"]["label"] == "15 days" and not laya
 
 
+def test_workday_phone_device_type_button_opens_and_mobile_is_picked(laya):
+    """Xylem: "Phone Device Type Select One Required", a button with no aria-expanded, in the "Phone" section."""
+    label = "Phone Device Type Select One Required"
+    shown = page(fill(5, "Postal Code", "313001"), button(1, label, context="Phone"), button(2, "Save and Continue"))
+    d = model.choose(shown, "goal", [], {**CANDIDATE, "personal.phone_type": "Mobile"})
+    assert d["operation"] == "CLICK" and d["action"]["label"] == label
+    opened = [{"kind": "click", "action": label, "context": "Phone", "url": "https://jobs.example/apply"}]
+    listed = page(option(3, "Landline"), option(4, "Mobile"), button(1, label, context="Phone"))
+    d = model.choose(listed, "goal", opened, {**CANDIDATE, "personal.phone_type": "Mobile"})
+    assert d["action"]["label"] == "Mobile" and not laya
+    # Still "Select One" after one try (the pick didn't take): opened once more; after two, never again (no loop).
+    d = model.choose(shown, "goal", opened, {**CANDIDATE, "personal.phone_type": "Mobile"})
+    assert d["action"]["label"] == label
+    d = model.choose(shown, "goal", opened * 2, {**CANDIDATE, "personal.phone_type": "Mobile"})
+    assert d["action"]["label"] != label
+
+
 def test_suggestions_follow_what_was_typed_and_an_unoffered_item_is_never_swapped(laya):
     typed = [{"kind": "fill", "action": "Current location *", "typed": "Udaipur"}]
     places = page(option(1, "Udaipurwati, Rajasthan"), option(2, "Udaipur, Rajasthan, India"))
@@ -332,7 +518,8 @@ def test_long_lists_are_narrowed_to_options_sharing_words_with_your_answer(laya)
     degrees = [f"Diploma {i}" for i in range(15)] + ["Bachelor's Degree", "Master's Degree", "Doctorate"]
     candidate = {**CANDIDATE, "education.0.degree": "B.Tech"}
     d = model.choose(page(*select(9, "Highest qualification", degrees)), "goal", [], candidate)
-    assert d["action"]["value"] == "Bachelor's Degree" and d["target_probability"] == 0.7 and not laya
+    # The only option that is just a level's name: a fixed rule now, not a close call for the model.
+    assert d["action"]["value"] == "Bachelor's Degree" and d["target_probability"] == 1.0 and not laya
 
 
 def test_lever_style_radio_questions_are_answered_separately(laya):
@@ -905,3 +1092,294 @@ def test_im_interested_opens_the_form_like_apply(laya):
     from jev_apply.policy import Policy
 
     assert Policy().submit_like({"role": "button", "label": "I'm interested"})
+
+
+def test_a_portal_is_entered_by_your_last_application_then_resume_then_manually_never_linkedin(laya):
+    linkedin, resume = button(1, "Apply with LinkedIn"), button(2, "Autofill with Resume")
+    manual, last = button(3, "Apply Manually"), button(4, "Use My Last Application")
+    url = "https://jobs.example/apply"
+    assert choose(page(linkedin, resume, manual, last))["action"]["label"] == "Use My Last Application"
+
+    def tried(*labels):  # ways already clicked on this page (the portal came back to the chooser)
+        history = [{"kind": "click", "action": label, "url": url, "page_changed": True} for label in labels]
+        return model.choose(page(linkedin, resume, manual, last), "goal", history, CANDIDATE)["action"]["label"]
+
+    assert tried("Use My Last Application") == "Autofill with Resume"
+    assert tried("Use My Last Application", "Autofill with Resume") == "Apply Manually"
+    assert choose(page(linkedin, manual))["action"]["label"] == "Apply Manually"
+    assert choose(page(button(1, "Apply with Indeed"), button(2, "Apply")))["action"]["label"] == "Apply"
+    for label in ("Apply with LinkedIn", "Continue with LinkedIn", "Autofill from LinkedIn", "LinkedIn"):
+        assert planner.SOCIAL_APPLY.search(label), label
+    for label in ("Easy Apply", "Apply now", "Apply Manually", "Upload Resume to autofill"):
+        assert not planner.SOCIAL_APPLY.search(label), label
+    # On a form already under way, an "Autofill with Resume" button isn't pressed again.
+    assert choose(page(fill(5, "First name *"), resume))["action"]["label"] != "Autofill with Resume"
+
+
+def test_workdays_start_dialog_beats_its_linkedin_frame(laya):
+    # Workday's "Start Your Application" dialog, as the agent saw it on ABB's portal.
+    frame = {"id": "fr", "node": 9, "kind": "frame", "role": "iframe", "label": "Embedded page: applyWithLinkedIn",
+             "value": "applywithlinkedin.myworkdaygadgets.com"}  # fmt: skip
+    dialog = page(button(1, "Close"), button(2, "Autofill with Resume"), button(3, "Apply Manually"),
+                  button(4, "Use My Last Application"), frame)  # fmt: skip
+    assert choose(dialog)["action"]["label"] == "Use My Last Application"
+    assert choose(page(button(1, "Close"), frame))["operation"] != "OPEN_FORM"  # never LinkedIn's frame
+
+
+def opt(n, label, context):
+    return {"id": f"o{n}", "node": 40 + n, "kind": "click", "role": "option", "label": label, "context": context}
+
+
+def test_workdays_how_did_you_hear_goes_into_the_category_that_holds_linkedin(laya):
+    q = "How Did You Hear About Us?"
+    candidate = {**CANDIDATE, "application.how_heard": "LinkedIn"}
+    categories = [opt(n, label, q) for n, label in enumerate(["Agency", "Career Fair/Job Fair", "Employee Referral",
+                                                              "Job Board", "Other", "Social Media"])]  # fmt: skip
+    opened = [{"kind": "click", "action": f"Open {q}", "url": "https://jobs.example/apply", "page_changed": True}]
+    d = model.choose(page(*categories), "goal", opened, candidate)
+    assert d["action"]["label"] == "Job Board"  # Workday files LinkedIn under Job Board
+    inside = [opt(10, "Indeed", q), opt(11, "LinkedIn", q), opt(12, "Naukri", q)]
+    went = opened + [{"kind": "click", "action": "Job Board", "url": "https://jobs.example/apply"}]
+    assert model.choose(page(*inside), "goal", went, candidate)["action"]["label"] == "LinkedIn"
+    # Job Board tried and LinkedIn wasn't there: the next likely category
+    back = model.choose(page(*categories), "goal", went, candidate)
+    assert back["action"]["label"] == "Social Media"
+
+
+def test_typed_into_a_prompt_in_a_form_opens_its_list_instead_of_pressing_enter(laya):
+    q = "How Did You Hear About Us?"
+    field = {**fill(3, q, "LinkedIn", role="combobox", placeholder="Search"), "in_form": True}
+    wait = {"id": "wait", "kind": "wait", "label": "Wait for the page to update"}
+    typed = [{"kind": "fill", "action": q, "typed": "LinkedIn", "url": "https://jobs.example/apply"},
+             {"kind": "wait"}, {"kind": "wait"}]  # fmt: skip
+    d = model.choose(page(field, wait), "goal", typed, {**CANDIDATE, "application.how_heard": "LinkedIn"})
+    assert d["operation"] == "CLICK" and d["action"]["label"] == f"Open {q}" and d["action"]["node"] == 3
+    # Opened, and the portal is still fetching the list: wait, don't click elsewhere (it would close)
+    opened = typed + [{"kind": "click", "action": f"Open {q}", "url": "https://jobs.example/apply"}]
+    assert model.choose(page(field, wait), "goal", opened, {**CANDIDATE})["operation"] == "WAIT"
+
+
+def test_on_workday_a_search_box_in_the_form_gets_enter_then_its_list(laya):
+    q = "How Did You Hear About Us?"
+    url = "https://acme.wd3.myworkdayjobs.com/en-US/careers/job/x/apply"
+    field = {**fill(3, q, "LinkedIn", role="combobox", placeholder="Search"), "in_form": True}
+    wait = {"id": "wait", "kind": "wait", "label": "Wait for the page to update"}
+    typed = [{"kind": "fill", "action": q, "typed": "LinkedIn", "url": url}, {"kind": "wait"}, {"kind": "wait"}]
+    workday = {**page(field, wait), "url": url}
+    d = model.choose(workday, "goal", typed, {**CANDIDATE, "application.how_heard": "LinkedIn"})
+    assert d["operation"] == "PRESS_ENTER" and d["action"]["in_form_ok"]  # Workday's search wants Enter
+    entered = typed + [{"kind": "enter", "action": f"Press Enter in '{q}'", "url": url}] + [{"kind": "wait"}] * 4
+    again = model.choose(workday, "goal", entered, {**CANDIDATE, "application.how_heard": "LinkedIn"})
+    assert again["operation"] == "CLICK" and again["action"]["label"] == f"Open {q}"  # no results: its list
+    assert not planner.PROMPT_ENTER_SITES.search("job-boards.greenhouse.io")
+
+
+def test_on_workday_enter_comes_first_even_while_the_categories_still_show(laya):
+    """Xylem: after typing "LinkedIn", Workday still lists Job Board, Social Media...; Enter picks LinkedIn."""
+    q = "How Did You Hear About Us?"
+    url = "https://xylem.wd5.myworkdayjobs.com/en-US/xylem-careers/job/x/apply/useMyLastApplication"
+    field = {**fill(3, q, "LinkedIn", placeholder="Search"), "in_form": True}
+    categories = [opt(n, label, q) for n, label in enumerate(["Job Board", "Referral", "Social Media"])]
+    typed = [{"kind": "fill", "action": q, "typed": "LinkedIn", "url": url}]
+    d = model.choose({**page(field, *categories), "url": url}, "goal", typed, CANDIDATE)
+    assert d["operation"] == "PRESS_ENTER" and d["action"]["in_form_ok"] and d["action"]["node"] == 3
+    entered = typed + [{"kind": "enter", "action": f"Press Enter in '{q}'", "url": url}]
+    after = model.choose({**page(field, *categories), "url": url}, "goal", entered, CANDIDATE)
+    assert after["operation"] != "PRESS_ENTER"  # once only
+    # Workday's page has no <form>: still Enter
+    bare = {k: v for k, v in field.items() if k != "in_form"}
+    d = model.choose({**page(bare, *categories), "url": url}, "goal", typed, CANDIDATE)
+    assert d["operation"] == "PRESS_ENTER"
+
+
+def test_a_workday_prompt_showing_your_answer_as_a_chip_is_done(laya):
+    """Xylem: after Enter, "LinkedIn, press delete to clear value." under the question: no retyping, no clicking
+    the chip, no going back into the categories (and never a click on "LinkedIn checked")."""
+    q = "How Did You Hear About Us?"
+    url = "https://xylem.wd5.myworkdayjobs.com/en-US/xylem-careers/job/x/apply/useMyLastApplication"
+    field = {**fill(3, q, "", placeholder="Search"), "multiple": True}
+    chip = opt(1, "LinkedIn, press delete to clear value.", q)
+    name = fill(5, "Given Name(s)", "", context="Legal Name")
+    candidate = {**CANDIDATE, "application.how_heard": "LinkedIn"}
+    d = model.choose({**page(field, chip, name), "url": url}, "goal", [], candidate)
+    assert d["operation"] == "TYPE_TEXT" and d["action"]["label"] == "Given Name(s)"
+    ticked = [opt(2, "Indeed not checked", q), opt(3, "LinkedIn checked", q)]
+    d = model.choose({**page(*ticked, name), "url": url}, "goal", [], candidate)
+    assert d["action"]["label"] not in {"LinkedIn checked", "Indeed not checked"}
+
+
+def test_an_open_list_over_the_form_is_closed_before_save_and_enter_gets_time(laya):
+    """Xylem: a Country list Workday was still loading covered the form, and Save was pressed on a half-filled
+    page; and right after Enter in a prompt, the chip takes a moment to show."""
+    url = "https://xylem.wd5.myworkdayjobs.com/en-US/xylem-careers/job/x/apply/useMyLastApplication"
+    escape = {"id": "escape", "kind": "key", "key": "Escape", "label": "Press Escape (close an open menu, list or popup)"}
+    wait = {"id": "wait", "kind": "wait", "label": "Wait for the page to update"}
+    listed = {**page(opt(1, "Afghanistan", ""), opt(2, "Albania", ""), button(9, "Save and Continue"), escape, wait),
+              "url": url}  # fmt: skip
+    worked = [{"kind": "fill", "action": "Given Name(s)", "typed": "Yuvraj", "url": url}]
+    d = model.choose(listed, "goal", worked, CANDIDATE)
+    assert d["operation"] == "KEY"
+    closed = worked + [{"kind": "key", "action": escape["label"], "url": url}]
+    assert model.choose(listed, "goal", closed, CANDIDATE)["action"]["label"] == "Save and Continue"
+    q = "How Did You Hear About Us?"
+    field = {**fill(3, q, "", placeholder="Search"), "multiple": True}
+    entered = [{"kind": "fill", "action": q, "typed": "LinkedIn", "url": url},
+               {"kind": "enter", "action": f"Press Enter in '{q}'", "url": url}]  # fmt: skip
+    categories = [opt(4, "Job Board not checked", q), opt(5, "Social Media not checked", q)]
+    d = model.choose({**page(field, *categories, wait), "url": url}, "goal", entered,
+                     {**CANDIDATE, "application.how_heard": "LinkedIn"})  # fmt: skip
+    assert d["operation"] == "WAIT"
+
+
+def test_workday_date_boxes_of_two_jobs_are_two_fields_though_both_say_month(laya):
+    """Xylem: Work Experience 1's Month took two tries, and Work Experience 2's Month was then skipped as "typed
+    twice"; its To Year showed 2003 and wasn't corrected because a "Year" had been typed elsewhere."""
+    url = "https://xylem.wd5.myworkdayjobs.com/en-US/xylem-careers/job/x/apply/useMyLastApplication"
+    month2 = {**fill(83, "Month", "", role="spinbutton", context="From* Calendar"), "section": "Work Experience 2"}
+    year2 = {**fill(86, "Year", "2003", role="spinbutton", context="To* Calendar"), "section": "Work Experience 2"}
+    typed = [{"kind": "fill", "action": "Month", "context": "From* Calendar", "section": "Work Experience 1",
+              "typed": "04", "url": url}] * 2 + [
+             {"kind": "fill", "action": "Year", "context": "From* Calendar", "section": "Work Experience 1",
+              "typed": "2025", "url": url}]  # fmt: skip
+    candidate = {**CANDIDATE, "experience.1.start": "2023-08", "experience.1.start.mm": "08",
+                 "experience.1.end": "2025-03", "experience.1.end.year": "2025"}  # fmt: skip
+    d = model.choose({**page(month2, year2), "url": url}, "goal", typed, candidate)
+    assert d["operation"] == "TYPE_TEXT" and d["action"]["node"] == 83
+    done = typed + [{"kind": "fill", "action": "Month", "context": "From* Calendar", "section": "Work Experience 2",
+                     "typed": "08", "url": url}]  # fmt: skip
+    month2 = {**month2, "value": "8"}
+    d = model.choose({**page(month2, year2), "url": url}, "goal", done, candidate)
+    assert d["operation"] == "TYPE_TEXT" and d["action"]["node"] == 86 and d["action"]["replaces"] == "2003"
+
+
+def test_a_whole_skill_list_typed_as_one_chip_is_removed_first(laya):
+    """Xylem: an earlier run typed all 53 skills as one chip, and Workday's draft kept it. It is removed, then the
+    skills go in one at a time; a chip holding one real skill is left alone."""
+    url = "https://xylem.wd5.myworkdayjobs.com/en-US/xylem-careers/job/x/apply"
+    candidate = {**CANDIDATE, "skills": "OPC UA, OPC DA, Modbus, Python"}
+    field = {**fill(3, "Type to Add Skills", "", placeholder="Search"), "multiple": True}
+    blob = {**button(7, "Remove: OPC UA, OPC DA, Modbus, Python"), "remove_chip": True, "context": "Skills"}
+    d = model.choose({**page(field, blob), "url": url}, "goal", [], candidate)
+    assert d["operation"] == "CLICK" and d["action"]["label"].startswith("Remove: OPC UA")
+    one = {**button(8, "Remove: Python"), "remove_chip": True, "context": "Skills"}
+    d = model.choose({**page(field, one), "url": url}, "goal", [], candidate)
+    assert d["action"]["label"] != "Remove: Python"
+    stranger = {**button(9, "Remove: Cooking, Gardening, Knitting"), "remove_chip": True}
+    assert model.choose({**page(field, stranger), "url": url}, "goal", [], candidate)["action"]["node"] != 9
+
+
+def test_cookies_are_accepted_and_a_way_in_above_the_screen_is_scrolled_back_to(laya):
+    """Maersk: its banner covered "Continue Application", and the run had scrolled past it. Cookies are accepted (as
+    you asked); then the run looks back up for the way in the page names."""
+    url = "https://maersk.wd3.myworkdayjobs.com/x/job/y"
+    ctx = "Maersk.com uses cookies ... you consent to our and third party use of cookies. Decline Accept Cookies"
+    banner = {**page(button(1, "Decline", context=ctx), button(2, "Accept Cookies", context=ctx)), "url": url}
+    d = model.choose(banner, "goal", [], CANDIDATE)
+    assert d["operation"] == "CLICK" and d["action"]["label"] == "Accept Cookies"
+    up = {"id": "scroll_up", "kind": "scroll", "label": "Scroll up", "delta": -400, "x": 1, "y": 1}
+    posting = {**page(button(5, "LinkedIn", context="Follow Us"), up), "url": url,
+               "text": "Associate Software Engineer\nContinue Application\nJob Summary ..."}  # fmt: skip
+    history = [{"kind": "click", "action": "Accept Cookies", "url": url, "page_changed": True},
+               {"kind": "wait", "action": "Wait", "url": url, "page_changed": False}]  # fmt: skip
+    assert model.choose(posting, "goal", history, CANDIDATE)["operation"] == "SCROLL_UP"
+    # In view: "Continue Application" is clicked at once (it was read as a form's Continue and waited on)
+    top = {**page(button(6, "Candidate Home"), button(7, "Continue Application"), up), "url": url,
+           "text": "Associate Software Engineer\nContinue Application"}  # fmt: skip
+    d = model.choose(top, "goal", history, CANDIDATE)
+    assert d["operation"] == "CLICK" and d["action"]["label"] == "Continue Application"
+    # Scrolled down past it (the page no longer names it on screen): back up
+    scrolled = history + [{"kind": "scroll", "action": "Scroll down", "url": url, "page_changed": True}] * 2
+    below = {**page(button(5, "LinkedIn", context="Follow Us"), up), "url": url, "text": "Job Summary ..."}
+    assert model.choose(below, "goal", scrolled, CANDIDATE)["operation"] == "SCROLL_UP"
+
+
+def test_a_field_of_study_the_search_cant_find_whole_is_searched_shorter(laya):
+    """Maersk: "Computer Science and Engineering" found nothing; "computer" lists "Computer and Information Science",
+    "Computer Engineering"... The shorter search, then the result nearest your whole answer."""
+    url = "https://maersk.wd3.myworkdayjobs.com/x/apply"
+    q = "Field of Study"
+    box = {**fill(3, q, "", placeholder="Search"), "in_form": True}
+    whole = "Computer Science and Engineering"
+    history = [{"kind": "fill", "action": q, "typed": whole, "url": url},
+               {"kind": "enter", "action": f"Press Enter in '{q}'", "url": url}]  # fmt: skip
+    d = model.choose({**page(box, opt(9, "No Items.", "")), "url": url}, "goal", history, CANDIDATE)
+    assert d["operation"] == "TYPE_TEXT" and d["action"]["retype"] == "Computer"
+    again = history + [{"kind": "fill", "action": q, "typed": "Computer", "url": url},
+                       {"kind": "enter", "action": f"Press Enter in '{q}'", "url": url}]  # fmt: skip
+    results = [opt(10, "Computer and Information Science", ""), opt(11, "Computer Graphics", ""),
+               opt(12, "Computer Systems Analysis", "")]  # fmt: skip
+    d = model.choose({**page(box, *results), "url": url}, "goal", again, CANDIDATE)
+    assert d["operation"] == "CLICK" and d["action"]["label"] == "Computer and Information Science"
+
+
+def test_a_btech_takes_the_nearest_degree_a_short_list_offers(laya):
+    """Maersk's Degree list: "BA", "BS", "MS", "MBA"... and no Bachelors or B.Tech: a B.Tech is a BS (never a BA)."""
+    candidate = {**CANDIDATE, "education.0.degree": "B.Tech"}
+    opened = [{"kind": "click", "action": "Degree Select One Required", "context": "", "url": "https://jobs.example/apply"}]
+    names = ["Select One", "High School", "AA", "AS", "BA", "BS", "MA", "MS", "MBA", "PhD", "Associates", "Masters"]
+    d = model.choose(page(*[opt(n, x, "") for n, x in enumerate(names)]), "goal", opened, candidate)
+    assert d["action"]["label"] == "BS" and not laya
+    d = model.choose(page(*[opt(n, x, "") for n, x in enumerate(["BA", "BE", "BS"])]), "goal", opened, candidate)
+    assert d["action"]["label"] == "BE"  # the nearer one when it is there
+
+
+def test_a_date_box_already_showing_its_part_is_left_alone(laya):
+    """MKS kept the start date from an earlier visit: Month "10", Day "26", Year "2026" were typed again (each
+    compared with "2026-10-26"), nothing changed, and the run stopped."""
+    url = "https://mksinst.wd1.myworkdayjobs.com/x/apply"
+    q = "What is your desired start date?* Calendar"
+    boxes = [{**fill(50 + i, label, value, role="spinbutton", context=q)} for i, (label, value) in
+             enumerate((("Month", "10"), ("Day", "26"), ("Year", "2026")))]  # fmt: skip
+    candidate = {**CANDIDATE, "work.earliest_start_date": "2026-10-26"}
+    history = [{"kind": "wait", "action": "Wait", "url": url, "page_changed": False}]
+    d = model.choose({**page(*boxes, button(9, "Save and Continue")), "url": url}, "goal", history, candidate)
+    assert d["action"]["label"] == "Save and Continue"
+
+
+def test_a_btech_is_workdays_bachelors_not_another_fields_bachelor(laya):
+    """Xylem's Degree list: B.Tech is "Bachelors" (not "Bachelor of Business & Commerce", not "Post Graduate")."""
+    q = "Degree"
+    names = ["Bachelor of Business & Commerce", "Higher Diploma", "Diplom", "Associates", "Bachelors", "Masters",
+             "MBA", "Post Graduate", "Higher Secondary"]  # fmt: skip
+    opened = [{"kind": "click", "action": "Degree Select One Required", "context": "From",
+               "url": "https://jobs.example/apply"}]  # fmt: skip
+    candidate = {**CANDIDATE, "education.0.degree": "B.Tech"}
+    d = model.choose(page(*[opt(n, x, "") for n, x in enumerate(names)]), "goal", opened, candidate)
+    assert d["action"]["label"] == "Bachelors" and not laya
+
+
+def test_a_required_mark_left_from_an_early_save_gets_one_more_save_not_a_stop(laya):
+    """Xylem: Save pressed before the phone was typed; typed now, the field still says "required"."""
+    url = "https://xylem.wd5.myworkdayjobs.com/en-US/xylem-careers/job/x/apply/useMyLastApplication"
+    phone = {**fill(4, "Phone Number", "9460355492", context="Phone"), "invalid": True}
+    save = button(9, "Save and Continue")
+    shown = {**page(phone, save), "url": url, "text": "Error: The field Phone Number is required and must have a value."}
+    history = [{"kind": "click", "action": "Save and Continue", "url": url},
+               {"kind": "fill", "action": "Phone Number", "typed": "9460355492", "url": url}]  # fmt: skip
+    d = model.choose(shown, "goal", history, CANDIDATE)
+    assert d["operation"] == "CLICK" and d["action"]["label"] == "Save and Continue"
+    # Saved again and still marked: a real error now, the run stops for you
+    again = history + [{"kind": "click", "action": "Save and Continue", "url": url}]
+    assert model.choose(shown, "goal", again, CANDIDATE)["operation"] == "BLOCKED"
+
+
+def test_a_college_the_search_doesnt_know_is_found_shorter_or_as_other(laya):
+    school = "Manipal University Jaipur"
+    field = fill(4, "School or University", school, role="combobox")
+    wait = {"id": "wait", "kind": "wait", "label": "Wait for the page to update"}
+    typed = [{"kind": "fill", "action": "School or University", "typed": school, "url": "https://jobs.example/apply"},
+             {"kind": "wait"}, {"kind": "wait"}]  # fmt: skip
+    d = model.choose(page(field, wait), "goal", typed, CANDIDATE)  # nothing came up for the full name
+    assert d["operation"] == "TYPE_TEXT" and d["action"]["retype"] == "Manipal University"
+    q = "School or University"
+    shown = [opt(1, "Manipal University", q), opt(2, "Manipal Institute of Technology", q), opt(3, "Other", q)]
+    assert model.choose(page(field, *shown), "goal", typed[:1], CANDIDATE)["action"]["label"] == "Manipal University"
+    others = [opt(1, "IIT Bombay", q), opt(2, "Others", q)]
+    assert model.choose(page(field, *others), "goal", typed[:1], CANDIDATE)["action"]["label"] == "Others"
+    assert planner.shorter_name("Manipal University, Jaipur") == "Manipal University"
+
+
+def test_a_page_saying_you_applied_already_in_other_words_is_already_applied(laya):
+    for text in ("Thank you for applying! We will review your profile.", "You have already applied for this job.",
+                 "We have received your application", "Your application has been submitted"):  # fmt: skip
+        assert choose({**page(button(1, "View job")), "text": text})["reason"] == planner.ALREADY_APPLIED, text

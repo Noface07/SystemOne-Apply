@@ -19,8 +19,21 @@ def load_environment(path=Path(".env")):
                 os.environ.setdefault(key.strip(), value.strip())
 
 
+def default_track(data):
+    """When --data names the shared data/ folder (the default) and your profiles live in its résumé tracks
+    (data/automation, data/dotnet...), the first track: never the example profile a fresh copy leaves there."""
+    own = data / "profile.json"
+    if own.exists() and "@example.com" not in own.read_text(encoding="utf-8"):
+        return data
+    tracks = sorted(p for p in data.iterdir() if p.is_dir() and (p / "profile.json").is_file()) if data.is_dir() else []
+    if tracks:
+        print(f"Using your {tracks[0].name} profile ({tracks[0].as_posix()}); --data picks another.", file=sys.stderr)
+        return tracks[0]
+    return data
+
+
 def load(args):
-    data = Path(args.data)
+    data = default_track(Path(args.data))
     policy = Policy.load(data / "policy.json")
     if getattr(args, "submit", False):
         from dataclasses import replace
@@ -223,6 +236,14 @@ def plan_batch(urls, loaded, default):
     return plans
 
 
+def removed_jobs(jobs_file):
+    """Job numbers you removed from a running batch: <jobs file>.skip, one number per line (the app writes it)."""
+    path = Path(jobs_file).with_suffix(".skip")
+    if not path.is_file():
+        return set()
+    return {int(n) for n in path.read_text(encoding="utf-8").split() if n.isdigit()}
+
+
 def batch(args):
     """Fill several jobs, one tab each, without asking anything. Nothing is submitted: every tab stays open for
     you to review and submit, and a summary lists what each one still needs from you."""
@@ -260,6 +281,10 @@ def batch(args):
             label = f"[{number}/{len(plans)}] "
             print(f"\n{label}{url}")
             ui = UnattendedUI(label)
+            if number in removed_jobs(args.file):  # you took it out of this batch in the app
+                print(f"  · {label}deferred: removed by you")
+                results.append((url, {"status": "deferred", "fills": [], "left_for_you": [], "error": "removed"}, ui))
+                continue
             if plan.deferred:
                 print(f"  · {label}deferred: {plan.deferred}")
                 results.append(
@@ -457,6 +482,7 @@ def answer(args):
         print(f"Nothing open in {path}. Unattended runs add the questions they couldn't answer there.")
         return 0
     print(f"{len(open_)} open question(s) in {path}. Enter = skip for now, 'q' = stop.\n")
+    given = {}
     for number, entry in enumerate(open_, 1):
         print(f"{number}. {entry['question']}")
         options = entry.get("options") or []
@@ -467,12 +493,17 @@ def answer(args):
         reply = input("   Your answer" + (" (number or text)" if options else "") + ": ").strip()
         if reply.lower() in {"q", "quit"}:
             break
-        if options and reply.isdigit() and 1 <= int(reply) <= len(options):
-            reply = options[int(reply) - 1]
-        entry["answer"] = reply
+        reply = inbox.option_for(reply, options)
         if reply:
+            given[entry["question"]] = reply
             print(f"   saved: {reply}\n")
-    inbox.write(path, questions)
+
+    def change(entries):  # only your answers go in: questions a batch added meanwhile stay
+        for e in entries:
+            if e["question"] in given:
+                e["answer"] = given[e["question"]]
+
+    questions = inbox.update(path, change) if given else inbox.read(path)
     left = sum(1 for q in questions if not q["answer"])
     print(f"\nSaved in {path}. {left} still open. Later runs fill these on their own.")
     return 0
@@ -554,12 +585,31 @@ def main(argv=None):
     many.add_argument("--runs", default="runs", help="where run reports are written")
     pilot = sub.add_parser("autopilot", help="search every track, apply to the best fits (data/autopilot.json)")
     pilot.add_argument("--dry", action="store_true", help="search and pick, but don't apply")
+    sub.add_parser("gmail-connect", help="let jev-apply read verification e-mails from your Gmail (read-only)")
     face = sub.add_parser("ui", help="open the web app: find jobs, run and watch batches, answer questions, history")
     face.add_argument("--port", type=int, default=8765)
     face.add_argument("--no-browser", action="store_true", help="don't open a browser tab")
+    stats = sub.add_parser("metrics", help="how runs went: first-run Review rate per site and ATS, why runs stop")
+    stats.add_argument("--runs", default="runs", help="where run reports are written")
+    stats.add_argument("--json", action="store_true", help="the numbers as JSON")
     args = parser.parse_args(argv)
+    if args.command == "metrics":
+        from . import metrics
+
+        numbers = metrics.summary(metrics.load(args.runs))
+        print(json.dumps(numbers, indent=2, default=list) if args.json else metrics.render(numbers))
+        return 0
     if args.command == "ui":
         return ui_cmd(args)
+    if args.command == "gmail-connect":
+        from . import gmail
+
+        folder = default_track(Path(args.data))
+        folder = folder.parent if (folder.parent / "profile.example.json").is_file() else folder
+        if not gmail.client_path(folder).is_file():
+            sys.exit(f"First save your Google OAuth client (Desktop app) as {gmail.client_path(folder)}; see README.")
+        print(f"Connected: jev-apply can read verification e-mails in {gmail.connect(folder)} (read-only).")
+        return 0
     if args.command == "autopilot":
         from .web.features import run_autopilot
 

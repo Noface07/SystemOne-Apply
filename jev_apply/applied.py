@@ -5,6 +5,8 @@ import re
 from datetime import datetime
 from pathlib import Path
 
+from .files import write_json
+
 # The same job under different addresses (tracking parameters, search pages) has one key.
 KEYS = (
     (re.compile(r"linkedin\.com/jobs/(?:view|collections/[^?]*currentJobId=)/?(\d+)"), "linkedin"),
@@ -54,7 +56,7 @@ def record(path, urls, status, title="", company=""):
     for url in urls:
         if url:
             done[job_key(url)] = entry
-    Path(path).write_text(json.dumps(done, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    write_json(Path(path), done)
 
 
 def company_of(entry):

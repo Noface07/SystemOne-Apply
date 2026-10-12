@@ -4,7 +4,10 @@ import json
 import os
 import re
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
+
+from .files import write_json
 
 # A choice question offers a field's facts: TypeSafe takes up to 255 options and Laya a handful, so both backends
 # get a shortlist of the facts sharing the field's words (model.fit_for_typesafe, laya_backend.shortlist). Saved
@@ -17,7 +20,7 @@ def source_limit():
     return MAX_SOURCES_SHORTLISTED
 
 
-MAX_ITEMS = 25  # lists up to this long also become one-item facts, for tag / multi-select fields
+MAX_ITEMS = 25  # the first this many items of a list also become one-item facts, for tag / multi-select fields
 ITEM = re.compile(r"\.item_\d+$")
 DATE = re.compile(r"^(\d{4})-(\d{2})(?:-(\d{2}))?$")
 MONTHS = "January February March April May June July August September October November December".split()
@@ -158,8 +161,8 @@ def flatten(node, prefix=""):
         if all(not isinstance(item, (dict, list)) for item in node):
             items = [as_text(item) for item in node if item not in (None, "")]
             yield prefix, ", ".join(items), f"{describe(prefix)} — all of them as ONE comma-separated text"
-            if 1 < len(items) <= MAX_ITEMS:  # tag fields take one value per entry
-                for n, item in enumerate(items, 1):
+            if len(items) > 1:  # tag fields take one value per entry: the first MAX_ITEMS of a longer list
+                for n, item in enumerate(items[:MAX_ITEMS], 1):
                     about = (
                         f"{describe(prefix)} — ONE item ({n} of {len(items)}), for fields that add items "
                         "one at a time (tags, chips, multi-select)"
@@ -218,6 +221,59 @@ PLACEHOLDER_TAIL = re.compile(
     re.I,
 )
 
+# A code the site just sent you (an e-mail or SMS verification, an OTP, a CAPTCHA): new every time, so you type it in
+# the tab and it is never asked in QUESTIONS.md or kept as an answer.
+ONE_TIME_CODE = re.compile(
+    r"verification code|verify (your )?(e-?mail|phone|mobile|code)|security code|one[- ]?time (pass(word|code)?|code)|"
+    r"\botp\b|passcode|confirmation code|code (we|was|has been) sent|enter (the )?(\d-digit |six-digit )?code\b|"
+    r"\bdigit \d+ of (\w+)|captcha",
+    re.I,
+)
+
+
+def one_time_code(text):
+    return bool(ONE_TIME_CODE.search(text or ""))
+
+
+# A cookie or consent banner's text is not a question about you: the banner is dismissed, never asked about.
+COOKIE_BANNER = re.compile(r"\bcookies?\b|cookie consent|consent preferences|privacy preference center", re.I)
+# What a page announces to screen readers ("6 suggestions available. Use up and down arrows to browse.") or its
+# own step counter: read along with a field, never a question.
+ANNOUNCEMENT = re.compile(
+    r"\b\d+ (suggestions?|results?|options?) (are )?available\b|use (the )?up and down arrows|"
+    r"^\s*\d+/\d+ pages?\b|no file (selected|chosen)|^\s*(resume|cv|attach\w*)\b.{0,40}\.(pdf|docx?)\s*$|"
+    r"^\s*(select|choose|please select)\s*(\.\.\.|…)?\s*$|^\s*apply\s*$|"
+    r"^\s*(contact information|role description|description|competency/skill|proficiency|combobox|textbox)\s*$|"
+    # Workday's error list: "The field X is required and must have a value.", its links "Error X"
+    r"^\s*the field .{1,200} is required and must have a value\.?\s*$|^\s*error\b",
+    re.I,
+)
+
+
+# What a dropdown or prompt shows that isn't a choice ("Select One Required", "press delete to clear value", the
+# agent's own "Open <field>"): never offered as an answer, or you'd be asked to pick the placeholder.
+CONTROL_OPTION = re.compile(
+    r"^\s*(select|choose|please select|pick)\b|\brequired\s*$|press delete|^\s*open\s|^\s*(--|—|-)?\s*$", re.I
+)
+
+
+def real_options(options):
+    return [o for o in options or [] if not CONTROL_OPTION.search(str(o))]
+
+
+def not_a_question(text):
+    """Text that must never become a QUESTIONS.md entry: a code a site sent, a cookie banner, a screen-reader
+    announcement, or a section title."""
+    return one_time_code(text) or bool(COOKIE_BANNER.search(text or "") or ANNOUNCEMENT.search(text or ""))
+
+
+def tidy_question(text):
+    """A question as it goes into QUESTIONS.md: doubled words undone, a dropdown's "Select..." dropped
+    ("School — Select..." is asked as "School"). same_question still matches it to the form's wording."""
+    text = undouble(text)
+    tidy = re.sub(r"\s*[—–-]\s*$", "", PLACEHOLDER_TAIL.sub("", text.replace("…", "..."))).strip()
+    return tidy or text
+
 
 def same_question(a, b):
     """Is this the same question, asked again (another form, another job)? Whole text, or the part before the
@@ -231,7 +287,11 @@ def same_question(a, b):
         head = re.sub(r"[^0-9a-z]", "", str(q).split(" — ")[0].lower())
         return {x for x in (whole, head) if len(x) >= 8}
 
-    return bool(forms(a) & forms(b))
+    def label(q):  # the whole label, however short ("School" is "School — Select..." without its placeholder)
+        q = re.sub(r"\s*[—–-]\s*$", "", PLACEHOLDER_TAIL.sub("", undouble(q).replace("…", "...")))
+        return re.sub(r"[^0-9a-z]", "", q.lower())
+
+    return bool(forms(a) & forms(b)) or (len(label(a)) >= 3 and label(a) == label(b))
 
 
 def answers(saved, asked):
@@ -287,6 +347,8 @@ class Profile:
         self.facts = self.derive(facts, str(data.get("compensation", {}).get("currency", "INR")).upper())
         self.saved = {}  # question -> your answer, from answers.json and learned.json
         for entry in answers:
+            if one_time_code(entry["question"]):
+                continue  # a code a site once sent you: wrong on every later form
             key = f"answer.{entry['id']}"
             self.facts[key] = Fact(key, entry["answer"].strip(), f"Your saved answer to: {entry['question']}")
             self.saved[entry["question"]] = entry["answer"].strip()
@@ -294,8 +356,25 @@ class Profile:
             raise ValueError(f"{len(self.facts)} facts + answers; the limit is {source_limit()}. Trim unused fields.")
         self.by_id = {safe_id(k): f for k, f in self.facts.items()}
 
+    def note_fact(self, key, value, about):
+        """A fact about this run's job (its country, whether you applied there before), kept for this run only."""
+        self.facts[key] = Fact(key, value, about)
+        self.by_id[safe_id(key)] = self.facts[key]
+
+    def note_job_country(self, country):
+        """The country of the job this run applies to (from its address or page), for questions that ask about
+        "the country in which this position is located". Kept for this run only, never saved."""
+        self.facts["job.country"] = Fact("job.country", country, "Country of the job being applied to")
+        self.by_id[safe_id("job.country")] = self.facts["job.country"]
+
     @staticmethod
     def derive(facts, currency):
+        born = facts.get("personal.date_of_birth")
+        found = DATE.match(born.value) if born else None
+        if found and "personal.over_18" not in facts:
+            today = datetime.now()
+            age = today.year - int(found[1]) - ((today.month, today.day) < (int(found[2]), int(found[3] or 1)))
+            facts["personal.over_18"] = Fact("personal.over_18", "Yes" if age >= 18 else "No", "18 or older")
         first, last = facts.get("personal.first_name"), facts.get("personal.last_name")
         if first and last and "personal.full_name" not in facts:
             facts["personal.full_name"] = Fact(
@@ -338,6 +417,16 @@ class Profile:
         if backlogs and "academics.has_active_backlogs" not in facts and backlogs.value.isdigit():
             key = "academics.has_active_backlogs"
             facts[key] = Fact(key, "Yes" if int(backlogs.value) else "No", describe(key))
+        notice = facts.get("work.notice_period_days")
+        if notice and notice.value.isdigit() and "work.earliest_start_date" not in facts:
+            # A start date a calendar asks for, from your notice period: today plus those days (computed, not guessed;
+            # your own date in the profile wins).
+            from datetime import timedelta
+
+            start = (datetime.now() + timedelta(days=int(notice.value))).strftime("%Y-%m-%d")
+            facts["work.earliest_start_date"] = Fact(
+                "work.earliest_start_date", start, f"Earliest start date: today plus your {notice.value}-day notice"
+            )
         derived = {}
         for key, fact in facts.items():
             if re.fullmatch(r"compensation\.\w+\.\w+_annual", key):
@@ -372,11 +461,22 @@ class Profile:
             if path and Path(path).is_file():
                 answers += json.loads(Path(path).read_text(encoding="utf-8")).get("answers", [])
         questions_path = questions_path or inbox.path_for(profile_path.parent)
-        answers += [
+        lessons = Path(questions_path).parent / "lessons.json"  # what the teacher answered from your profile
+        yours = [
             {"id": f"md_{n}", "question": entry["question"], "answer": entry["answer"]}
             for n, entry in enumerate(inbox.read(questions_path), 1)
             if entry["answer"]
         ]
+        if lessons.is_file():
+            from .teacher import still_holds
+
+            # Each lesson checked again against your profile as it is now, your answers in QUESTIONS.md included (a
+            # lesson may come from one): one whose fact has changed since (a new CTC), or that the checks no longer
+            # allow (a question of who you are), is not used.
+            now = cls(data, profile_path.parent, list(answers) + yours, learned_path, questions_path)
+            answers += [a for a in json.loads(lessons.read_text(encoding="utf-8")).get("answers", [])
+                        if still_holds(a, now)]  # fmt: skip
+        answers += yours  # last: your own answer to a question wins over a lesson's
         return cls(data, profile_path.parent, answers, learned_path, questions_path)
 
     def sources(self, dates_only=False, exclude=()):
@@ -393,7 +493,10 @@ class Profile:
         return state
 
     def saved_answer(self, question):
-        """Your saved answer to this question if you answered it before (here or on another form), else None."""
+        """Your saved answer to this question if you answered it before (here or on another form), else None. A code
+        a site sends (verification, OTP) never has one: it is new every time."""
+        if one_time_code(question):
+            return None
         return next((a for q, a in self.saved.items() if answers(q, question)), None)
 
     def add_pending(self, entries, done=()):
@@ -405,28 +508,27 @@ class Profile:
         path = self.questions_path
         if not path:
             return 0
-        known = inbox.read(path)
-        before = len(known)
-        known = [q for q in known if q.get("answer") or not any(same_question(q["question"], d) for d in done)]
-        for entry in entries:
-            if self.saved_answer(entry["question"]):
-                continue
-            same = next((q for q in known if same_question(q["question"], entry["question"])), None)
-            if same:
-                same["urls"] = list(dict.fromkeys(same.get("urls", []) + entry.get("urls", [])))[-5:]
-                same["options"] = same.get("options") or entry.get("options", [])
-            else:
-                known.append(
-                    {
-                        "question": undouble(entry["question"]),
-                        "options": entry.get("options", []),
-                        "urls": entry.get("urls", []),
-                        "answer": "",
-                    }
-                )
-        if entries or len(known) != before:
-            inbox.write(path, known)
-        return sum(1 for q in known if not q.get("answer"))
+        added = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+        def change(known):
+            known = [q for q in known if q.get("answer") or not any(same_question(q["question"], d) for d in done)]
+            # Older runs added codes (some answered) and cookie banners: never questions.
+            known = [q for q in known if not one_time_code(q["question"])]
+            known = [q for q in known if q.get("answer") or not not_a_question(q["question"])]
+            for entry in entries:
+                if self.saved_answer(entry["question"]) or not_a_question(entry["question"]):
+                    continue
+                options = real_options(entry.get("options", []))
+                same = next((q for q in known if same_question(q["question"], entry["question"])), None)
+                if same:
+                    same["urls"] = list(dict.fromkeys(same.get("urls", []) + entry.get("urls", [])))[-5:]
+                    same["options"] = same.get("options") or options
+                else:
+                    known.append({"question": tidy_question(entry["question"]), "options": options,
+                                  "urls": entry.get("urls", []), "answer": "", "added": added})  # fmt: skip
+            return known
+
+        return sum(1 for q in inbox.update(path, change) if not q.get("answer"))
 
     def remember(self, question, answer):
         """Save an answer you typed so the next form fills it without asking."""
@@ -436,7 +538,7 @@ class Profile:
         data = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {"answers": []}
         entry = {"id": f"learned_{len(data['answers']) + 1}", "question": question, "answer": answer}
         data["answers"].append(entry)
-        path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        write_json(path, data)
         key = f"answer.{entry['id']}"
         self.facts[key] = Fact(key, answer, f"Your saved answer to: {question}")
         self.by_id[safe_id(key)] = self.facts[key]

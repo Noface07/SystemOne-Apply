@@ -320,17 +320,53 @@ def test_the_inbox_parses_each_run_report_once(home, monkeypatch):  # noqa: F811
     assert len(reads) - first <= 1  # the second build reuses every parsed report (applied.json may be read)
 
 
-def test_a_batch_job_waiting_for_your_answers_shows_until_it_moves_on(monkeypatch):
+def test_a_batch_job_waiting_for_you_shows_until_it_moves_on_and_continue_reaches_it(home, monkeypatch):  # noqa: F811
     b = {"id": "b1", "state": "running", "phase": "", "started": "", "jobs": [{"n": 1, "url": "u1", "state": "running",
          "events": []}]}  # fmt: skip
-    current = batches._apply(b, "  · [1/1] waiting for your answers (up to 5 min, in Questions): Notice? | Shifts?", 1)
-    assert b["jobs"][0]["waiting"] == "Notice? | Shifts?"
+    line = "  · [1/1] waiting for your answers (up to 5 min, in Questions) [continue 1a2b3c4d]: Notice? | Shifts?"
+    current = batches._apply(b, line, 1)
+    assert b["jobs"][0]["waiting"] == {"kind": "answers", "questions": ["Notice?", "Shifts?"], "token": "1a2b3c4d"}
     monkeypatch.setitem(batches._batches, "b1", b)
-    assert batches.waiting() == [
-        {"batch": "b1", "n": 1, "title": "u1", "company": None, "questions": ["Notice?", "Shifts?"]}
-    ]
-    batches._apply(b, "  · [1/1] answered: carrying on with this form", current)
+    assert batches.waiting() == [{"batch": "b1", "n": 1, "title": "u1", "company": None, "kind": "answers",
+                                  "questions": ["Notice?", "Shifts?"]}]  # fmt: skip
+    # "Continue" in the app leaves the run a signal file named by its token
+    assert client().post("/api/batches/b1/jobs/1/continue", headers=AUTH).json() == {"continuing": True}
+    assert (home / "runs" / "continue" / "1a2b3c4d").is_file()
+    batches._apply(b, "  · [1/1] continuing: you said go ahead", current)
     assert "waiting" not in b["jobs"][0] and batches.waiting() == []
+    assert client().post("/api/batches/b1/jobs/1/continue", headers=AUTH).status_code == 409  # nothing waits now
+    code = (
+        "  · [1/1] \a!!! waiting for you to enter the verification code in the open tab (up to 15 min) "
+        "[continue 0f0f0f0f]: x"
+    )
+    batches._apply(b, code, current)
+    assert b["jobs"][0]["waiting"] == {"kind": "code", "questions": [], "token": "0f0f0f0f"}
+
+
+def test_codes_a_site_sends_never_reach_the_question_bank(home):  # noqa: F811
+    from jev_apply import inbox
+    from jev_apply.profile import one_time_code
+    from jev_apply.web import data
+
+    for code in ("Enter verification code digit 1 of six.", "OTP", "Enter the 6-digit code we sent", "Security code"):
+        assert one_time_code(code), code
+    for question in ("What is your notice period?", "Postal code", "Country code", "Code of conduct agreement?"):
+        assert not one_time_code(question), question
+    path = home / "data" / "QUESTIONS.md"
+    old = [
+        {"question": f"Enter verification code digit {n} of six.", "options": [], "urls": [], "answer": ""}
+        for n in (1, 2)
+    ]
+    inbox.write(path, inbox.read(path) + old)
+    assert all(not one_time_code(q["question"]) for q in data.questions())  # hidden in the app at once
+    from jev_apply.profile import Profile
+
+    profile = Profile({}, home, questions_path=path)
+    profile.add_pending([{"question": "Enter the code we sent to your e-mail", "urls": []}])
+    assert all(not one_time_code(e["question"]) for e in inbox.read(path))  # and cleared from the file
+    remembered = Profile({}, home, answers=[{"id": "1", "question": "Enter verification code digit 1 of six.",
+                                             "answer": "2"}], questions_path=path)  # fmt: skip
+    assert remembered.saved_answer("Enter verification code digit 1 of six.") is None  # a stale code is never reused
 
 
 def test_jobs_stopped_on_questions_you_have_answered_are_offered_again(home):  # noqa: F811
@@ -375,3 +411,45 @@ def test_an_answer_is_saved_to_its_question_even_when_the_list_moved(home):  # n
     c.post(f"/api/questions/{target['index']}", json={"answer": "No", "question": target["question"]}, headers=AUTH)
     saved = {e["question"]: e["answer"] for e in inbox.read(path)}
     assert saved[target["question"]] == "No" and saved["A new one a batch just added?"] == ""
+
+
+def test_jobs_not_started_can_be_removed_from_a_running_batch(home, monkeypatch):  # noqa: F811
+    from jev_apply import cli
+
+    jobs = [{"n": n, "url": f"u{n}", "state": s, "events": []} for n, s in ((1, "submitted"), (2, "running"),
+                                                                          (3, "waiting"), (4, "waiting"))]  # fmt: skip
+    monkeypatch.setitem(batches._batches, "20261010-120000-abcd", {"id": "20261010-120000-abcd", "state": "running",
+                        "started": "", "jobs": jobs})  # fmt: skip
+    c = client()
+    res = c.post("/api/batches/20261010-120000-abcd/remove", json={"jobs": [1, 2, 3, 4]}, headers=AUTH)
+    assert res.json() == {"removed": [3, 4]}  # what has started or finished stays
+    assert [j["state"] for j in jobs] == ["submitted", "running", "deferred", "deferred"]
+    jobs_file = batches.folder() / "20261010-120000-abcd.txt"
+    assert cli.removed_jobs(jobs_file) == {3, 4}  # the batch process reads this before each job
+
+
+def test_the_question_bank_lists_newest_first_and_never_cookie_banners(home):  # noqa: F811
+    from jev_apply import inbox
+    from jev_apply.profile import Profile
+    from jev_apply.web import data
+
+    path = home / "data" / "QUESTIONS.md"
+    profile = Profile({}, home, questions_path=path)
+    profile.add_pending([
+        {"question": "School — Select...", "urls": ["https://x.test/1"]},
+        {"question": "We use cookies to offer you a better browsing experience", "urls": []},
+        {"question": "Cookie Consent", "options": ["Accept", "Reject"], "urls": []},
+    ])  # fmt: skip
+    entries = inbox.read(path)
+    school = next(e for e in entries if e["question"] == "School")  # the dropdown's "Select..." dropped
+    assert school["added"] and not any("ookie" in e["question"] for e in entries)
+    assert profile.saved_answer("School — Select...") is None
+    school["answer"] = "MIT"
+    inbox.write(path, entries)
+    assert (
+        Profile({}, home, answers=[{"id": "1", "question": "School", "answer": "MIT"}]).saved_answer(
+            "School — Select..."
+        )
+        == "MIT"
+    )  # the short form still answers the form's wording
+    assert all("ookie" not in q["question"] for q in data.questions())

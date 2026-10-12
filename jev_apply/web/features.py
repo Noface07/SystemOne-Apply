@@ -15,6 +15,7 @@ from dataclasses import fields
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from ..files import write_json
 from ..policy import Policy
 from . import data
 
@@ -32,7 +33,13 @@ SAFETY = [
     ("company_gap_days", "Company window (days)", "e.g. 14: at most the number above in any 14 days."),
     ("auto_consent", "Tick plain privacy/terms boxes", "Declarations (criminal record...) are always asked."),
     ("google_sign_in", "Sign in with Google for me", "Clicks only: your account, basic profile sharing. Never types."),
+    ("email_codes", "Read verification e-mails for me", "Codes and verification links from your Gmail "
+     "(read-only; run `jev-apply gmail-connect` once). Off: they wait for you."),
+    ("portal_accounts", "Sign in / sign up on portals for me", "Workday, iCIMS... without a Google button: your "
+     "e-mail and the portal password from System settings. A refused sign-in isn't retried."),
     ("login_wait_s", "Wait at a sign-in page (s)", "How long a run waits for you to sign in. 0 stops at once."),
+    ("teacher", "Teacher (Claude) answers from your profile", "Before asking you: Claude answers what your "
+     "profile settles, citing the fact; checked, then reused without Claude. Off: questions come to you."),
     ("answer_wait_s", "Wait for your answers (s)", "A required question nothing on file answers: the run waits "
      "this long for you to answer it in Questions, then carries on. 0: it stops, to re-run later."),
     ("confirm_wait_s", "Wait for the site's confirmation (s)", "After Submit."),
@@ -85,7 +92,7 @@ def save_safety(track, values):
         else:
             overrides[name] = value
     Policy(**{k: v for k, v in overrides.items() if not k.startswith("_") and k in types})  # raises if invalid
-    path.write_text(json.dumps(overrides, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    write_json(path, overrides)
     data._load.cache_clear()
     return get_safety(track)
 
@@ -124,7 +131,7 @@ def save_prefs(values):
             prefs[key] = value[:30]
         else:
             prefs[key] = [str(v).strip() for v in value if str(v).strip()][:200]
-    prefs_path().write_text(json.dumps(prefs, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    write_json(prefs_path(), prefs)
     return prefs
 
 
@@ -345,7 +352,7 @@ def queue():
                 items.append({"id": iid, "kind": "job", "run": r["id"], "url": r["url"], "track": r["track"],
                               "at": r["at"], "status": status, "reason": r["reason"], "left": r["left"]})  # fmt: skip
     questions = [q for q in data.questions() if not q["answer"]]
-    return {"items": items[:200], "open_questions": len(questions)}
+    return {"items": items[:200], "open_questions": len(questions)}  # data.questions() leaves codes out
 
 
 RERUN_DAYS = 30  # older stops are likely closed jobs by now
@@ -356,7 +363,7 @@ def rerun_ready():
     A run records the questions it stopped on (report "waiting_on"); for older runs, the questions QUESTIONS.md
     lists as asked on that job's pages. Jobs you've applied to since, or dismissed, are left out."""
     from .. import applied, inbox
-    from ..profile import same_question
+    from ..profile import one_time_code, same_question
 
     entries = inbox.read(data.data_dir() / "QUESTIONS.md")
     answered = [e for e in entries if e["answer"]]
@@ -379,6 +386,7 @@ def rerun_ready():
         if waiting is None:
             pages = {r["url"], report.get("final_url")}
             waiting = [e["question"] for e in entries if pages & set(e.get("urls") or [])]
+        waiting = [w for w in waiting if not one_time_code(w)]  # a code is typed in the tab on the next run
         if waiting and all(any(same_question(a["question"], w) for a in answered) for w in waiting):
             out.append({"url": r["url"], "run": r["id"], "at": r["at"], "track": r["track"], "status": status,
                         "questions": waiting[:6]})  # fmt: skip
@@ -391,7 +399,7 @@ def mark_done(item_id, done=True):
         state[item_id] = datetime.now().isoformat(timespec="seconds")
     else:
         state.pop(item_id, None)
-    path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+    write_json(path, state, ascii_only=True)
     return queue()
 
 
@@ -508,7 +516,7 @@ def save_autopilot(values):
         raise ValueError("posted: day or week")
     config["enabled"] = bool(config["enabled"])
     config["submit"] = bool(config["submit"])
-    autopilot_path().write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+    write_json(autopilot_path(), config, ascii_only=True)
     schedule(config)
     return get_autopilot()
 
@@ -602,11 +610,10 @@ def run_autopilot(dry=False, wait_s=900):
         sources=search["sources"],
     )
     deadline = time.monotonic() + wait_s
-    while time.monotonic() < deadline:
-        found = jobs.get_search(task)
-        if found["state"] == "done":
-            break
+    found = jobs.get_search(task)  # what's in so far, even when the wait is over before the search is
+    while found["state"] != "done" and time.monotonic() < deadline:
         time.sleep(2)
+        found = jobs.get_search(task)
     fits = sorted(
         (j for j in found["jobs"] if j.get("fit") and (j.get("score") or 0) >= config["min_score"]),
         key=lambda j: (not j.get("fresh"), -(j.get("score") or 0)),
@@ -635,7 +642,7 @@ def run_autopilot(dry=False, wait_s=900):
     summary["ended"] = datetime.now().isoformat(timespec="seconds")
     out = data.runs_dir() / "autopilot" / f"{started:%Y%m%d-%H%M%S}.json"
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps(summary, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    write_json(out, summary)
     return summary
 
 
@@ -664,7 +671,7 @@ def dismiss(key, title="", company="", undo=False):
             "company": str(company)[:80],
             "at": datetime.now().isoformat(timespec="seconds"),
         }
-    _dismissed_path().write_text(json.dumps(found, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    write_json(_dismissed_path(), found)
     return found
 
 
@@ -680,6 +687,7 @@ def _answer_files():
         folder = data.track_folder(t["id"])
         out.append(("answers", t["id"], folder / "answers.json"))
         out.append(("learned", t["id"], folder / Policy.load(folder / "policy.json").learned_answers))
+    out.append(("teacher", None, data.data_dir() / "lessons.json"))  # answered from your profile by the teacher
     return out
 
 
@@ -747,7 +755,7 @@ def update_answer(answer_id, answer):
     else:
         stored = json.loads(path.read_text(encoding="utf-8"))
         stored["answers"][n]["answer"] = text
-        path.write_text(json.dumps(stored, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        write_json(path, stored)
     data._load.cache_clear()
     return answer_bank()
 
@@ -759,7 +767,7 @@ def delete_answer(answer_id):
     else:
         stored = json.loads(path.read_text(encoding="utf-8"))
         del stored["answers"][n]
-        path.write_text(json.dumps(stored, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        write_json(path, stored)
     data._load.cache_clear()
     return answer_bank()
 

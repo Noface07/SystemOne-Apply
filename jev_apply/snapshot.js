@@ -121,7 +121,12 @@
   const customs=new Set();  // clickables without a role, found below: their words are answers too
   const isChoice = e => e.matches(CHOICES) || customs.has(e);
   const context = (e, own) => {
-    const group=e.closest('fieldset,[role="radiogroup"],[role="group"]');
+    let group=e.closest('fieldset,[role="radiogroup"],[role="group"]');
+    // A group holding other questions' fields is a section, not a question (Maersk's "Personal information" wraps
+    // all 13 fields in one role="group": each took the section's words). The parts of one date stay one question.
+    const part=/^\s*(month|day|year|mm|dd|yyyy|hours?|minutes?)\s*\*?\s*$/i;
+    if (group && [...group.querySelectorAll(FIELDS+',button[aria-haspopup]')].some(x=>x!==e && visible(x) &&
+        !part.test(name(x)||'') && !x.contains(e) && !e.contains(x))) group=null;
     if (group) {
       const legend=group.querySelector('legend');
       const t=clean(legend ? legend.innerText : name(group)) || blockText(group);
@@ -184,7 +189,7 @@
       if (e.type==='search') return 'searchbox';
       if (e.type==='number') return 'spinbutton';
       if (DATES.includes(e.type)) return 'date';
-      if (['text','email','url','tel'].includes(e.type)) return 'textbox';
+      if (['text','email','url','tel','password'].includes(e.type)) return 'textbox';
     }
     return null;
   };
@@ -213,7 +218,16 @@
   };
   // Styled checkboxes/radios often hide the real input and show a label. Click the label; read the input.
   const proxyOf = e => ['checkbox','radio'].includes(e.type) && !visible(e) ?
-    ([...(e.labels||[])].find(visible) || null) : drawnFor(e);
+    ([...(e.labels||[])].find(visible) || boxFor(e)) : drawnFor(e);
+  // Workday's checkbox ("I agree to the processing of my personal data"): a transparent <input> inside the small square
+  // drawn for it, and a label hidden from view. Click the square.
+  function boxFor(e) {
+    for (let p=e.parentElement, i=0; p && i<2; p=p.parentElement, i++) {
+      const box=rectOf(p);
+      if (box.width>=10 && box.height>=10 && box.width<=60 && box.height<=60 && visible(p)) return p;
+    }
+    return null;
+  }
   // Workday's date parts: the real <input role="spinbutton"> (Month, Year) is 0x0 inside a box drawn for it, which
   // focuses it when clicked. Click the box; type into and read the input.
   function drawnFor(e) {
@@ -295,6 +309,16 @@
   };
   const describe = (e, rname, label, base) => {
     const ctx=bare(context(e,label)); if (ctx && ctx!==label) base.context=ctx;
+    // A date drawn as parts (Workday: "From* MM / YYYY", boxes named only "Month" and "Year"): the field's own
+    // label ("From", "To") is what tells the start of a job from its end.
+    const PART=/^(month|year|day|mm|yyyy|dd)\*?$/i;
+    if (PART.test(clean(label))) {
+      for (let p=e.parentElement, i=0; p && i<6; p=p.parentElement, i++) {
+        const head=[...p.querySelectorAll('label,legend')].find(x=>!x.contains(e) && !PART.test(clean(x.innerText||'')));
+        const words=head ? clean(head.innerText||'').slice(0,60) : '';
+        if (words) { base.context=words+(ctx && ctx!==words ? ' '+ctx : ''); break; }
+      }
+    }
     if (e.matches(FIELDS) && inNav(e)) base.nav=true;  // only fields: an Apply button in a job header stays
     const chat=chatOf(e);
     if (chat) {
@@ -306,6 +330,12 @@
       }
     }
     const sec=section(e); if (sec) base.section=sec;
+    // The field's own stable name, when the site gives one: Workday's formField-<name> ("countryOfBirth"), else the
+    // input's name attribute unless it is generated (digits, long hex).
+    const wd=e.closest('[data-automation-id^="formField-"]')?.getAttribute('data-automation-id');
+    const own=e.getAttribute('name')||'';
+    if (wd) base.field_id=wd.slice(10);
+    else if (own && own.length<=60 && !/^\d|[0-9a-f]{12,}|\d{5,}/i.test(own)) base.field_id=own;
     const help=described(e); if (help) base.help=help;
     // Required: the attribute, or the asterisk sites print (in the label, or in a choice's question).
     const question=isChoice(e) ? (ctx||'').replace(label,'') : '';
@@ -372,7 +402,7 @@
   const typingQuestion=typing && popup.size ? name(typing) : '';
   const actions=[], elements=[];
   for (const e of all(selector)) {
-    if (!safe(e) || e.type==='file' || e.matches(':disabled') || e.closest('[aria-disabled="true"],[inert]')) continue;
+    if (e.type==='hidden' || e.type==='file' || e.matches(':disabled') || e.closest('[aria-disabled="true"],[inert]')) continue;
     if (e.isContentEditable && e.parentElement?.isContentEditable) continue;  // inside an editor already listed
     const proxy=proxyOf(e);
     // A native dropdown drawn over a styled box (opacity 0) or hidden behind one (Lever, select2): it is set by
@@ -381,9 +411,20 @@
     const shown=standIn || proxy || e;
     if (!visible(shown)) continue;
     const {r,x,y}=center(shown), rname=role(e);
-    if (!rname || !onscreen(r) || x<0 || y<0 || x>=innerWidth || y>=innerHeight) continue;
+    // An option scrolled out of an open short list (Workday's Degree: "Bachelors" below "Diplom"): still a choice,
+    // marked offscreen; the click scrolls it into view first (a country list too: up to 300 options).
+    const list=rname==='option' ? e.closest('[role="listbox"]') : null;
+    const short=!!list && visible(list) && list.querySelectorAll('[role="option"]').length<=300;
+    let offscreen=false;
+    if (!rname || !onscreen(r) || x<0 || y<0 || x>=innerWidth || y>=innerHeight) {
+      if (!short) continue;
+      offscreen=true;
+    }
     // Covered by a banner/modal, or clipped by a scroll box
-    if (!cache.hittable(shown,x,y) && !(standIn && cache.hittable(e,x,y))) continue;
+    if (!offscreen && !cache.hittable(shown,x,y) && !(standIn && cache.hittable(e,x,y))) {
+      if (!short) continue;
+      offscreen=true;
+    }
     if (rname==='gridcell' && e.querySelector('button,[role="button"]')) continue;
     // No name of its own (Lever's dropdowns have no <label>): the question around it names it.
     let label=name(e)||(proxy && name(proxy))||bare(context(e,'')).slice(0,150)||rname;
@@ -408,6 +449,7 @@
       }
     }
     const base={node:identity(e),role:rname,label,rect:{x:r.x,y:r.y,w:r.width,h:r.height}};
+    if (offscreen) base.offscreen=true;
     if (proxy) base.proxy=identity(proxy);
     describe(e,rname,label,base);
     if (asked) base.context=clean(asked+' '+answers.join(' '));
@@ -441,10 +483,21 @@
       const editable=!e.readOnly && e.getAttribute('aria-readonly')!=='true' &&
         (['textbox','searchbox','spinbutton'].includes(rname) ||
           (rname==='combobox' && ['INPUT','TEXTAREA'].includes(e.tagName)));
+      // A password box is listed for the portal sign-in only (Python moves it to page.secrets): its value is
+      // never read out, only whether something is typed in it.
+      if (e.type==='password') { actions.push({...base,kind:'fill',secret:true,value:e.value ? '********' : ''}); continue; }
       const value='value' in e ? String(e.value) :
         e.isContentEditable || rname==='combobox' ? e.innerText.trim() : '';
       actions.push({...base,kind:editable?'fill':'click',value});
       if (editable) actions.push({...base,kind:'click',value,label:'Open '+base.label});
+      // Workday's chip ("LinkedIn, press delete to clear value.") carries its own × : offered as its removal.
+      const remove=e.getAttribute('data-automation-id')==='selectedItem' && e.querySelector('[data-automation-id="DELETE_charm"]');
+      // (marked aria-hidden for screen readers, which use Delete on the chip, but drawn and clickable)
+      if (remove && remove.checkVisibility({checkOpacity:true,checkVisibilityCSS:true})) {
+        const rr=rectOf(remove);
+        actions.push({...base,node:identity(remove),kind:'click',role:'button',remove_chip:true,
+          label:'Remove: '+label.replace(/,?\s*press delete to clear value\.?\s*$/i,''),rect:{x:rr.x,y:rr.y,w:rr.width,h:rr.height}});
+      }
     }
   }
   // The role-less clickables found above, placed in document order among the other controls.
@@ -549,8 +602,10 @@
     document.title,text,semantics,page_key[6]];
   // A dropdown of every country must not push the rest of the form (Submit) out of the list: controls are capped
   // at 250, native dropdown options separately.
-  let controls=0, choices=0;
-  const kept=actions.filter(a=>a.kind==='select' ? choices++<600 : controls++<250);
+  // Options scrolled out of an open list (a country list: India far down) have their own cap, so they never push
+  // the page's own controls out.
+  let controls=0, choices=0, hidden=0;
+  const kept=actions.filter(a=>a.kind==='select' ? choices++<600 : a.offscreen ? hidden++<300 : controls++<250);
   const omitted_actions=actions.length-kept.length;
   actions.splice(0,actions.length,...kept);
   actions.forEach((a,i)=>a.id='e'+(i+1));
@@ -577,7 +632,13 @@
     }
     return false;
   };
-  const required_empty=[], radios=new Set(), open_questions=[];
+  const required_empty=[], required_above=[], radios=new Set(), open_questions=[];
+  // A Workday prompt shows its pick as a chip beside its (empty) search box: "LinkedIn, press delete to clear value."
+  const chipped = e => {
+    for (let p=parentOf(e), i=0; p && i<6; p=parentOf(p), i++)
+      if (p.querySelector('[data-automation-id="selectedItem"],[aria-label*="press delete to clear value"]')) return true;
+    return false;
+  };
   // A radio's answer text: its own name, else the text beside it (LinkedIn leaves the <label> empty), else value.
   const answerOf = (x,question) => {
     const own=name(x)||(proxyOf(x) && name(proxyOf(x)))||'';
@@ -602,10 +663,12 @@
       empty=![...e.ownerDocument.querySelectorAll('input[type="radio"]')].some(x=>x.name===e.name && x.checked);
     } else if (e.type==='checkbox') empty=!e.checked;
     else if (e.tagName==='SELECT') empty=e.selectedIndex<0 || !e.value || /^\s*(select|choose|please|--)/i.test(e.options[e.selectedIndex]?.text||'');
-    else empty=!String(e.value||'').trim() && !shownChoice(e,q);
+    else empty=!String(e.value||'').trim() && !shownChoice(e,q) && !chipped(e);
     const what=(e.type==='radio' ? asked : q).slice(0,80);
     if (empty && what) {
       required_empty.push(what);
+      // Above the screen (Workday adds a block over where the agent is): the agent looks up for it.
+      if (rectOf(e).bottom<0 || (e.tagName==='SELECT' && standInFor(e) && rectOf(standInFor(e)).bottom<0)) required_above.push(what);
       if (e.type==='radio') {
         const peers=[...e.ownerDocument.querySelectorAll('input[type="radio"]')].filter(x=>x.name===e.name);
         const options=peers.map(x=>answerOf(x,q)).filter(Boolean);
@@ -618,5 +681,6 @@
   }
   return {doc:String(performance.timeOrigin),url:location.href,title:document.title,w:innerWidth,h:innerHeight,text,
     scroll,actions,marker,page_key,guards,omitted_actions,login,required_empty:[...new Set(required_empty)].slice(0,20),
+    required_above:[...new Set(required_above)].slice(0,10),
     open_questions:open_questions.slice(0,20)};
 })()

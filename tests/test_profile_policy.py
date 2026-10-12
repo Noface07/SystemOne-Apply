@@ -136,6 +136,21 @@ def test_lists_also_become_one_item_facts_for_tag_fields():
     assert safe_id("skills.item_1") not in profile.sources(exclude=tried)
 
 
+def test_a_long_skill_list_still_goes_into_tag_fields_one_skill_at_a_time():
+    """53 skills (the automation résumé): a Workday "Type to Add Skills" box got all of them as one chip."""
+    from jev_apply import rules
+    from jev_apply.browser import ADDS_ITEMS
+
+    many = [f"Skill {n}" for n in range(1, 54)]
+    profile = Profile({**DATA, "skills": many})
+    values = facts(profile)
+    assert values["skills.item_1"] == "Skill 1" and "skills.item_25" in values and "skills.item_26" not in values
+    box = {"kind": "fill", "role": "textbox", "label": "Type to Add Skills", "multiple": True, "context": ""}
+    assert rules.next_item(profile, "skills", box, set()) == safe_id("skills.item_1")
+    assert ADDS_ITEMS.search("Type to Add Skills") and ADDS_ITEMS.search("Add skills")
+    assert not ADDS_ITEMS.search("Skills summary") and not ADDS_ITEMS.search("Address Line 1")
+
+
 def test_a_dropdown_placeholder_read_with_the_label_is_not_part_of_the_question():
     from jev_apply.profile import same_question
 

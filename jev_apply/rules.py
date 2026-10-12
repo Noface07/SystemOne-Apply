@@ -131,7 +131,8 @@ def money(t, action):
         "fixed"
         if re.search(r"fixed|\bbase\b|basic", t)
         else "variable"
-        if re.search(r"variable|bonus|incentive", t)
+        # "Details can include bonus, benefits, or additional compensation" describes a total, not the bonus alone.
+        if re.search(r"variable|bonus|incentive", t) and not re.search(r"includ|inclusive|benefits|along with", t)
         else "total"
     )
     if part == "variable" and when == "expected":
@@ -349,8 +350,34 @@ def experience_years_key(t, label):
     return base + "_years"
 
 
+# A field's own stable name (Workday's data-automation-id "formField-<name>", the snapshot's field_id) is the same on
+# every company's Workday: it says what is asked whatever text surrounds the field (Maersk's whole-section group gave
+# "City of Birth" the words "Date of Birth"). Each entry also says what the field's own label must speak of: a name
+# unknown here, renamed, or reused for something else falls back to reading the label, as on any site. Only names
+# seen on real Workday pages are listed (added as replay captures show more: data/replay).
+FIELD_IDS = {
+    "gender": (("self_identification.gender",), r"\b(gender|sex)\b"),
+    "countryOfBirth": (("personal.country_of_birth",), r"\bcountry\b.*\bbirth\b|\bbirth\b.*\bcountry\b"),
+    "cityOfBirth": (("personal.city_of_birth",), r"\b(city|place|town)\b.*\bbirth\b|\bbirth ?place\b"),
+    "maritalStatus": (("self_identification.marital_status", "personal.marital_status"), r"\bmarital\b"),
+    "nationality": (("personal.nationality", "personal.citizenship_country"), r"\bnationality\b"),
+}
+
+
+def by_field_id(action):
+    """The keys a field's stable name gives, when its own label agrees; else None (the label is read as usual)."""
+    entry = FIELD_IDS.get(action.get("field_id") or "")
+    label = (action.get("label") or "").split(" → ")[0]
+    if entry and re.search(entry[1], label, re.I):
+        return entry[0] if len(entry[0]) > 1 else entry[0][0]
+    return None
+
+
 def key_for(action, profile, tried, dates_only=False, page_text=""):
     """Profile key (dotted), special choice, or None. Order matters: specific questions before generic ones."""
+    named = by_field_id(action)
+    if named:
+        return named
     t, label = text_of(action), label_of(action)
     section = (action.get("section") or "").lower()
     where = " ".join((page_text.lower(), t, section))
@@ -359,6 +386,11 @@ def key_for(action, profile, tried, dates_only=False, page_text=""):
         return school
     if re.search(BLOCKS["work experience"] + NUMBERED, where):
         key = experience_key(t, label, section, page_text)
+        index = re.match(r"experience\.(\d+)\.", key or "")
+        if index and not any(i.startswith(safe_id(f"experience.{index.group(1)}.")) for i in profile.by_id):
+            # Work Experience 3 when your profile has two jobs: a block that shouldn't be there. Never filled from
+            # another job (a model would pick your first job's company).
+            return "SKIP_FIELD"
         if key:
             return key
     if PREVIOUS.search(f"{t} {section}") and not re.search(r"\b(current|present)\b", t):
@@ -371,6 +403,9 @@ def key_for(action, profile, tried, dates_only=False, page_text=""):
             return key
     if re.search(r"\blocal (given|first|middle|family|last) name|native script|name in local", t):
         return None if action.get("required") else "SKIP_FIELD"  # a name in another script: yours to type
+    if re.search(r"(have|did) you (ever )?(previously )?(applied|submitted an application)\b|previously applied", t):
+        # "Have you applied to A.P. Moller Maersk Group before?": your record of applications on this site.
+        return "application.applied_here_before"
     if re.search(
         r"(have|did) you (ever )?(previously )?(work|worked|been employed)\b(?! (on|with|in|using|as)\b)|"
         r"former employee|"
@@ -432,14 +467,22 @@ def key_for(action, profile, tried, dates_only=False, page_text=""):
         return "work.has_relative_at_company"
     if re.search(r"date of birth|\bdob\b|birth ?date|born on", t):
         return "personal.date_of_birth"
+    if re.search(r"country of birth|birth ?country|country (where|in which) you were born", t):
+        return "personal.country_of_birth"
+    if re.search(r"(city|town|place) of birth|birth ?place|birth ?city", t):
+        return "personal.city_of_birth"
+    if re.search(r"citizenship status|status of (your )?citizenship", t):
+        # Workday lists countries, then the status inside yours: "India" > "Citizen".
+        return ("personal.citizenship_country", "personal.citizenship_status")
     if re.search(r"nationality|citizenship", t):
-        return "personal.nationality"
+        # "Indian", or the country's name where the list holds countries ("India").
+        return ("personal.nationality", "personal.citizenship_country")
     if re.search(r"father'?s?( or guardian'?s?)? name|guardian'?s? name", t):
         return "personal.father_name"
     if re.search(r"mother'?s? name", t):
         return "personal.mother_name"
     if "marital" in t:
-        return "self_identification.marital_status"
+        return ("self_identification.marital_status", "personal.marital_status")
     if re.search(r"passport", t) and not re.search(r"number|\bno\b|expiry|issue", t):
         return "personal.has_valid_passport"
     if re.search(r"\bwhy\b|motivat|what (excites|interests|attracts)|cover (letter|note)", t):
@@ -479,12 +522,17 @@ def key_for(action, profile, tried, dates_only=False, page_text=""):
     link = None
     if re.search(r"twitter|\bx\.com\b|\bx (profile|handle)", t):
         link = "links.twitter"
-    elif re.search(r"portfolio|personal (web)?site|website|\bblog\b|other (url|link|website|profile)", t):
+    elif re.search(r"portfolio|personal (web)?site|website|\bblog\b|other (url|link|website|profile)", t) or (
+        re.fullmatch(r"url|website url|web address", label) and "website" in section
+    ):
         link = "links.portfolio"
+        website = re.search(r"website|web address|\burl\b", t) and not re.search(r"portfolio|upload|attach", t)
+        if website and safe_id(link) not in profile.by_id and safe_id("links.github") in profile.by_id:
+            link = "links.github"  # "Add any relevant websites": your GitHub, when you keep no portfolio
     if link:
         # A link your profile doesn't have is left empty (or asked, when required), never filled with another fact.
         return link if safe_id(link) in profile.by_id else ("ASK_USER" if action.get("required") else "SKIP_FIELD")
-    if re.search(r"pin ?code|postal|\bzip\b", t):
+    if re.search(r"pin ?code|postal|\bzip\b|\bpost ?code\b", t):  # UK/EU forms say "Postcode"
         return "personal.pincode"
     if re.search(
         r"preferred (work )?location|location preference|preferred cit|location.{0,20}applying for|"
@@ -503,6 +551,10 @@ def key_for(action, profile, tried, dates_only=False, page_text=""):
         "location",
         "current city",
         "current location",
+        "town",
+        "town/city",
+        "city/town",
+        "city / town",
     }:
         return "personal.city"
     if re.search(r"(what|which) country|country (are you|do you) (based|live|reside|located)", t):
@@ -533,11 +585,30 @@ def key_for(action, profile, tried, dates_only=False, page_text=""):
         return "preferences.work_mode"
     if re.search(r"authori[sz]ed to work|work authori[sz]ation|legally (eligible|allowed|permitted)", t):
         return "work_authorization.authorized_to_work_in_india"
+    in_india = getattr(profile.by_id.get(safe_id("job.country")), "value", None) == "India"
+    if re.search(r"(eligible|permitted|allowed|right) to work in (the|this) country", t):
+        # "...in the country in which this position is located": your India authorization, for a job in India.
+        return "work_authorization.authorized_to_work_in_india" if in_india else None
     if re.search(r"sponsor", t):
         return "work_authorization.requires_visa_sponsorship"
+    if re.search(r"(support|need|require)\w* (for )?(a )?(work )?visa|work permit|residence permit", t):
+        # "Will you need support for a work visa and residence permit": none for a job in your own country.
+        return "work_authorization.requires_visa_sponsorship" if in_india else None
+    if re.search(r"\b(over|above|at least) (the age of )?18\b|18\+? years (of age|or older)|age of 18|\b18\+", t):
+        return "personal.over_18"
+    # Holding an ID document (never its number: those boxes are never filled): what you said, else asked
+    holds = re.compile(r"\b(valid|have|hold|possess)\b.*\b(aadh?aa?r|pan card|driv\w* licen[cs]e|driver'?s licen[cs]e)")
+    # A box for its number says "number" or "No." / "no:" ("PAN card no."); a Yes/No question's own "No" option isn't it
+    asks_number = re.search(r"\bnumber\b|\bno\s*[.:#]|\b(card|licen[cs]e)\s+no\b(?!\s*\w)", t)
+    if not asks_number and (held := holds.search(t)):
+        card = held.group(2)
+        return ("personal.has_aadhaar_card" if card.startswith("aadh") else
+                "personal.has_pan_card" if card.startswith("pan") else "personal.has_driving_licence")  # fmt: skip
     if re.search(r"earliest|joining date|start date|availability|when can you (start|join)|date of availability", t):
         # A calendar date when the field asks for one (a date input, "DD/MM/YYYY", "...date"), else your words.
-        wants_date = dates_only or date_shape(action) or re.search(r"\bdate\b", label)
+        # Workday's Month / Day / Year boxes of "desired start date" want the date's parts, never your words.
+        part = re.fullmatch(r"(month|day|year|mm|dd|yyyy)\*?", label)
+        wants_date = dates_only or date_shape(action) or re.search(r"\bdate\b", label) or part
         return (
             ("work.earliest_start_date", "work.availability")
             if wants_date
@@ -613,6 +684,16 @@ def fit(fact, action, profile):
     """The fact's value in the shape this field accepts, or None when it can't be given without inventing
     something (a day your profile doesn't hold, a decimal in a whole-number box, text over the length limit)."""
     value = fact.value
+    part = re.fullmatch(r"\s*(month|mm|year|yyyy|day|dd)\s*\*?\s*", str(action.get("label") or ""), re.I)
+    if part:
+        # One box of a date drawn as parts (Workday's "MM / YYYY"): only its own part, whatever shape the whole
+        # date's help text gives ("current value is MM/YYYY").
+        base = re.sub(r"\.(mm_yyyy|month_year|year|mm|dd_mm_yyyy|mm_dd_yyyy)$", "", fact.key)
+        found = DATE.match(getattr(profile, "facts", {}).get(base, fact).value or "")
+        if not found:
+            return value if re.fullmatch(r"\d{1,4}", value) else None
+        which = part.group(1).lower()
+        return found[2] if which in {"month", "mm"} else found[1] if which in {"year", "yyyy"} else found[3]
     shape = date_shape(action) if action.get("input_type") not in {"date", "month", "week", "time"} else None
     if shape:
         base = re.sub(r"\.(mm_yyyy|month_year|year|mm|dd_mm_yyyy|mm_dd_yyyy)$", "", fact.key)

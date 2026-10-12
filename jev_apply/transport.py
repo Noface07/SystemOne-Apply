@@ -7,7 +7,7 @@ from pathlib import Path
 class ChromeTransport:
     """Your running Chrome through Browser Harness: a new tab in your everyday profile and its logins."""
 
-    def __init__(self):
+    def __init__(self, background=None):
         from browser_harness.admin import ensure_daemon
         from browser_harness.helpers import cdp
 
@@ -15,7 +15,9 @@ class ChromeTransport:
         self._cdp = cdp
         # In front by default: a background tab gets no animation frames, and JavaScript portals such as Workday
         # never finish drawing their form there. JEV_BACKGROUND_TABS=1 keeps the agent's tabs behind yours.
-        background = (os.environ.get("JEV_BACKGROUND_TABS") or "0").strip() not in {"", "0", "false", "no"}
+        # `background` decides for this one tab (hiring.cafe's reader) without touching that setting.
+        if background is None:
+            background = (os.environ.get("JEV_BACKGROUND_TABS") or "0").strip() not in {"", "0", "false", "no"}
         self.target = cdp("Target.createTarget", url="about:blank", background=background)["targetId"]
         self.session = cdp("Target.attachToTarget", targetId=self.target, flatten=True)["sessionId"]
         self.opened = [self.target]  # this tab, then any tab it opened that the run moved to

@@ -170,12 +170,11 @@ class Tab:
 
     def __init__(self, transport=None):
         if transport is None:
-            import os
-
-            os.environ.setdefault("JEV_BACKGROUND_TABS", "1")  # read in the background, don't steal your screen
             from ..transport import ChromeTransport
 
-            transport = ChromeTransport()
+            # In the background, so it doesn't take your screen. For this tab only: setting JEV_BACKGROUND_TABS
+            # here would reach every batch the app starts afterwards, and Workday can't draw in a background tab.
+            transport = ChromeTransport(background=True)
         self.transport = transport
 
     def call(self, method, **params):

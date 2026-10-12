@@ -22,6 +22,8 @@ CONFIRM = [
     "arrest",
     "sponsor",
     "visa",
+    "citizen",  # "Citizen (Belgium)" picked by the model on Maersk: your citizenship only from your profile
+    "nationality",
     "work authori",
     "authorized to work",
     "authorised to work",
@@ -35,6 +37,11 @@ CONFIRM = [
     "pay",
     "package",
     "background check",
+    # Whether you hold an ID document ("Please confirm if you have a valid PAN card"): only from what you said
+    "aadha",
+    "pan card",
+    "passport",
+    "driving licen",
     "i agree",
     "i certify",
     "i confirm",
@@ -114,10 +121,25 @@ class Policy:
     # carries on with the same form, using your answers. Otherwise the job stops as before and is offered for a
     # re-run once you answer. 0 stops at once.
     answer_wait_s: int = 300
+    # A person's pace: seconds after each action, so the site finishes drawing what it changed (a list opening, a
+    # value taken, Workday's next field) before the next one; and longer after Next / Save / Continue.
+    pace_s: float = 0.6
+    pace_after_next_s: float = 1.5
+    # Before asking you, questions nothing on file answered go to the teacher (teacher.py): Claude answers what
+    # your profile settles, citing the fact, code checks it, and each answer becomes a lesson the rules use next
+    # time. Needs TEXT_MODEL_PROVIDER=claude-code. False: questions come straight to you.
+    teacher: bool = True
     # At a "Continue with Google" sign-in: click it, choose the Google account whose address is your profile's e-mail
     # and confirm Google's "share your name, email and picture" page. Clicks only: nothing is ever typed into Google
     # (an e-mail, password or code request waits for you), and wider access (Drive, Gmail...) is left for you.
     google_sign_in: bool = False
+    # At a portal's own sign-in (no Google button): sign in, or create the account first, with your profile's
+    # e-mail and JEV_PORTAL_PASSWORD from .env (accounts.py). Only the e-mail and that password are ever typed
+    # there; a refused sign-in is not retried. Off: sign-ins wait for you.
+    portal_accounts: bool = False
+    # Codes and verification links portals e-mail you: read from your Gmail (read-only, gmail.py; set up with
+    # `jev-apply gmail-connect`), then typed or opened. Off, or Gmail not connected: they wait for you.
+    email_codes: bool = False
     # After auto_submit clicks Submit: how long to watch for the site's own confirmation before recording the job
     # as "submitted (no confirmation seen)". Nothing is clicked while waiting.
     confirm_wait_s: int = 15

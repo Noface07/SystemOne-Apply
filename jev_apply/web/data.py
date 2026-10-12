@@ -9,6 +9,7 @@ from functools import lru_cache
 from pathlib import Path
 
 from .. import applied, inbox
+from ..files import write_json
 from ..jobinfo import company_key
 
 ROOT = Path.cwd()
@@ -241,31 +242,39 @@ def applications():
 
 
 def questions():
+    """QUESTIONS.md's questions, numbered. Codes a site sent (verification, OTP) that older runs added there are
+    left out: they're typed in the tab, never answered here."""
+    from ..profile import not_a_question, one_time_code
+
     path = data_dir() / "QUESTIONS.md"
     entries = inbox.read(path)
-    return [{"index": i, **e} for i, e in enumerate(entries)]
+    return [
+        {"index": i, **e}
+        for i, e in enumerate(entries)
+        if not one_time_code(e["question"]) and (e["answer"] or not not_a_question(e["question"]))
+    ]
 
 
 def answer_question(index, answer, question=None):
     """Save your answer to one question in QUESTIONS.md (every later form reuses it). `question` (its text) finds
-    it even when a running batch has added questions since the page listed them and the numbers moved; the save
-    is read back and retried, as that batch may write the file at the same moment."""
+    it even when a running batch has added questions since the page listed them and the numbers moved; the file is
+    changed under its lock, so a batch writing it at the same moment can't undo the answer."""
     path = data_dir() / "QUESTIONS.md"
     answer = " ".join(str(answer or "").split())
-    for _ in range(3):
-        entries = inbox.read(path)
+    saved = {}
+
+    def change(entries):
         found = next((i for i, e in enumerate(entries) if question and e["question"] == question), None)
         if found is None:
             if question or not 0 <= index < len(entries):
                 raise IndexError("no such question")
             found = index
-        entries[found]["answer"] = answer
-        inbox.write(path, entries)
-        _load.cache_clear()
-        kept = next((e for e in inbox.read(path) if e["question"] == entries[found]["question"]), None)
-        if kept and kept["answer"] == answer:
-            return kept
-    return entries[found]
+        entries[found]["answer"] = inbox.option_for(answer, entries[found].get("options"))
+        saved.update(entries[found])
+
+    inbox.update(path, change)
+    _load.cache_clear()
+    return saved
 
 
 MODELS = [
@@ -437,7 +446,7 @@ def save_profile(track, profile, apply_to=()):
         backups = where / ".backups"
         backups.mkdir(exist_ok=True)
         (backups / f"profile-{stamp}.json").write_text(before, encoding="utf-8")
-        target.write_text(json.dumps(data_, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        write_json(target, data_)
         saved[name] = [".".join(map(str, p)) for p in changes(json.loads(before), data_)]
     _load.cache_clear()
     return saved

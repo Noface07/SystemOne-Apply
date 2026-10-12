@@ -6,6 +6,7 @@ uv run --extra playwright python scripts/local_check.py [--chromium /path/to/chr
 import argparse
 import functools
 import http.server
+import re
 import tempfile
 import threading
 from pathlib import Path
@@ -238,6 +239,12 @@ def main():
             [relocate, visa],
         )
         check("an asterisk in the question makes it required", relocate and relocate.get("required"), relocate)
+        city = find(page, "Please specify your City of Birth", "fill")
+        check(
+            "a group around a whole section is no field's question (Maersk: City of Birth got the birth date)",
+            city and not re.search(r"Date of Birth|Personal information|Marital", city.get("context") or ""),
+            city,
+        )
         check("a table row's first cell is the radios' question", find(page, "No", context="valid passport"))
         night = find(page, "No", context="night shifts")
         check("div Yes/No choices offered with their question", night and night.get("chosen") == "false", night)
@@ -299,6 +306,48 @@ def main():
         browser.act(tab, page)
         page = browser.observe()
         check("a link that opens a new tab is followed there", page["url"].endswith("/apply/step1.html"), page["url"])
+
+        print("portal account (Workday-style sign-in, then create account)")
+        from jev_apply import accounts
+
+        browser.navigate(f"http://localhost:{port}/apply/account.html")
+        page = browser.observe()
+        check("password boxes are kept out of the actions", not any(a.get("secret") for a in page["actions"]))
+        check("the sign-in sees the password box", len(page.get("secrets") or []) == 1, page.get("secrets"))
+        # The agent's own procedure, as a run calls it at a sign-in wall.
+        import json as _json
+        import os
+        from dataclasses import replace
+
+        from jev_apply.agent import Agent
+        from jev_apply.profile import Fact, Profile
+
+        class Quiet:
+            def event(self, text):
+                pass
+
+        secret = "Test@1234"
+        os.environ["JEV_PORTAL_PASSWORD"] = secret
+        scratch = Path(tempfile.mkdtemp())
+        profile = Profile.load(Path("data/profile.example.json"), questions_path=scratch / "QUESTIONS.md")
+        profile.facts["personal.email"] = Fact("personal.email", "me@mail.test", "e-mail")
+        agent = Agent(browser, profile, replace(policy, portal_accounts=True, email_codes=False), Quiet(),
+                      run_dir=scratch / "runs")  # fmt: skip
+        agent.page = page
+        agent.sign_in_with_password()  # False here: the verify e-mail is never read in this check
+        page = browser.observe()
+        steps = [h["action"] for h in agent.history]
+        check("no account yet: it switches to Create Account first", steps[:1] == ["switch: Create Account"], steps)
+        check("the sign-up pop-up gets e-mail, both passwords, terms, Create Account (scrolling to them)",
+              steps[1:] == ["fill: Email Address", "fill: Password", "fill: Verify New Password",
+                            "tick: I agree to the terms and privacy policy", "click: Create Account"], steps)  # fmt: skip
+        check("the cut-short pop-up was scrolled to reach its button", browser.evaluate("!!window.popupScrolled"))
+        check("the account was created (verify page shown)", accounts.VERIFY.search(page["text"]), page["text"][:200])
+        book = _json.loads((scratch / "accounts.json").read_text(encoding="utf-8"))
+        check("the portal is noted as having an account now", any(v.get("created") for v in book.values()), book)
+        check("the password was typed in full", browser.evaluate("window.passwordLength") == len(secret))
+        check("a typed password never shows in the page read or the history",
+              secret not in str(page) and secret not in str(agent.history))
     finally:
         browser.close()
         server.shutdown()

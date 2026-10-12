@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Sign In</title>
+  <link rel="stylesheet" href="../style.css">
+  <style>#popup label{display:block;margin:10px 0}</style>
+</head>
+<body>
+  <!-- A Workday-style account step: a sign-in form (one password box) with a Create Account switch, a sign-up
+       form (password + verify, terms box), and the "verify your e-mail" page after it. -->
+  <main>
+    <form id="signin" onsubmit="return false">
+      <h2>Sign In</h2>
+      <label>Email Address <input type="text" id="si-email" autocomplete="email"></label>
+      <label>Password <input type="password" id="si-password"></label>
+      <button type="button" onclick="document.getElementById('signin').hidden=true;document.getElementById('popup').hidden=false">Create Account</button>
+      <button type="button" id="si-go">Sign In</button>
+    </form>
+    <!-- Workday's Create Account pop-up in a small window: a short panel that scrolls inside itself. -->
+    <div id="popup" hidden style="position:fixed;top:120px;left:300px;width:460px;height:150px;overflow:auto;
+         background:#fff;border:2px solid #333;padding:12px">
+    <form id="signup" onsubmit="return false">
+      <h2>Create Account</h2>
+      <label>Email Address <input type="text" id="su-email"></label>
+      <label>Password <input type="password" id="su-password"></label>
+      <label>Verify New Password <input type="password" id="su-verify"></label>
+      <!-- Workday's "Password Requirements" panel: shown while the Password box has focus, over the Verify box. -->
+      <div id="rules" hidden style="position:absolute;z-index:5;background:#fff;border:1px solid #888;padding:24px;width:340px">
+        Password Requirements: a minimum of 8 characters, an uppercase character, a special character</div>
+      <label><input type="checkbox" id="su-terms"> I agree to the terms and privacy policy</label>
+      <button type="button" id="su-go">Create Account</button>
+      <p>Already have an account?</p>
+      <button type="button" onclick="document.getElementById('popup').hidden=true;document.getElementById('signin').hidden=false">Sign In</button>
+    </form>
+    </div>
+    <p id="sent" hidden>We've sent you a verification email. Please verify your account to continue.</p>
+  </main>
+  <script>
+    const pw = document.getElementById('su-password'), rules = document.getElementById('rules');
+    pw.addEventListener('focus', () => {
+      const r = document.getElementById('su-verify').getBoundingClientRect();
+      Object.assign(rules.style, {left: (r.left + scrollX - 20) + 'px', top: (r.top + scrollY - 20) + 'px'});
+      rules.hidden = false;
+    });
+    pw.addEventListener('blur', () => { rules.hidden = true; });
+    document.getElementById('popup').addEventListener('scroll', () => { window.popupScrolled = true; });
+    document.getElementById('su-go').addEventListener('click', () => {
+      const p = document.getElementById('su-password').value, v = document.getElementById('su-verify').value;
+      if (!document.getElementById('su-email').value || !p || p !== v || !document.getElementById('su-terms').checked) return;
+      document.getElementById('popup').hidden = true;
+      document.getElementById('sent').hidden = false;
+      window.passwordLength = p.length;  // what the check reads: never the password itself
+    });
+  </script>
+</body>
+</html>

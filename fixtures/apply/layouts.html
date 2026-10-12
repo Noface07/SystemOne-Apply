@@ -47,6 +47,15 @@
       <input id="wd-month" type="text" role="spinbutton" aria-label="Month" aria-valuemin="1" aria-valuemax="12"
         data-automation-id="dateSectionMonth-input" style="position:absolute;left:0;top:0;width:0;height:0;border:0;padding:0">
     </span></div>
+  <!-- Maersk (Workday): one role="group" around the whole section, each field labelled on its own. -->
+  <div role="group" aria-labelledby="pi-head">
+    <h3 id="pi-head">Personal information</h3>
+    <div class="field"><label for="pi-dob">Please specify your Date of Birth</label> <input id="pi-dob"></div>
+    <div class="field"><label for="pi-city">Please specify your City of Birth</label> <input id="pi-city"></div>
+    <div class="field"><label id="pi-ms-l">Please specify your Marital Status</label>
+      <button type="button" aria-haspopup="listbox" aria-labelledby="pi-ms-l pi-ms">
+        <span id="pi-ms">Select One</span></button></div>
+  </div>
   <p><a href="step1.html" target="_blank">Continue in a new tab</a></p>
 </main>
 <script>

@@ -7,6 +7,8 @@ import sys
 import time
 from pathlib import Path
 
+from . import helper
+
 READ_STATE = Path(__file__).with_name("snapshot.js").read_text(encoding="utf-8")
 MARKER = f"(() => {{ const state={READ_STATE}; return state?.marker ?? null; }})()"
 ADVANCING = re.compile(r"\b(next|continue|save|proceed|start|apply|review)\b", re.I)
@@ -24,7 +26,7 @@ class ExecutionUncertain(RuntimeError):
 
 
 def fingerprint(state):
-    content = {k: state[k] for k in ("url", "text", "actions", "scroll")}
+    content = {k: state[k] for k in ("url", "text", "actions", "secrets", "scroll") if k in state}
     return hashlib.sha256(json.dumps(content, sort_keys=True).encode()).hexdigest()
 
 
@@ -34,10 +36,16 @@ RESOLVE = """(action => {
   if (!e?.isConnected || !shown?.isConnected || e.matches(':disabled') || e.closest('[aria-disabled="true"],[inert]') ||
       !shown.checkVisibility({checkOpacity:true,checkVisibilityCSS:true})) return null;
   if (action.kind==='fill' && (e.readOnly || e.getAttribute('aria-readonly')==='true')) return null;
-  const r=c.rectOf ? c.rectOf(shown) : shown.getBoundingClientRect(), x=r.x+r.width/2, y=r.y+r.height/2;
-  if (!r.width || !r.height || x<0 || y<0 || x>=innerWidth || y>=innerHeight) return null;
-  if (!c.hittable(shown,x,y)) return null;
-  return {x,y};
+  if (action.offscreen) shown.scrollIntoView({block:'nearest'});  // an option scrolled out of its open list
+  const place = () => { const r=c.rectOf ? c.rectOf(shown) : shown.getBoundingClientRect();
+    return {r, x:r.x+r.width/2, y:r.y+r.height/2}; };
+  const usable = ({r,x,y}) => r.width && r.height && x>=0 && y>=0 && x<innerWidth && y<innerHeight && c.hittable(shown,x,y);
+  let p=place();
+  // Under a sticky footer or header (Workday's Save bar), or just out of view: brought to the middle once. A
+  // dialog over the page still covers it there, and nothing is clicked.
+  if (!usable(p)) { shown.scrollIntoView({block:'center', inline:'nearest'}); p=place(); }
+  if (!usable(p)) return null;
+  return {x:p.x, y:p.y};
 })"""
 
 # Set a native <select> or date/time input the way React/Vue expect: native setter, then events. The element may
@@ -80,9 +88,31 @@ EXPAND_FRAMES = """(() => {
 
 # Enter is only ever pressed in a search prompt ("type and press Enter to find a value") that is not inside a
 # <form>, because Enter in a form can submit it. Checked in the page itself, right before the key press.
+# Portals whose search boxes need Enter to show their values, where Enter in such a box only runs the search
+# (Workday's prompts, iCIMS, Oracle, SuccessFactors): Enter is allowed there even inside a <form>, in a search box
+# only. Everywhere else, Enter inside a form could submit it and is never pressed.
+PROMPT_ENTER_SITES = re.compile(
+    r"myworkdayjobs\.com|\.workday\.com|icims\.com|oraclecloud\.com|successfactors\.|sapsf\.", re.I
+)
+# Empty a text input as a person deleting its text would (React/Workday see the change), and leave focus in it.
+CLEAR_INPUT = """(node => {
+  const e=window.__jevApply?.nodes.get(node); if (!e) return false;
+  const view=e.ownerDocument?.defaultView || window;
+  const proto=e.tagName==='TEXTAREA' ? view.HTMLTextAreaElement.prototype : view.HTMLInputElement.prototype;
+  e.focus();
+  if (e.value) {
+    Object.getOwnPropertyDescriptor(proto,'value').set.call(e,'');
+    e.dispatchEvent(new view.Event('input',{bubbles:true}));
+  }
+  e.focus();
+  return e.value==='';
+})"""
+# A box that adds one item per entry ("Type to Add Skills", "Add skills"): a tag field.
+ADDS_ITEMS = re.compile(r"\btype to add\b|\badd (more |your |a )?(skills?|tags?|keywords?|items?)\b", re.I)
 SAFE_ENTER = """(action => {
   const e=window.__jevApply?.nodes.get(action.node);
-  if (!e?.isConnected || e.tagName!=='INPUT' || e.form || e.closest('form')) return false;
+  if (!e?.isConnected || e.tagName!=='INPUT' || ['submit','button','image','reset'].includes(e.type)) return false;
+  if ((e.form || e.closest('form')) && !action.in_form_ok) return false;
   const described=document.getElementById(e.getAttribute('aria-describedby')||'')?.innerText;
   const hint=[e.placeholder,e.getAttribute('aria-label'),described].join(' ');
   const prompt=['combobox','searchbox'].includes(e.getAttribute('role')||'') || e.type==='search';
@@ -97,7 +127,35 @@ class Browser:
         self.transport = transport
         self.after_input = None
         self.call("Emulation.setFocusEmulationEnabled", enabled=True)
+        self.install_helper()
         self.navigate(url)
+
+    # ---- the helper bubble (helper.py): yours to pause, continue or skip from the tab itself ----------------
+
+    def install_helper(self):
+        """Put the bubble in this tab, now and on every page it loads. A browser that refuses just has none."""
+        try:
+            self.call("Page.addScriptToEvaluateOnNewDocument", source=helper.BUBBLE)
+            self.evaluate(helper.BUBBLE)
+        except Exception:  # noqa: BLE001 - the bubble is a convenience: never a reason to fail the run
+            pass
+
+    def _helper(self, expression):
+        try:
+            return self.evaluate(expression)
+        except Exception:  # noqa: BLE001 - a page between documents has no bubble for a moment
+            return None
+
+    def helper_events(self):
+        """What you pressed in the bubble since the last call: [{type: pause|resume|continue|skip|answers}]."""
+        raw = self._helper(helper.DRAIN)
+        try:
+            return json.loads(raw) if raw else []
+        except ValueError:
+            return []
+
+    def helper_state(self, state):
+        self._helper(helper.show_state(state))
 
     def call(self, method, **params):
         return self.transport.call(method, **params)
@@ -190,6 +248,7 @@ class Browser:
         adopt = getattr(self.transport, "adopt_popup", None)
         if adopt and adopt():
             self.call("Emulation.setFocusEmulationEnabled", enabled=True)
+            self.install_helper()
             self.wait_loaded()
 
     def observe(self):
@@ -202,17 +261,30 @@ class Browser:
         except (StalePage, RuntimeError):
             pass  # the page is navigating: nothing to resize yet
         deadline = time.monotonic() + OBSERVE_S
-        while True:
-            try:
-                info = self.evaluate(READ_STATE)
-                if info is None:
-                    raise StalePage("Document is navigating")
-                info["fingerprint"] = fingerprint(info)
-                return info
-            except (StalePage, RuntimeError):
-                if time.monotonic() > deadline:
-                    raise StalePage("The page did not settle") from None
-                time.sleep(0.1)
+        self._helper(helper.HIDE)  # out of the way while the page is read (it never covers a field)
+        try:
+            while True:
+                try:
+                    info = self.evaluate(READ_STATE)
+                    if info is None:
+                        raise StalePage("Document is navigating")
+                    # Password boxes go to the portal sign-in (accounts.py) only, never to the planner or a model.
+                    actions = info.get("actions") or []
+                    info["secrets"] = [a for a in actions if a.get("secret")]
+                    info["actions"] = [a for a in actions if not a.get("secret")]
+                    for a in info["actions"]:
+                        # Workday's "Type to Add Skills" adds one item per search, like a tag field, though the
+                        # page never says it holds several.
+                        if a.get("kind") == "fill" and ADDS_ITEMS.search(f"{a.get('label')} {a.get('placeholder')}"):
+                            a["multiple"] = True
+                    info["fingerprint"] = fingerprint(info)
+                    return info
+                except (StalePage, RuntimeError):
+                    if time.monotonic() > deadline:
+                        raise StalePage("The page did not settle") from None
+                    time.sleep(0.1)
+        finally:
+            self._helper(helper.SHOW)
 
     def fresh(self, page, action=None):
         if action is not None and action["kind"] in {"click", "select", "setdate", "upload", "frame"}:
@@ -229,7 +301,15 @@ class Browser:
         return self.evaluate(MARKER) == page["marker"]
 
     def act(self, action, page, text=None, value=None, files=None):
-        """Execute one observed action. `text` for fill, `value` for setdate, `files` for upload (code-owned)."""
+        """Execute one observed action. `text` for fill, `value` for setdate, `files` for upload (code-owned).
+        The bubble is hidden meanwhile, so no click can land on it."""
+        self._helper(helper.HIDE)
+        try:
+            return self._act(action, page, text, value, files)
+        finally:
+            self._helper(helper.SHOW)
+
+    def _act(self, action, page, text=None, value=None, files=None):
         if not self.fresh(page, action):
             raise StalePage("Page changed since this decision. Observe again.")
         kind = action["kind"]
@@ -246,6 +326,10 @@ class Browser:
                 deltaY=action["delta"],
             )
         elif kind == "enter":
+            if action.get("in_form_ok") and not PROMPT_ENTER_SITES.search(self.evaluate("location.hostname") or ""):
+                raise ValueError(
+                    f"Enter inside a form is allowed only on known portals; nothing pressed in '{action['label']}'."
+                )
             if not self.evaluate(SAFE_ENTER + "(" + json.dumps(action) + ")"):
                 raise ValueError(f"Pressing Enter isn't safe in '{action['label']}'; nothing was pressed.")
             for event in ("keyDown", "keyUp"):
@@ -288,6 +372,15 @@ class Browser:
                 self.call(
                     "Input.dispatchMouseEvent", type=event, x=target["x"], y=target["y"], button="left", clickCount=1
                 )
+            if kind == "fill" and action.get("proxy") is not None:
+                # A box drawn over by another element (Workday's "MM / YYYY": the display sits on the input). The
+                # click may leave focus where the site last put it (its Year box, after a Month): focus the input
+                # itself, so the text goes where it was meant to.
+                self.evaluate(
+                    f"(() => {{ const e = window.__jevApply?.nodes.get({int(action['node'])}); "
+                    "if (e && document.activeElement !== e) e.focus(); return true; })()"
+                )
+                time.sleep(0.25)  # Workday swaps its display for the input on focus: text typed meanwhile is lost
             if kind == "fill":
                 modifier = 4 if sys.platform == "darwin" else 2
                 self.call(
@@ -299,6 +392,11 @@ class Browser:
                     commands=["selectAll"],
                 )
                 self.call("Input.dispatchKeyEvent", type="keyUp", key="a", code="KeyA", modifiers=modifier)
+                if action.get("multiple"):
+                    # A tag box (Workday's "Type to Add Skills") keeps the last search's text, and after a result is
+                    # picked focus sits in its list, so Ctrl+A selects nothing: empty that very input the way the
+                    # page's own code sees it (native setter + input event), focus it, then type one item.
+                    self.evaluate(CLEAR_INPUT + "(" + json.dumps(int(action["node"])) + ")")
                 if action.get("masked"):
                     # A typing mask ("DD/MM/YYYY") reads keystrokes, not pasted text: clear, then type key by key.
                     for event in ("keyDown", "keyUp"):

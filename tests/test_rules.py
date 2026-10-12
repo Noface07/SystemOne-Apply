@@ -38,6 +38,9 @@ def test_every_probe_wording_is_answered_right_or_left_to_the_model(spec):
         ("Notice period", {}, "work.notice_period_text"),
         ("Are you currently serving notice?", {}, "work.serving_notice"),
         ("Graduation year", {}, "education.0.end.year"),  # "2022", not "2022-06"
+        ("Postcode", {}, "personal.pincode"),  # UK/EU wording
+        ("Town", {}, "personal.city"),
+        ("Town/City", {}, "personal.city"),
         ("Current designation *", {}, "work.current_title"),
         ("Mobile number *", {}, "personal.phone"),
         ("Current location *", {}, "personal.city"),
@@ -309,6 +312,74 @@ def test_values_are_fitted_to_the_field_or_left_to_you():
     phone = SCHOOLED.facts["personal.phone"]  # +91 98765 43210
     assert rules.fit(phone, field("Mobile", maxlength=10), SCHOOLED) == "9876543210"
     assert rules.fit(SCHOOLED.facts["personal.email"], field("Email", maxlength=5), SCHOOLED) is None
+    # Workday's date in parts: the Month box gets "06", the Year box "2022", though its help says "MM/YYYY"
+    help_ = "current value is MM/YYYY"
+    assert rules.fit(SCHOOLED.facts["education.0.end.mm"], field("Month", help=help_), SCHOOLED) == "06"
+    assert rules.fit(SCHOOLED.facts["education.0.end.year"], field("Year", help=help_), SCHOOLED) == "2022"
+    assert rules.fit(SCHOOLED.facts["education.0.end.mm_yyyy"], field("Month", help=help_), SCHOOLED) == "06"
+
+
+def test_a_desired_salary_that_may_include_bonus_is_the_expected_total():
+    """Xylem: "What is your desired annual salary? Details can include bonus, benefits, or additional
+    compensation." read as the variable part (which is never answered), so it went unanswered."""
+    profile = Profile({"compensation": {"currency": "INR", "expected": {"total_annual": 1500000}}}, ROOT)
+    label = "What is your desired annual salary? Details can include bonus, benefits, or additional compensation."
+    assert rules.match(field(label), profile, False, ()) == safe_id("compensation.expected.total_annual")
+    assert rules.match(field("Expected variable pay / bonus"), profile, False, ()) != safe_id(
+        "compensation.expected.total_annual"
+    )
+
+
+def test_workdays_eligibility_visa_and_age_questions_follow_the_jobs_country():
+    """Xylem's Application Questions. The work-eligibility and visa answers hold only for a job in India."""
+    data = {"personal": {"date_of_birth": "2002-02-07"},
+            "work_authorization": {"authorized_to_work_in_india": True, "requires_visa_sponsorship": False}}  # fmt: skip
+    profile = Profile(data, ROOT)
+    eligible = field("Are you eligible to work in the country in which this position is located?*")
+    visa = field("Will you need support for a work visa and residence permit now or in the future?*")
+    assert rules.match(eligible, profile, False, ()) is None  # a job somewhere unknown: yours to answer
+    assert rules.match(visa, profile, False, ()) is None
+    assert profile.by_id[rules.match(field("Are you over 18 years of age?*"), profile, False, ())].value == "Yes"
+    profile.note_job_country("India")
+    assert profile.by_id[rules.match(eligible, profile, False, ())].value == "Yes"
+    assert profile.by_id[rules.match(visa, profile, False, ())].value == "No"
+
+
+def test_workdays_personal_information_questions_come_from_the_profile():
+    """Yokogawa's Voluntary Disclosures: country and city of birth, marital status, citizenship (country, then
+    status), nationality. Its error list ("The field ... is required") never becomes a question."""
+    from jev_apply.profile import not_a_question
+
+    data = {"personal": {"nationality": "Indian", "country_of_birth": "India", "city_of_birth": "Udaipur",
+                         "marital_status": "Single", "citizenship_country": "India", "citizenship_status": "Citizen"}}
+    profile = Profile(data, ROOT)
+
+    def value(label):
+        return profile.by_id[rules.match(field(label), profile, False, ())].value
+
+    assert value("What is your Country of Birth?") == "India"
+    assert value("What is your City of Birth?") == "Udaipur"
+    assert value("What is your Marital Status?") == "Single"
+    assert value("What is your Citizenship Status?") == "India"  # its list: the country first, then "Citizen"
+    assert value("What is your Primary Nationality?") == "Indian"
+    assert not_a_question("The field What is your Marital Status? is required and must have a value.")
+    assert not_a_question("Error What is your Marital Status?")
+    assert not not_a_question("What is your Marital Status?")
+
+
+def test_a_desired_start_date_is_today_plus_your_notice_period():
+    """MKS: "What is your desired start date?" in Month / Day / Year boxes was skipped: the profile had a 15-day
+    notice period but no calendar date."""
+    from datetime import datetime, timedelta
+
+    profile = Profile({"work": {"notice_period_days": 15}}, ROOT)
+    expected = datetime.now() + timedelta(days=15)
+    key = rules.match(field("Month", context="What is your desired start date?* Calendar"), profile, False, ())
+    assert profile.by_id[key].value == expected.strftime("%Y-%m-%d")
+    month = field("Month", context="What is your desired start date?* Calendar", help="current value is MM/DD/YYYY")
+    assert rules.fit(profile.by_id[key], month, profile) == expected.strftime("%m")
+    own = Profile({"work": {"notice_period_days": 15, "earliest_start_date": "2026-12-01"}}, ROOT)
+    assert own.facts["work.earliest_start_date"].value == "2026-12-01"  # your own date wins
 
 
 def test_new_personal_facts_are_answered_from_the_profile():
@@ -489,3 +560,41 @@ def test_your_annual_ctc_without_current_or_expected_is_your_current_ctc():
     assert rules.match(field("What CTC are you looking for in the new role (LPA)?"), PROFILE) == safe_id(
         "compensation.expected.total_annual_lpa"
     )
+
+
+def test_holding_an_id_card_comes_from_what_you_said_never_its_number():
+    """Maersk: "Please confirm if you have a valid PAN card / Aadhar card"; the numbers stay never-fill."""
+    data = json.loads((ROOT / "data" / "profile.example.json").read_text(encoding="utf-8"))
+    cards = {"has_aadhaar_card": "Yes", "has_pan_card": "Yes", "has_driving_licence": "Yes", "date_of_birth": "2002-02-07"}
+    profile = Profile({**data, "personal": {**data["personal"], **cards}}, ROOT / "data")
+    for question, key in [
+        ("Please confirm if you have a valid Aadhar card.*", "personal.has_aadhaar_card"),
+        ("Please confirm if you have a valid PAN card.*", "personal.has_pan_card"),
+        ("Do you hold a valid driving license?", "personal.has_driving_licence"),
+        ("I confirm that I am 18+ years of age*", "personal.over_18"),
+    ]:
+        assert profile.by_id[rules.match(field(question), profile)].key == key
+    # A Yes/No radio reads its options with its question ("... valid PAN card? Yes No"): still the card question
+    radio = {"kind": "click", "role": "radio", "node": 2, "label": "Yes", "context": "Do you have a valid PAN card? Yes No"}
+    assert profile.by_id[rules.match(radio, profile)].key == "personal.has_pan_card"
+    for question in ("Aadhaar Card Number*", "Please enter your valid PAN card number", "Valid PAN card no.",
+                     "Do you have a valid driving licence? Licence no:"):
+        chosen = rules.match(field(question), profile)
+        assert chosen not in {safe_id("personal.has_aadhaar_card"), safe_id("personal.has_pan_card")}
+
+
+def test_a_workday_field_name_says_what_is_asked_when_its_label_agrees():
+    """Maersk: "City of Birth" read with the words "Date of Birth" around it got your birth date. Its stable name
+    (formField-cityOfBirth) settles it; a name renamed or reused for something else falls back to the label."""
+    data = json.loads((ROOT / "data" / "profile.example.json").read_text(encoding="utf-8"))
+    personal = {**data["personal"], "city_of_birth": "Udaipur", "date_of_birth": "2002-02-07"}
+    profile = Profile({**data, "personal": personal}, ROOT / "data")
+    city = field("Please specify your City of Birth", context="Please specify your Date of Birth",
+                 field_id="cityOfBirth")  # fmt: skip
+    assert profile.by_id[rules.match(city, profile)].key == "personal.city_of_birth"
+    reused = field("Phone Extension", field_id="cityOfBirth")  # the label says otherwise: the label decides
+    assert rules.key_for(reused, profile, set()) != "personal.city_of_birth"
+    unknown = field("Please specify your City of Birth", field_id="somethingNew")
+    assert profile.by_id[rules.match(unknown, profile)].key == "personal.city_of_birth"  # read from its label
+    assert rules.by_field_id(field("Primary Nationality", field_id="nationality")) == (
+        "personal.nationality", "personal.citizenship_country")

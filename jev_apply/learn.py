@@ -16,6 +16,8 @@ import re
 from datetime import date
 from pathlib import Path
 
+from .files import write_json
+
 MONTHS = {m: i for i, m in enumerate("jan feb mar apr may jun jul aug sep oct nov dec".split(), 1)}
 MONTH = r"(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\.?"
 RANGE = re.compile(
@@ -235,5 +237,5 @@ def learn(resume, data_dir, use_claude=True, today=None):
     )
     draft["documents"] = {"resume": {"path": str(Path(resume).resolve()), "about": "Résumé / CV (PDF)"}}
     path = Path(data_dir) / "profile.learned.json"
-    path.write_text(json.dumps(draft, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    write_json(path, draft)
     return path, draft, notes + [f"Claude: {n}" for n in draft.get("_review", [])]

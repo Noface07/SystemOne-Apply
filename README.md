@@ -13,15 +13,17 @@ from a model's imagination. By default it stops at the final **Submit** button s
   decision model that runs locally. It only ever picks *which* of your facts or options answers a question.
   One line in `.env` switches that role to TypeSafe's [Jev](https://typesafe.ai) instead
   ([Choosing the decision model](#choosing-the-decision-model)).
-- **Claude for text only.** Open questions ("Why do you want to join us?") are drafted through the
-  [Claude Code](https://docs.anthropic.com/en/docs/claude-code) CLI on your own Claude login, with no tools and
-  no file access. Or leave drafting off and answer them yourself.
+- **Claude for text, and for getting unstuck.** Open questions ("Why do you want to join us?") are drafted through
+  the [Claude Code](https://docs.anthropic.com/en/docs/claude-code) CLI on your own Claude login, with no tools and
+  no file access. The same CLI answers questions from your profile that no rule knows, finds your answer in a
+  list that words it differently ("BS" for your B.Tech) and gets a stuck page moving. Code checks every one of
+  its answers against your profile ([When a run gets stuck](#when-a-run-gets-stuck-claude-as-teacher-and-rescuer)).
 - **Safety is code, not prompts.** Sensitive fields, declarations, logins and the final submit are all gated by
   rules you can read in `jev_apply/policy.py` and `jev_apply/agent.py`.
 
-> **Status:** personal project, actively used on LinkedIn Easy Apply and simple company forms. Workday-style
-> portals are partly supported (see [Limits](#limits)). Job boards generally prohibit automation in their terms,
-> so use it on your own responsibility.
+> **Status:** personal project, actively used on LinkedIn Easy Apply, simple company forms and Workday (sign-up,
+> e-mail verification and every step up to Review, tested on several companies). See [Limits](#limits). Job boards
+> generally prohibit automation in their terms, so use it on your own responsibility.
 
 ---
 
@@ -34,13 +36,15 @@ from a model's imagination. By default it stops at the final **Submit** button s
 4. [Running applications](#running-applications)
 5. [Submitting for you](#submitting-for-you)
 6. [Answer once: QUESTIONS.md](#answer-once-questionsmd)
-7. [Drafting open answers with Claude Code](#drafting-open-answers-with-claude-code)
-8. [Supported fields](#supported-fields)
-9. [Configuration](#configuration)
-10. [Testing and development](#testing-and-development)
-11. [Limits](#limits)
-12. [Privacy](#privacy)
-13. [Credits and license](#credits-and-license)
+7. [When a run gets stuck: Claude as teacher and rescuer](#when-a-run-gets-stuck-claude-as-teacher-and-rescuer)
+8. [Drafting open answers with Claude Code](#drafting-open-answers-with-claude-code)
+9. [Supported fields](#supported-fields)
+10. [Configuration](#configuration)
+11. [Testing and development](#testing-and-development)
+12. [How the agent is doing: metrics](#how-the-agent-is-doing-metrics)
+13. [Limits](#limits)
+14. [Privacy](#privacy)
+15. [Credits and license](#credits-and-license)
 
 ---
 
@@ -53,16 +57,20 @@ from a model's imagination. By default it stops at the final **Submit** button s
 ```
 
 1. **Observe.** `snapshot.js` lists every visible control with its label, the question it belongs to, help text,
-   required flag and current value. Styled widgets are read through the element they draw (hidden radios through
-   their labels, Workday's 0×0 date inputs through their date box).
+   required flag, current value and, when the site gives one, its stable field name (Workday's `formField-…`).
+   Styled widgets are read through the element they draw (hidden radios through their labels, Workday's 0×0 date
+   inputs through their date box). A group wrapped around a whole section is never taken as each field's question.
 2. **Plan.** A fixed procedure (`planner.py`) decides the next step: open an embedded form, dismiss a cookie
    banner, fill the next unanswered field top to bottom, scroll, press Next, stop at Submit.
-3. **Choose the value.** `rules.py` maps the wordings forms use to your facts. When no rule knows, Laya picks among
-   that one question's options. A model never answers something your profile doesn't hold: those questions go to
-   [QUESTIONS.md](#answer-once-questionsmd).
+3. **Choose the value.** `rules.py` maps the wordings forms use (and Workday's field names) to your facts. When no
+   rule knows, the decision model picks among that one question's options. When a list words your answer
+   differently, Claude finds it there. A model never answers something your profile doesn't hold: those questions
+   go to [QUESTIONS.md](#answer-once-questionsmd).
 4. **Check.** Low-confidence picks, sensitive fields, declarations and the final submit go through the guards.
-5. **Act and read back.** The action runs on the exact element observed, then the page is read again to confirm
-   the value stuck.
+5. **Act and read back.** The action runs on the exact element observed, at a person's pace, then the page is read
+   again to confirm the value stuck.
+6. **Unstick.** About to stop with nobody watching, Claude gets up to five checked steps to get the page moving,
+   or says exactly which field and fact are missing.
 
 ### Choosing the decision model
 
@@ -84,7 +92,9 @@ CLEF_MODEL_PATH=D:/models/Cloudflare_clef-flash-Q4_K_M.gguf
 CLEF_SERVER_BIN=D:/llama.cpp/llama-server.exe   # jev-apply starts it when nothing answers on CLEF_BASE_URL
 ```
 
-Clef answers through the same `/v1/systemone` API as Jev, so nothing else changes. Each question keeps its 12
+Before starting llama-server, jev-apply checks that Windows can spare the memory the model needs, counting the room
+a system-managed page file can still grow into on its drive (keeping 5 GB of that drive free). Clef answers through
+the same `/v1/systemone` API as Jev, so nothing else changes. Each question keeps its 12
 most relevant options (`CLEF_MAX_OPTIONS`); the exits (ask you, skip, draft) always stay. With the rules switched
 off, on a real profile, Clef-Flash answered 18 of 26 field wordings right against Laya's 3 (Laya asked about most).
 
@@ -135,6 +145,10 @@ Everything personal lives in `data/` and is git-ignored. Only the `*.example.jso
 | `policy.json` | Overrides of the safety defaults (only what you change) |
 | `documents/` | Résumé and cover letter; the only files that can ever be uploaded |
 | `applied.json` | Jobs submitted with `auto_submit`, so none is applied to twice |
+| `lessons.json` | Answers Claude gave from your profile, reused without asking again (checked again on every load) |
+| `equivalents.json` | Your answer in other lists' words ("BS" for B.Tech), so the same list needs no Claude call |
+| `accounts.json` | Portals where an account was created for you |
+| `replay/` | Real pages kept from runs, for replay tests (`scripts/replay.py`) |
 
 ### Starting from your résumé
 
@@ -188,7 +202,10 @@ number instead of a guess:
   default.
 
 Never put Aadhaar, PAN, passport numbers, bank details or passwords in the profile. Those fields are on the
-never-fill list anyway.
+never-fill list anyway. *Holding* a document is a fact like any other: `"has_aadhaar_card": "Yes"`,
+`"has_pan_card"`, `"has_driving_licence"` under `personal` answer "Do you have a valid PAN card?". Without them that
+question is asked, never guessed, and so are citizenship, nationality and birth details unless your profile states
+them.
 
 ---
 
@@ -242,7 +259,8 @@ Everything the commands do, in one place:
 - **Signing in:** a sign-in page (a password box, "Continue with Google"-style buttons, Google's or Microsoft's
   own sign-in) makes the run wait for you. With "Sign in with Google for me" on (System → Safety settings), it
   clicks Continue with Google, your profile e-mail's account and Google's basic-sharing confirmation itself.
-  It never types into a sign-in page; a password, code or wider access request is always yours.
+  With "Sign in / sign up on portals for me" on, it uses your profile e-mail and the portal password on a
+  portal's own sign-in or Create Account form (see "Portal accounts" below); otherwise it never types there.
 - **Claude usage (Insights):** each Claude call's stage, time, tokens and cost (runs/claude-usage.jsonl).
 - **Draft profile from résumé (Profile → Documents):** reads the résumé (code, then Claude for gaps) and shows
   what differs from your profile; only the values you tick are applied.
@@ -268,6 +286,7 @@ The API (`jev_apply/web/server.py`) is the contract a hosted version would keep.
 | `uv run jev-apply preflight jobs.txt` | Read those forms ahead and send questions nothing can answer to `QUESTIONS.md` |
 | `uv run jev-apply learn --resume cv.pdf` | Draft a profile from your résumé into `profile.learned.json` |
 | `uv run jev-apply answer` | Answer the open questions of `QUESTIONS.md` in the terminal |
+| `uv run jev-apply metrics` | How runs went: first-run Review rate per site and ATS, why runs stop |
 
 Options go after the command, except `--data`, which goes first:
 
@@ -342,9 +361,11 @@ https://job-boards.greenhouse.io/acme/jobs/123
   ? ASK           Are you comfortable working from office 5 days a week? only you can say
 ```
 
-**Logins.** The agent never types into a sign-in page. In an unattended run it brings the tab to the front, prints
-**LOGIN NEEDED** and waits (15 minutes by default) while you sign in or create the account, then carries on.
-Portals like Workday keep one account per company. The browser remembers the session afterwards.
+**Logins.** Without "Sign in / sign up on portals" on, the agent never types into a sign-in page. In an unattended
+run it brings the tab to the front, prints **LOGIN NEEDED** and waits (15 minutes by default) while you sign in or
+create the account, then carries on. With it on, it signs in or signs up itself
+([Portal accounts](#portal-accounts-and-verification-e-mails)). Portals like Workday keep one account per company.
+The browser remembers the session afterwards. Cookie banners are accepted (Decline only when there is no Accept).
 
 ---
 
@@ -375,6 +396,30 @@ this way: it goes to `QUESTIONS.md` as "Tick this box? …" and your Yes or No i
 
 ---
 
+## Portal accounts and verification e-mails
+
+With **Sign in / sign up on portals** on (Safety settings), a portal's own sign-in (Workday, iCIMS, Oracle...) is
+handled for you: your profile's e-mail and the portal password (System settings, `JEV_PORTAL_PASSWORD` in `.env`)
+sign in, or create the account first; `data/accounts.json` remembers which portals have one. A refused sign-in is
+never retried. With **Read verification e-mails** on and Gmail connected, the codes and verification links portals
+send are read from your Gmail (read-only) and typed or opened.
+
+### Gmail for verification codes (once, about 10 minutes)
+
+1. Open https://console.cloud.google.com/, sign in with the Gmail account you apply with, and create a project
+   (top bar: project picker, **New project**, name it `jev-apply`).
+2. **APIs & Services → Library**: search **Gmail API**, open it, **Enable**.
+3. **Google Auth Platform** (or **APIs & Services → OAuth consent screen**): **Get started**. App name `jev-apply`,
+   your e-mail as support and developer contact, Audience **External**. Then **Data access → Add or remove
+   scopes**: add `https://www.googleapis.com/auth/gmail.readonly`. Under **Audience → Test users**, add your Gmail
+   address. (While the app is in *Testing*, Google lets the sign-in last 7 days; **Publish app** on the Audience
+   page keeps it, with an "unverified app" notice only you see.)
+4. **Clients → Create client**: type **Desktop app**, name `jev-apply desktop`, **Create**, then **Download JSON**.
+5. Save that file as `data/google_client.json` in this project.
+6. Run `uv run jev-apply gmail-connect`: your browser opens Google's page; choose your account and allow read-only
+   access (on the "Google hasn't verified this app" page: **Advanced → Go to jev-apply**). The token is saved in
+   `data/google_token.json`; like everything in `data/` it never leaves your machine or reaches git.
+
 ## Answer once: QUESTIONS.md
 
 Every question a run couldn't answer is added to `data/QUESTIONS.md` once, with its options and the jobs that
@@ -392,6 +437,37 @@ batches most forms need nothing from you.
 
 Questions about what you have done ("Have you deployed ROS 2 on robots?") are never answered by a model. Only a
 rule, your profile or your saved answer may answer them.
+
+---
+
+## When a run gets stuck: Claude as teacher and rescuer
+
+With `TEXT_MODEL_PROVIDER=claude-code` (and `"teacher": true` in `policy.json`, the default), Claude Code steps in
+at three points. It always runs on your own login with no tools, and code checks every answer before it is used.
+
+- **Teacher.** Questions no rule answers and nothing on file matches are sent to Claude with your profile facts.
+  It must name the fact each answer comes from. Code keeps an answer only when that fact exists and the answer is
+  its value (or one of the options shown). Kept answers go to `data/lessons.json` and are reused on every later
+  form without a call. Each lesson is checked again against your profile whenever it loads, so one built on a
+  value you have since changed (your CTC) stops being used. Questions about who you are (citizenship, nationality,
+  birth, marital status, gender) and the fields of one job or school are never taught: the rules answer those.
+- **Closest option.** When a dropdown or search list doesn't hold your answer as written, Claude picks the option
+  that is your answer in the list's own words: "BS" or "Bachelor of Science" for B.Tech, "Computer Science" for
+  Computer Science and Engineering, "Manipal University" (or, only when nothing fits, "Other") for Manipal
+  University Jaipur. It must say whether its pick means the same, is the closest equivalent or is the list's way
+  out; code keeps only an option actually shown, never a different school, country, level or field. Picks are
+  saved to `data/equivalents.json`, so the next list offering "BS" needs no call (an "Other" is kept for its own
+  site only). Only lists the rules can tie to one of your facts are looked up.
+- **Rescuer.** About to stop with nobody watching (Save pressed three times without effect, nothing left to do),
+  Claude gets the page's error messages (Workday's banner at the top too), its controls with their questions and
+  field names, the last steps and your facts. It works in up to five steps, seeing after each what changed, and
+  says `done` once the field blocking the page is fixed. Code refuses any final submit, password box, sign-out,
+  a step that just failed, a ticked box (a click would untick it), text that isn't one of your facts, and a
+  sensitive question your profile doesn't answer. When it finds no way, the stop message says why
+  ("Claude: Marital Status: nothing on file says"). At most three rescues per run.
+
+Every call and its reply go to `runs/teacher.jsonl`, and tokens and cost to `runs/claude-usage.jsonl`.
+`TEXT_MODEL=haiku` makes all of this much cheaper; keep Sonnet for drafts if you prefer.
 
 ---
 
@@ -427,6 +503,7 @@ The older route still works: leave `TEXT_MODEL_PROVIDER` empty and set `TEXT_MOD
 | Autocomplete and search boxes | Types, waits for suggestions, picks the one matching your profile |
 | Skill tags ("type, pick, repeat") | One item at a time, never twice; unmatched items reported |
 | Native and custom dropdowns, multi-selects | Set or opened and chosen; long lists narrowed to your answer |
+| Workday "Select One" dropdowns and search prompts | Opened, searched (Enter), your option chosen even when worded differently ("Citizen (India)", "BS") |
 | Radios, checkboxes, Yes/No buttons, div choices | Clicked through their label, each with its own question |
 | "Select all that apply" | Ticks what your profile lists; never unticks, never guesses |
 | Date and month pickers, masked date text ("DD/MM/YYYY") | Your date in the shape asked; masks get key-by-key input |
@@ -459,6 +536,8 @@ The older route still works: leave `TEXT_MODEL_PROVIDER` empty and set `TEXT_MOD
 | `JEV_VIEWPORT_HEIGHT` | off | Minimum layout height of the agent's Chrome tabs; by default the window is maximised instead, so pages keep their normal size |
 | `JEV_BACKGROUND_TABS` | `0` | `1` keeps the agent's Chrome tabs behind yours |
 | `JEV_CHROMIUM` | *(empty)* | A specific Chromium for `--browser playwright` |
+| `JEV_PORTAL_PASSWORD` | *(empty)* | The password used to sign in or sign up on portals (never printed or logged) |
+| `JEV_CAPTURE` | `1` | Keep each new page layout a run meets for replay tests (`runs/pages/`); `0` turns it off |
 
 ### `policy.json`
 
@@ -475,6 +554,10 @@ defaults in `jev_apply/policy.py`.
 | `auto_consent` | `false` | Tick required privacy / terms consent boxes |
 | `consent_patterns` / `declaration_patterns` | privacy notice, terms… / criminal, background, true… | What counts as plain consent; what makes a box a declaration |
 | `login_wait_s` | `900` | How long an unattended run waits at a sign-in page |
+| `answer_wait_s` | `300` | How long an unattended run waits for your answers before stopping |
+| `pace_s` / `pace_after_next_s` | `0.6` / `1.5` | Pause after each action, and after Save / Next, so the site keeps up |
+| `teacher` | `true` | Let Claude answer from your profile, find closest options and rescue stuck pages |
+| `portal_accounts` / `email_codes` / `google_sign_in` | `false` | Sign in or up on portals; read verification e-mails; Continue with Google |
 | `confirm_wait_s` | `15` | How long to watch for the site's confirmation after Submit |
 | `per_company` / `company_gap_days` | `1` / `14` | At most this many applications per company in this many days (0: off) |
 | `confirm_patterns` | gender, caste, visa, salary, "i confirm"… | Fields that always need your yes |
@@ -491,11 +574,26 @@ Patterns match the start of words, ignoring case: `disab` matches "Disability"; 
 ## Testing and development
 
 ```bash
-uv run pytest                                               # 277 unit tests, offline
-uv run --extra playwright python scripts/local_check.py     # 69 real-browser checks on the built-in test forms
+uv run pytest                                               # 442 unit tests, offline
+uv run --extra playwright python scripts/local_check.py     # 79 real-browser checks on the built-in test forms
 uv run --extra playwright python scripts/dry_run.py         # a full application on the test site, nothing sent
 uv run ruff check . && uv run ruff format --check .
 ```
+
+**Replay tests from real pages.** Every run keeps each new page layout it meets (up to 25, `runs/pages/`): the page
+frozen into one static HTML file (`freeze.js`: every element keeps its box, visibility and form state, no site or
+script needed), what the agent read on it, its last steps and the planner's decision. Password boxes are never
+written down. Keep a good run's pages and check every later change against them:
+
+```bash
+uv run python scripts/replay.py promote runs/<report folder>   # its pages become goldens in data/replay/<site>/
+uv run --extra playwright python scripts/replay.py check       # read each page again, decide again; --bless accepts
+uv run python scripts/replay.py fields                         # Workday field names the map doesn't know yet
+```
+
+`check` loads each frozen page in headless Chromium, reads it with today's `snapshot.js` and runs the planner on it:
+a field read differently or a different decision is reported. `uv run pytest` replays every kept decision
+offline too. Shadow DOM and frames are not kept.
 
 **Benchmark.** `scripts/bench.py` fills real application forms with your profile while every request that
 could save or submit is blocked, photographs each form top to bottom and has Claude Code (sandboxed: the
@@ -520,13 +618,20 @@ in `fixtures/` and a check in `scripts/local_check.py`.
 ```
 jev-apply/
 ├─ jev_apply/
-│  ├─ agent.py          the loop, guards, submit, read-back, review report
-│  ├─ planner.py        the fixed procedure that decides each step (Laya backend)
+│  ├─ agent.py          the loop, guards, submit, read-back, rescues, review report
+│  ├─ planner.py        the fixed procedure that decides each step
 │  ├─ rules.py          wordings mapped to profile facts, value shaping (dates, whole years)
 │  ├─ snapshot.js       in-page snapshot of controls and their questions
+│  ├─ freeze.js         a page frozen into static HTML for replay tests
 │  ├─ browser.py        executes actions (clicks, typing, dates, uploads)
 │  ├─ model.py          decision questions and drafting (Claude Code or an API)
 │  ├─ laya_backend.py   runs Laya locally within its token budget
+│  ├─ clef_backend.py   starts llama-server with Clef-Flash (memory check included)
+│  ├─ teacher.py        Claude as teacher, closest-option finder and rescuer, every answer checked
+│  ├─ accounts.py       portal sign-in and sign-up steps
+│  ├─ gmail.py          verification codes and links from your Gmail (read-only)
+│  ├─ metrics.py        jev-apply metrics: first-run Review rate, stop reasons
+│  ├─ replay.py         keeps real pages and replays them
 │  ├─ profile.py        profile.json → facts (CTC variants, dates, list items)
 │  ├─ policy.py         guard patterns and thresholds
 │  ├─ inbox.py          QUESTIONS.md
@@ -539,23 +644,43 @@ jev-apply/
 │  ├─ skills.py         technology names and aliases found in job descriptions
 │  ├─ transport.py      separate browser (Playwright) or your Chrome
 │  ├─ ui.py             terminal and unattended interfaces
-│  └─ cli.py            jev-apply run / batch / scan / preflight / learn / check / answer
+│  └─ cli.py            jev-apply run / batch / scan / preflight / learn / check / answer / metrics
 ├─ data/                *.example.json (your real files are git-ignored)
 ├─ fixtures/            built-in test application pages
-├─ scripts/             browser checks, dry run, probes, bench.py (screenshot benchmark)
+├─ scripts/             browser checks, dry run, probes, bench.py, replay.py
 └─ tests/               unit tests
 ```
 
 ---
 
+## How the agent is doing: metrics
+
+Every run report records its site, the applicant tracking system behind it (Workday, Greenhouse, Lever...), one
+stop code saying why it ended (`site_errors`, `no_progress`, `login`, `job_closed`...), its rescues and its
+closest-option picks. `uv run jev-apply metrics` reads all reports, old ones included:
+
+```
+Runs: 204 on 26 sites; reached Review/Submit: 44 (22%)
+First run on a new site reached Review: 7 of 26 (27%)
+ATS              sites  runs  reached  first run
+workday              9    64      14%        11%
+Why runs stopped: no_form_found 35, site_errors 30, no_progress 24, resume_mismatch 22, ...
+```
+
+The number that matters most is the first run on a company never seen before. `--json` prints the numbers.
+
+---
+
 ## Limits
 
-- **Workday** works up to the experience step: sign-in waits, split date boxes and uploads are handled, but its
-  skills picker, school search and some date contexts still need work. Start from the job's `/apply/applyManually`
-  address.
+- **Workday** is handled end to end on the companies tested: sign-up and sign-in, e-mail verification, "Select
+  One" dropdowns, search prompts, skills, education, split dates, consent boxes and the voluntary disclosures. A new
+  company can still show a layout or wording no rule knows; the run then stops and says which field.
 - A final button labelled only "Next" can't be recognised as a submit, so some sites send the application from
   the last "Next" (LinkedIn does on short forms). The agent only reaches it once everything is filled.
-- Enter is pressed only in search boxes outside a `<form>`, since Enter inside a form can submit it.
+- Enter is pressed only in search boxes outside a `<form>`, since Enter inside a form can submit it (Workday,
+  iCIMS, Oracle and SuccessFactors search boxes excepted: there Enter only searches).
+- Aadhaar and PAN *numbers* are never typed; a box asking for one stops the run for you.
 - Skill names must match the site's options ("Go" vs "Golang"); unmatched ones are reported, not guessed.
 - One tab and one application at a time.
 
@@ -565,16 +690,15 @@ jev-apply/
 
 With Laya, every decision runs on your machine: page text, labels and your profile stay local. Only the
 one-time checkpoint download talks to Hugging Face. Drafting sends the question, your profile facts, saved answers
-and the job page text to the drafting model (Claude through your own login, or the API you configured). Run
-reports and `data/` stay local and are git-ignored. Keep sensitive identifiers out of the profile.
+and the job page text to the drafting model (Claude through your own login, or the API you configured). The
+teacher, closest-option finder and rescuer send your profile facts, the question or the page's controls and text
+(never a password, never a never-fill field's value) to Claude the same way. Run reports, kept pages
+(`runs/pages/`) and `data/` stay local and are git-ignored. Keep sensitive identifiers out of the profile.
 
 ---
 
 ## Credits and license
 
-MIT, see [LICENSE](LICENSE). Based on [jev-ultrafast](https://github.com/browser-use/jev-ultrafast) by Browser Use
-(MIT). Job discovery, reading forms ahead, résumé learning, the screenshot benchmark and the post-submit
-confirmation wait follow ideas from
-[TheAdaply/jev-apply](https://github.com/TheAdaply/jev-apply) (MIT). Laya is a model by Convai Innovations
+MIT, see [LICENSE](LICENSE). Laya is a model by Convai Innovations
 (Apache-2.0). Jev is a model by TypeSafe. Not affiliated with any of
 them.

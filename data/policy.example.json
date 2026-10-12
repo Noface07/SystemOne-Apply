@@ -11,7 +11,12 @@
   "submit_drafts": false,
   "login_wait_s": 900,
   "answer_wait_s": 300,
+  "pace_s": 0.6,
+  "pace_after_next_s": 1.5,
+  "teacher": true,
   "google_sign_in": false,
+  "portal_accounts": false,
+  "email_codes": false,
   "confirm_wait_s": 15,
   "per_company": 1,
   "company_gap_days": 14,
@@ -28,8 +33,8 @@
 
   "confirm_patterns": [
     "gender", "sex", "pronoun", "race", "ethnic", "caste", "category", "religion", "disab", "veteran",
-    "criminal", "convict", "arrest", "sponsor", "visa", "work authori", "authorized to work", "authorised to work",
-    "date of birth", "birth", "age", "marital", "salary", "ctc", "compensation", "pay", "package", "background check",
+    "criminal", "convict", "arrest", "sponsor", "visa", "citizen", "nationality", "work authori", "authorized to work", "authorised to work",
+    "date of birth", "birth", "age", "marital", "salary", "ctc", "compensation", "pay", "package", "background check", "aadha", "pan card", "passport", "driving licen",
     "i agree", "i certify", "i confirm", "i acknowledge", "declare", "consent", "terms"
   ],
 

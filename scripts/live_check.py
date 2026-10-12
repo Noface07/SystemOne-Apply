@@ -164,10 +164,22 @@ def real_profile(data, folder):
     copy, so a test run changes nothing in your data folder."""
     import shutil
 
+    from jev_apply import inbox
+
     data = Path(data)
     if (data / "learned.json").is_file():
         shutil.copy(data / "learned.json", folder / "learned.json")
-    return Profile.load(data / "profile.json", data / "answers.json", folder / "learned.json")
+    # Your answered questions and the teacher's lessons apply, from copies: questions a test run would add go to
+    # the copy, not your QUESTIONS.md.
+    real = inbox.path_for(data)
+    for name in ("QUESTIONS.md", "lessons.json"):
+        if (real.parent / name).is_file():
+            shutil.copy(real.parent / name, folder / name)
+    profile = Profile.load(
+        data / "profile.json", data / "answers.json", folder / "learned.json", folder / "QUESTIONS.md"
+    )
+    profile.lessons_file = real.parent / "lessons.json"  # what the teacher learns is kept: it's from your profile
+    return profile
 
 
 def main():

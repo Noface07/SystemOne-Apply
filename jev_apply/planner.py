@@ -22,13 +22,22 @@ The output is the same decision shape as model.choose, so every guard in agent.p
 import re
 
 from . import laya_backend, rules
+from .browser import PROMPT_ENTER_SITES
 from .profile import MONTHS, Fact, answers, safe_id, undouble
 
 PLACEHOLDER = re.compile(r"^\s*$|^\s*(select|choose|please|pick|--|—|-|none)", re.I)
+# Workday names its dropdown button after the question and what it shows: "Phone Device Type Select One Required".
+SHOWS_NOTHING = re.compile(r"\b(select one|please select|choose one)\b(\s+required)?\s*$", re.I)
 COOKIES = re.compile(
     r"only (necessary|essential|required)|necessary (cookies )?only|reject( all)?\b|decline|"
     r"^\s*(dismiss|got it|ok|close)\s*$",
     re.I,
+)
+# A job page's way into its form, by its words ("Continue Application", "Apply", "Apply Now").
+WAY_IN_TEXT = re.compile(r"^\W*(continue application|apply( now| for this job)?|start (your )?application)\W*$", re.I | re.M)
+# A cookie banner's accept button: "Accept Cookies", "Accept all", "Allow all", "I agree".
+ACCEPT_COOKIES = re.compile(
+    r"^\W*(accept|allow|agree|i agree|i accept|yes)\b.{0,30}$|^\W*ok,? (i )?(agree|accept)\b", re.I
 )
 ADVANCE = re.compile(r"^\s*(next|continue|review(?!s)|save (and|&) (continue|next)|proceed|next step)\b", re.I)
 # Naukri: its own Apply sends the application; its questionnaire is a chat answered one message at a time.
@@ -39,8 +48,15 @@ APPLIED = re.compile(
     re.I,
 )
 ALREADY = re.compile(r"applied|already applied|application submitted", re.I)
+# Not a failure: the job is done (the agent records it and moves on).
+ALREADY_APPLIED = "The site shows this job as already applied."
 APPLIED_AGO = re.compile(
-    r"\bapplied \d+ (second|minute|hour|day|week|month)s? ago\b|application status\W+application (submitted|viewed)",
+    r"\bapplied \d+ (second|minute|hour|day|week|month)s? ago\b|application status\W+application (submitted|viewed)|"
+    # What a job page says, before anything is done, when you applied to it before.
+    r"you('ve| have)? already (applied|submitted)|already (applied|submitted an application) (for|to)|"
+    r"thank you for (applying|your application|your interest in this (job|position|role))|"
+    r"(we('ve| have)|has been) received your application|your application (has been|was) (received|submitted)|"
+    r"you('ve| have) applied (for|to) this (job|position|role)|application (already )?(submitted|received) on",
     re.I,
 )
 # A question about what you have done or can do ("Have you deployed ROS 2...?"): only your profile, a rule or
@@ -62,6 +78,34 @@ HAS_SKILL = re.compile(
     r"(?:do you have|have you (?:worked|used)|are you (?:familiar|experienced|proficient|comfortable))"
     r"[^?]{0,30}?(?:experience |knowledge )?(?:with|in|on|using) ([^?*✱]+)",
     re.I,
+)
+# Applying through another site's account ("Apply with LinkedIn", "Apply with Indeed"): never used. It shares that
+# profile instead of yours, and needs a sign-in the agent doesn't do.
+SOCIAL_APPLY = re.compile(
+    r"\b(apply|sign\s*in|log\s*in|continue|auto-?fill|import|connect|easy apply)\b.{0,25}?\b(with|using|via|from|"
+    r"through)\s+(linkedin|indeed|seek|xing|glassdoor|facebook)\b|^\W*(linkedin|indeed)\W*$",
+    re.I,
+)
+# Another site's apply widget embedded in a portal (Workday's "applyWithLinkedIn" frame): never opened.
+SOCIAL_FRAME = re.compile(r"linkedin|indeed|glassdoor|facebook|seek\.com", re.I)
+# The ways into a company portal's application, in your order of preference (Workday, Oracle, SuccessFactors...
+# ask first): reuse your last application there, else let the portal read your résumé, else fill it in by hand.
+WAYS_IN = (
+    re.compile(
+        r"\b(use|apply with|start (from|with)|copy|reuse)\s+(my|your)?\s*"
+        r"(last|previous|prior|existing|saved|most recent)\s+(application|profile)\b|\blast application\b",
+        re.I,
+    ),
+    re.compile(
+        r"auto-?fill\s+(with|from|using)?\s*(my|your|a)?\s*(r[ée]sum[ée]|cv)|(apply|start|upload)\s+(with|using|from)\s+"
+        r"(my|your|a)?\s*(r[ée]sum[ée]|cv)\b|\b(r[ée]sum[ée]|cv)\s+(auto-?fill|parsing|upload)\b",
+        re.I,
+    ),
+    re.compile(
+        r"\b(apply|fill(\s+(it|this|them))?(\s+(out|in))?|enter(\s+details)?|complete(\s+the\s+form)?|start)\s+manually\b|"
+        r"\bmanual\s+(application|apply|entry)\b|\bapply without (a )?(r[ée]sum[ée]|cv)\b|\bstart from scratch\b",
+        re.I,
+    ),
 )
 # "I'm interested" is Zoho Recruit's Apply (and other sites'): on a posting it opens the form, as Apply does.
 INTERESTED = r"i(?:['’]m| am) interested"
@@ -86,6 +130,7 @@ APPLICATION_FRAME = re.compile(
     re.I,
 )
 # The site failed, not the form: retrying the same steps won't help.
+SITE_ERROR_REASON = 'The site shows an error ("Something went wrong"): try again later.'
 SITE_ERROR = re.compile(
     r"something went wrong|try refreshing|an (unexpected )?error (has )?occurred|unexpected error|there was an error|"
     r"page (isn't|is not|could not be) (available|found|loaded)|we couldn'?t load|temporarily unavailable",
@@ -121,6 +166,8 @@ UTILITY = re.compile(
 SECTIONS = (
     (re.compile(r"work experience|employment|work history", re.I), "experience", "company"),
     (re.compile(r"education|academic", re.I), "education", "institution"),
+    # Workday's "Websites: Add any relevant websites" (your GitHub, or portfolio)
+    (re.compile(r"\bwebsites?\b", re.I), "links", "github"),
 )
 PROMPT = re.compile(r"search|type to|start typing|press enter|hit enter|items? selected", re.I)
 # Fields whose value is usually picked from suggestions the site looks up as you type.
@@ -140,6 +187,104 @@ DECLINE = re.compile(
 )
 CURRENT_JOB = re.compile(r"currently work here|i currently work|current(ly)? (employed|working)|still work here", re.I)
 SELECTED = re.compile(r"\b[1-9]\d* items? selected", re.I)
+# How Workday shows what a prompt holds: a chip "LinkedIn, press delete to clear value." Not a choice to click.
+CHIP = re.compile(r",?\s*press delete to clear value\.?\s*$", re.I)
+# An option already ticked ("LinkedIn checked"): clicking it again only unticks it.
+TICKED = re.compile(r"(?<!\bnot)\s+checked\s*$", re.I)
+TICKED_SUFFIX = re.compile(r"\s+(not\s+)?checked\s*$", re.I)  # how Workday names a result's tick box state
+NO_RESULTS = re.compile(r"^\s*(no items|no results?( found)?|no matches)\.?\s*$", re.I)
+
+
+def pending_above(page, actions, history, url):
+    """Required questions the page says are still empty somewhere (off screen too), not worked on and not shown
+    as chosen (a Workday prompt with a chip reads empty to the page's own check)."""
+    chipped = {norm(a.get("context") or "")[:30] for a in actions if a.get("role") == "option" and CHIP.search(a["label"])}
+    return [
+        q for q in page.get("required_above") or []
+        if norm(q)[:30] not in chipped and not touched(history, url, label=q) and not touched(history, url, context=q)
+    ]  # fmt: skip
+
+
+def ups_since_advance(history, url):
+    """Scrolls up since the last Next/Save on this page."""
+    count = 0
+    for h in reversed(history):
+        if h.get("kind") == "click" and ADVANCE.search(str(h.get("action") or "")):
+            break
+        if h.get("kind") == "scroll" and h.get("url") == url and str(h.get("action") or "").startswith("Scroll up"):
+            count += 1
+    return count
+
+
+GENERIC_WORDS = r"(programming language|language|software|framework|protocol|platform|technology|development)"
+# Only a generic tail: "Python (Programming Language)", "Kotlin Programming Language". A bracketed name is something
+# else entirely: "Citizen (Czechia)" is not "Citizen" (India).
+GENERIC_TAIL = re.compile(rf"\s*(\(\s*{GENERIC_WORDS}\s*\)|{GENERIC_WORDS})?\s*", re.I)
+
+
+def same_skill(typed, offered):
+    """Is the site's skill name the same skill as yours? Its own words plus a generic tail ("Programming
+    Language", a bracketed note), or your words as its bracketed abbreviation ("... (OPC UA)")."""
+    if norm(typed) in {norm(p) for p in re.findall(r"\(([^)]+)\)", offered)}:
+        return True
+    if not offered.lower().startswith(typed.lower()):
+        return False
+    tail = offered[len(typed):]
+    if GENERIC_TAIL.fullmatch(tail):
+        return True
+    # The abbreviation spelled out: "SCADA (Supervisory Control and Data Acquisition)", its initials are "SCADA".
+    spelled = re.fullmatch(r"\s*\(([^)]+)\)\s*", tail)
+    initials = "".join(w[0] for w in re.findall(r"[A-Za-z]+", spelled.group(1))) if spelled else ""
+    return bool(initials) and initials.lower() == re.sub(r"[^a-z]", "", typed.lower())
+
+
+def search_shorter(actions, label, answer, history):
+    """A search for your whole answer found nothing that fits ("Computer Science and Engineering"): its first word
+    ("Computer"), once, whose results are then judged against the whole answer."""
+    words = [w for w in re.findall(r"[A-Za-z0-9+#.]+", answer or "") if w.lower() not in STOP_WORDS]
+    field = next((a for a in actions if a["kind"] == "fill" and a["label"] == label), None)
+    if len(words) < 2 or not field or field.get("multiple"):
+        return None
+    short = words[0]
+    if any(h.get("kind") == "fill" and h.get("action") == label and h.get("typed") == short for h in history):
+        return None  # searched shorter already
+    return decision("TYPE_TEXT", {**field, "retype": short})
+
+
+def stems(text):
+    """Meaningful words, plurals folded: "Information Sciences" -> {"information", "science"}."""
+    return {w[:-1] if len(w) > 4 and w.endswith("s") else w for w in tokens(text) if len(w) > 2}
+
+
+def opened_times(history, url, a):
+    """How often this "Select One" (this label, under this question) was opened on this page."""
+    context = (a.get("context") or "")[:160]
+    return sum(h.get("kind") == "click" and h.get("url") == url and h.get("action") == a["label"]
+               and (h.get("context") or "")[:160] == context for h in history)  # fmt: skip
+
+
+def run_together(label, facts):
+    """Is this chip ("Remove: OPC UA, OPC DA, Modbus, ...") three or more of your profile's list items as one?"""
+    parts = [norm(p) for p in re.split(r",\s*", re.sub(r"^Remove:\s*", "", label)) if norm(p)]
+    # The page state shortens long values (200 characters), so a long list's tail may be missing from it: three
+    # of yours, and a quarter of the chip at least, is enough to call it your list run together.
+    mine = sum(p in facts.values for p in parts)
+    if len(parts) >= 3 and mine >= 3 and mine * 4 >= len(parts):
+        return True
+    # Typed one after another into a box that kept its text ("OPC UAOPC DAMoIMQTTBACnetDNP3..."): no commas, but
+    # three or more of your items glued in one chip ("Citizen (India)" holds two of your answers and is one option).
+    glued = norm(re.sub(r"^Remove:\s*", "", label))
+    return len(parts) == 1 and sum(1 for v in facts.values if len(v) >= 4 and v in glued) >= 3
+
+
+def chosen_items(actions, field):
+    """What a prompt field already holds, from Workday's chips under its question: ["LinkedIn"]."""
+    q = norm(field.get("label") or "")[:30]
+    return [CHIP.sub("", a["label"]).strip() for a in actions
+            if a.get("role") == "option" and CHIP.search(a["label"]) and q
+            and (norm(a.get("context") or "").startswith(q) or q.startswith(norm(a.get("context") or "x")[:30]))]  # fmt: skip
+
+
 MAX_WAITS = 25  # ~10 s for a slow page to settle after an action
 NO_FORM_WAITS = 75  # ~30 s for a page that shows no form yet (Workday's first load) before handing over
 QUIET_WAITS = 8  # a page with fields but nothing to do: how long it may still be drawing before handing over
@@ -168,6 +313,21 @@ DEGREES = {
     "mba": "masterofbusinessadministration",
     "phd": "doctorofphilosophy",
 }
+# A degree's nearest equivalents, most exact first, for lists that name only some ("BS", "MS" and no B.Tech): an
+# engineering or computing bachelor's is a bachelor of science, never an arts one.
+DEGREE_EQUIVALENTS = {
+    **dict.fromkeys(("btech", "bacheloroftechnology"),
+                    ("btech", "be", "bachelorofengineering", "bsc", "bs", "bachelorofscience")),
+    **dict.fromkeys(("be", "bachelorofengineering"),
+                    ("be", "btech", "bacheloroftechnology", "bsc", "bs", "bachelorofscience")),
+    "bca": ("bca", "bsc", "bs", "bachelorofscience"),
+    "bsc": ("bsc", "bs", "bachelorofscience"),
+    **dict.fromkeys(("mtech", "masteroftechnology"),
+                    ("mtech", "me", "masterofengineering", "msc", "ms", "masterofscience")),
+    "me": ("me", "mtech", "msc", "ms", "masterofscience"),
+    "mca": ("mca", "msc", "ms", "masterofscience"),
+    "msc": ("msc", "ms", "masterofscience"),
+}
 # The level a degree is, in the words a "Highest qualification" list uses ("Bachelor's Degree", "Post Graduate").
 LEVELS = {
     **dict.fromkeys(
@@ -183,7 +343,9 @@ LEVELS = {
 
 
 def option_text(action):
-    return action["label"].split(" → ", 1)[-1] if action["kind"] == "select" else action["label"]
+    if action["kind"] == "select":
+        return action["label"].split(" → ", 1)[-1]
+    return TICKED_SUFFIX.sub("", action["label"])  # Workday's "India not checked" is the option "India"
 
 
 class Facts:
@@ -279,6 +441,20 @@ def profile_answer(question, options, facts):
     matches = [o for o in options if norm(option_text(o)) in wanted]
     if matches:
         return matches
+    # "B.Tech" in a list of levels (Workday: "Bachelors", "Masters", "Bachelor of Business & Commerce"): the one
+    # option that is nothing but the level's name. A bachelor's in another field is not yours.
+    level = set().union(*(LEVELS.get(w, set()) for w in wanted))
+    if level:
+        generic = [o for o in options
+                   if tokens(option_text(o)) and tokens(option_text(o)) - {"degree", "s"} <= level]  # fmt: skip
+        if len(generic) == 1:
+            return generic
+    # A list of abbreviations without yours (Maersk: "BA", "BS", "MS", "MBA", no B.Tech): its nearest equivalent.
+    for w in wanted:
+        for alias in DEGREE_EQUIVALENTS.get(w, ()):
+            same = [o for o in options if norm(option_text(o)) == alias]
+            if same:
+                return same[:1]
     # "+91" for "India (+91)": a phone code inside the option's text.
     for code in [v.strip() for v in values if re.fullmatch(r"\+\d{1,4}", v.strip())]:
         coded = [o for o in options if re.search(re.escape(code) + r"(?!\d)", option_text(o))]
@@ -522,6 +698,8 @@ def waiting(history):
 
 
 def entries(candidate, name, key):
+    if name == "links":
+        return 1 if candidate.get("links.github") or candidate.get("links.portfolio") else 0  # one website: yours
     count = 0
     while f"{name}.{count}.{key}" in candidate:
         count += 1
@@ -534,6 +712,10 @@ def add_block(a, candidate, history, url, actions=()):
     for pattern, name, key in SECTIONS:
         if pattern.search(where):
             wanted = entries(candidate, name, key)
+            if name == "links":
+                # One website box, for your GitHub: Add pressed once, unless a box shows in that section already.
+                box = any(x["kind"] == "fill" and pattern.search(x.get("section") or "") for x in actions)
+                return bool(wanted) and not box and not touched(history, url, label=a["label"], context=a.get("context"))
             # Entries the page already lists, each with its own Edit / Remove button (LinkedIn's work experience
             # step, taken from your profile there): the section is filled; a new entry would change that profile.
             if any(
@@ -561,6 +743,16 @@ def add_block(a, candidate, history, url, actions=()):
                 and h.get("url") == url
             )
             another = bool(re.search(r"another|more|new", a["label"], re.I))
+            # Blocks the page shows already ("Work Experience 1", "Work Experience 2": a draft the portal kept from
+            # an earlier visit): never more blocks than your profile has entries.
+            family = rules.BLOCKS["work experience" if name == "experience" else "education"]
+            shown_blocks = max(
+                (int(m.group(1)) for x in actions
+                 for m in [re.search(family + rules.NUMBERED, x.get("section") or "", re.I)] if m),
+                default=0,
+            )  # fmt: skip
+            if shown_blocks >= wanted:
+                return False
             # "Add" creates the first block; "Add Another" the rest (one block usually shows already).
             return pressed < (wanted - 1 if another else min(wanted, 1))
     return False
@@ -596,7 +788,14 @@ def typed_times(history, url, a):
         and h.get("action") == a["label"]
         and h.get("url") == url
         and (h.get("context") or "")[:160] == context
+        and same_block(h, a)
     )
+
+
+def same_block(h, a):
+    """A history step and a field in the same block of a repeating section: "Month" of Work Experience 1 and
+    "Month" of Work Experience 2 are two fields."""
+    return not (h.get("section") and a.get("section")) or h.get("section") == a.get("section")
 
 
 def is_button_choice(a):
@@ -643,6 +842,18 @@ def same_value(shown, wanted):
         return False
 
 
+def way_to_start(actions, history, url):
+    """On a portal asking how to start: your last application there, else autofill from your résumé, else
+    manually; never through LinkedIn or another site's account. A way already tried on this page is passed over."""
+    ways = [a for a in actions if a["kind"] == "click" and a.get("role") in {"button", "link"}
+            and not SOCIAL_APPLY.search(a["label"])]  # fmt: skip
+    for way in WAYS_IN:
+        pick = next((a for a in ways if way.search(a["label"]) and not touched(history, url, label=a["label"])), None)
+        if pick:
+            return pick
+    return None
+
+
 def touched(history, url, label=None, context=None, question=None):
     """Has the agent already worked on this field or question on this page (typed, chosen, skipped)?"""
     for h in history:
@@ -677,6 +888,8 @@ def unanswered(actions):
             if not any(is_on(o) for o in group):
                 missing.append(question_of(a["context"], group))
         elif kind == "click" and a.get("role") == "checkbox" and a.get("checked") == "false":
+            if CURRENT_JOB.search(a["label"]):
+                continue  # "I currently work here" is unticked for a past job (its "*" belongs to the dates beside it)
             group = [o for o in actions if o.get("role") == "checkbox" and o.get("context") == a.get("context")]
             if len(group) < 2:
                 missing.append(a["label"])
@@ -684,6 +897,31 @@ def unanswered(actions):
                 seen.add(("c", a["context"]))
                 missing.append(question_of(a["context"], group))
     return [m[:60] for m in missing]
+
+
+def stale_errors(actions, history, url):
+    """Every field the site marks wrong has been answered since the last Next/Save (Workday keeps a "required"
+    message from a Save pressed early until the next one): pressing it again re-checks them. Once only: errors
+    still there after that Save are real."""
+    saves = [i for i, h in enumerate(history) if h.get("kind") == "click" and h.get("url") == url
+             and ADVANCE.search(str(h.get("action") or ""))]  # fmt: skip
+    if not saves:
+        return False
+    since = history[saves[-1] + 1:]
+    if not any(h.get("kind") in {"fill", "select", "setdate", "click", "upload"} for h in since):
+        return False  # nothing answered since that Save: its errors stand
+    answered = [norm(str(h.get("action") or ""))[:24] for h in since if h.get("kind") in {"fill", "select", "setdate"}]
+    wrong = [a for a in actions if a.get("invalid") and a["kind"] in {"fill", "setdate", "select", "upload"}]
+    if not wrong:
+        # Only the banner ("Errors Found") with no field marked any more, and something answered since that Save
+        # (MKS: the résumé uploaded after a Save pressed too early): one more Save re-checks.
+        return any(h.get("kind") in {"fill", "select", "setdate", "upload"} for h in since)
+
+    def settled(a):
+        has = a.get("value") or SELECTED.search(a.get("context") or "")
+        return bool(has) and any(norm(a["label"]).startswith(x) or x.startswith(norm(a["label"])[:24]) for x in answered)
+
+    return all(settled(a) for a in wrong)
 
 
 def invalid_fields(actions):
@@ -695,6 +933,72 @@ def invalid_fields(actions):
             label = a["label"].split(" → ", 1)[0][:50]
             found.append(f"{label}: {a['error']}" if a.get("error") else label)
     return found
+
+
+# Lists drawn as categories (Workday's "How Did You Hear About Us?": "Job Board >", "Social Media >"): when your
+# answer isn't shown, the category it usually sits in, most likely first.
+CATEGORY_HINTS = (
+    (re.compile(r"linkedin|glassdoor", re.I),  # Workday files them under Job Board
+     [re.compile(r"job ?boards?|job ?portal|job ?site", re.I), re.compile(r"social", re.I),
+      re.compile(r"online|internet|website|\bweb\b", re.I)]),
+    (re.compile(r"facebook|twitter|instagram|youtube", re.I),
+     [re.compile(r"social", re.I), re.compile(r"online|internet|website|\bweb\b", re.I)]),
+    (re.compile(r"naukri|indeed|monster|foundit|shine|hirist|instahyre|wellfound|job ?board|job ?portal", re.I),
+     [re.compile(r"job ?board|job ?portal|job ?site", re.I), re.compile(r"online|internet|website|\bweb\b", re.I)]),
+    (re.compile(r"referr|friend|employee", re.I), [re.compile(r"referr", re.I)]),
+    (re.compile(r"career (fair|site|page)|company (site|website)", re.I),
+     [re.compile(r"career|company (site|website)", re.I)]),
+)  # fmt: skip
+INSTITUTION = re.compile(r"school|college|universit|institut|alma mater", re.I)
+# The way out of a school list that doesn't have yours.
+OTHER_OPTION = re.compile(
+    r"^\W*(others?|other\s*[-–:(/].*|not (listed|found|in (the )?list)|none of (the )?above|"
+    r"my (school|university|college|institution) is not listed)\W*$",
+    re.I,
+)
+NAME_STOP = {"of", "the", "and", "at", "for", "in"}
+
+
+def name_words(text):
+    return {w for w in re.findall(r"[a-z0-9]+", str(text or "").lower()) if w not in NAME_STOP}
+
+
+def category_for(question, options, facts, history):
+    """A list drawn as categories: the one your answer sits in, when your answer itself isn't among the options."""
+    ruled = rules.match({"label": question, "context": question}, facts)
+    fact = facts.by_id.get(ruled) if ruled and ruled not in {"ASK_USER", "SKIP_FIELD", "DRAFT_ANSWER"} else None
+    leaf = lambda o: norm(re.split(r"[>›»]", option_text(o))[-1])  # noqa: E731  "Job Boards > LinkedIn" is LinkedIn
+    if not fact or any(norm(fact.value) in {norm(option_text(o)), leaf(o)} for o in options):
+        return None
+    clicked = {h.get("action") for h in history[-15:] if h.get("kind") == "click"}
+    groups = [o for o in options if not re.search(r"[>›»]", option_text(o))]  # a result's path isn't a category
+    for answer, categories in CATEGORY_HINTS:
+        if answer.search(fact.value):
+            for category in categories:
+                pick = next((o for o in groups if category.search(option_text(o)) and o["label"] not in clicked), None)
+                if pick:
+                    return decision("CLICK", pick, 0.9)
+    return None
+
+
+def school_fallback(typed, options):
+    """Your school isn't offered as typed: a suggestion that is part of its name ("Manipal University" for
+    "Manipal University Jaipur"), the longest such; else the list's own way out ("Other", "Not listed")."""
+    words = name_words(typed)
+    within = [o for o in options if len(name_words(option_text(o))) >= 2 and name_words(option_text(o)) <= words]
+    if within:
+        return decision("CLICK", max(within, key=lambda o: len(name_words(option_text(o)))), 0.8)
+    other = next((o for o in options if OTHER_OPTION.search(option_text(o))), None)
+    return decision("CLICK", other, 0.8) if other else None
+
+
+def shorter_name(value):
+    """A school's name cut to what its search usually knows: before a comma or dash, else its first two words."""
+    head = re.split(r"\s*[,(]\s*|\s+[-–]\s+", value or "")[0].strip()
+    if head and head != value.strip():
+        return head
+    words = (value or "").split()
+    return " ".join(words[:2]) if len(words) > 2 else None
 
 
 def opener(history):
@@ -713,28 +1017,94 @@ def answer_options(options, actions, candidate, facts, history):
         )
     ):
         return None  # one of these was just clicked and the list stayed (a multi-select): don't click again
-    typed = norm(last.get("typed")) if last and last.get("kind") in {"fill", "enter"} else ""
+    typed_text, name = "", ""
+    if last and last.get("kind") == "fill":
+        typed_text = last.get("typed") or ""
+    elif last and last.get("kind") == "enter":
+        # Enter searched for what was typed just before it (Workday's skills box, its Field of Study).
+        name = re.sub(r"^Press Enter in '(.*)'$", r"\1", last.get("action") or "")
+        typed_text = next((h.get("typed") or "" for h in reversed(history)
+                           if h.get("kind") == "fill" and h.get("action") == name), "")  # fmt: skip
+    typed = norm(typed_text)
+    options = [o for o in options if not NO_RESULTS.match(o["label"])]  # "No Items." is not a result
+    if not options:
+        # Nothing found: a skill stays unmatched (the next one is typed); one answer is searched again shorter.
+        searched = name if last and last.get("kind") == "enter" else (last or {}).get("action")
+        single = any(a["kind"] == "fill" and a["label"] == searched and not a.get("multiple") for a in actions)
+        return search_shorter(actions, searched, typed_text, history) if single and typed_text else None
     if typed:
         # Suggestions for what was just typed: the one that is that text, else the one that starts with it.
         # Never another suggestion: a skill or city the site doesn't offer stays unmatched and is reported.
-        exact = [o for o in options if typed in {norm(o["label"]), norm(re.split(r"[>›»]", o["label"])[-1])}]
+        shown = {id(o): norm(TICKED_SUFFIX.sub("", o["label"])) for o in options}  # "Python IDLE not checked"
+        exact = [o for o in options if typed in {shown[id(o)], norm(re.split(r"[>›»]", o["label"])[-1])}]
         if exact:
             return decision("CLICK", exact[0])
-        starts = [o for o in options if norm(o["label"]).startswith(typed)]
+        typed_field = name if last.get("kind") == "enter" else last.get("action")
+        tag_box = any(a["kind"] == "fill" and a["label"] == typed_field and a.get("multiple") for a in actions)
+        if tag_box:
+            # A skill: the same skill under the site's name ("Python (Programming Language)", "Kotlin Programming
+            # Language", "OPC Unified Architecture (OPC UA)"), never a neighbour ("Siemens S7-200" for "Siemens S7",
+            # "Siemens WinCC SCADA" for "SCADA"). None of that: this skill stays unmatched, and the next one is typed.
+            same = [o for o in options if same_skill(typed_text, TICKED_SUFFIX.sub("", o["label"]))]
+            # Several fit ("Citizen (India)", "Permanent Resident (India)" for "India"): the one also naming another
+            # answer of yours (your citizenship status), then the shortest name.
+            mine = lambda o: sum(v in shown[id(o)] for v in facts.values if len(v) >= 4 and v != typed)  # noqa: E731
+            return decision("CLICK", min(same, key=lambda o: (-mine(o), len(shown[id(o)]))), 0.9) if same else None
+        # Searched again shorter ("Computer" for "Computer Science and Engineering"): the results are judged against
+        # your whole answer, not the short search.
+        original = max((h.get("typed") or "" for h in history if h.get("kind") == "fill"
+                        and h.get("action") == typed_field), key=len, default="")  # fmt: skip
+        shorter = len(norm(original)) > len(typed)
+        starts = [] if shorter else [o for o in options if shown[id(o)].startswith(typed)]
         if len(starts) == 1:
             return decision("CLICK", starts[0], 0.9)
         if starts:
             # "Udaipur, Rajasthan, India" over "Udaipur Airport": the one that also names your state or country.
             # Equally good ones: the site's own first suggestion.
-            scores = [sum(v in norm(o["label"]) for v in facts.values if len(v) >= 4) for o in starts]
+            # A suggestion whose name is exactly what was typed ("Udaipur, Rajasthan, India" for "Udaipur") counts
+            # double over one that only starts with it ("Udaipurwati, Rajasthan, India").
+            scores = [
+                sum(v in norm(o["label"]) for v in facts.values if len(v) >= 4)
+                + 2 * (norm(re.split(r"[,(|>›-]", o["label"])[0]) == typed)
+                for o in starts
+            ]
             best = max(scores)
             return decision("CLICK", starts[scores.index(best)], 0.85 if scores.count(best) == 1 else 0.65)
-        return None
+        field = f"{last.get('action') or ''} {last.get('context') or ''}"
+        if INSTITUTION.search(field):
+            return school_fallback(typed_text, options)  # your college under a shorter name, or "Other"
+        # The site's name for it carries what was typed as its abbreviation ("OPC Unified Architecture (OPC UA)" for
+        # "OPC UA"). Merely containing the word is not enough: "SCADA" is not "Siemens WinCC SCADA".
+        inside = [o for o in options if typed in {norm(p) for p in re.findall(r"\(([^)]+)\)", o["label"])}]
+        if inside:
+            pick = min(inside, key=lambda o: len(shown[id(o)]))
+            return decision("CLICK", pick, 0.9 if len(inside) == 1 else 0.85)
+        # Its own words differ ("Computer and Information Sciences" for "Computer Science and Engineering"): the
+        # result sharing most of the words, when it shares at least two and half of them, and is the clear best.
+        words = stems(original if shorter else typed_text)
+        if len(words) >= 2:
+            scored = []
+            for o in options:
+                theirs = stems(TICKED_SUFFIX.sub("", o["label"]))
+                shared = len(words & theirs)
+                scored.append((shared, shared / len(words | theirs) if theirs else 0, o))
+            shared, overlap, best = max(scored, key=lambda s: (s[0], s[1]))
+            rivals = [s for s in scored if (s[0], s[1]) == (shared, overlap)]
+            if shared >= 2 and shared * 2 >= len(words):
+                return decision("CLICK", best, 0.85 if len(rivals) == 1 else 0.6)
+        # A search that shows categories, not results (Workday): the category your answer sits in.
+        category = category_for(last.get("action") or options[0].get("context") or "", options, facts, history)
+        return category or search_shorter(actions, typed_field, original or typed_text, history)
     question = options[0].get("context") or ""
     if not question and last and last.get("kind") == "click":
         # A dropdown's list is usually drawn apart from it: the question is the one of the control just opened.
-        question = last.get("context") or re.sub(r"^Open ", "", last.get("action") or "")
-    return answer_group(question, options, candidate, facts, "CLICK") if question else None
+        # Workday's button says it itself ("Phone Device Type Select One Required"), sharper than its section.
+        label = last.get("action") or ""
+        named = SHOWS_NOTHING.sub("", label).strip() if SHOWS_NOTHING.search(label) else ""
+        question = named or last.get("context") or re.sub(r"^Open ", "", label)
+    if not question:
+        return None
+    return category_for(question, options, facts, history) or answer_group(question, options, candidate, facts, "CLICK")
 
 
 def choose(page, candidate, exclude=(), history=()):
@@ -772,9 +1142,12 @@ def choose(page, candidate, exclude=(), history=()):
             or APPLIED_AGO.search(page.get("text", ""))
         )
     ):
-        return decision("BLOCKED", None, reason="The site shows this job as already applied.")
+        return decision("BLOCKED", None, reason=ALREADY_APPLIED)
     if not has_fields and SITE_ERROR.search(page.get("text", "")) and history:
-        return decision("BLOCKED", None, reason='The site shows an error ("Something went wrong"): try again later.')
+        # Often a passing hiccup (Workday right after signing in): a few moments first, then the agent reloads.
+        if wait and waiting(history) < 5:
+            return decision("WAIT", wait)
+        return decision("BLOCKED", None, reason=SITE_ERROR_REASON)
     if not has_fields and CLOSED.search(page.get("text", "")):
         return decision("BLOCKED", None, reason="This job is no longer open (the page says it has closed or expired).")
     # The application's frame, not a header, video or ad: an applicant system's page, or one that says so, else the
@@ -789,8 +1162,13 @@ def choose(page, candidate, exclude=(), history=()):
             reason="This page doesn't look like a job application (nothing on it mentions a job, "
             "an application or a résumé), so nothing was filled.",
         )
+    # A portal asking how to start (Workday's "Autofill with Resume / Apply Manually / Use My Last Application"
+    # dialog) comes before any embedded frame: that dialog also holds Workday's "applyWithLinkedIn" frame.
+    way_in = None if has_fields else way_to_start(actions, history, url)
+    if way_in:
+        return decision("CLICK", way_in)
     frame = max(
-        (a for a in actions if a["kind"] == "frame"),
+        (a for a in actions if a["kind"] == "frame" and not SOCIAL_FRAME.search(f"{a['label']} {a.get('value', '')}")),
         key=lambda a: (
             bool(APPLICATION_FRAME.search(f"{a['label']} {a.get('value', '')}"))
             and not DECORATIVE_FRAME.search(f"{a['label']} {a.get('value', '')}"),
@@ -811,17 +1189,19 @@ def choose(page, candidate, exclude=(), history=()):
         )
         if looks_like_form or not own_way_in:
             return decision("OPEN_FORM", frame)
-    cookie = first(
-        lambda a: (
+    def banner(a, words):
+        return (
             a["kind"] == "click"
             and a.get("role") in {"button", "link"}
-            and COOKIES.search(a["label"])
+            and words.search(a["label"])
             and not touched(history, url, label=a["label"])  # tried once: a banner that stays isn't clicked forever
             and re.search(
                 r"cookie|tracking|consent manager|privacy preference", f"{a['label']} {a.get('context', '')}", re.I
             )
-        )
-    )  # "Decline" in a cookie banner, not "I decline to self-identify"
+        )  # "Decline" in a cookie banner, not "I decline to self-identify"
+
+    # Cookies accepted, as you asked (12 Oct 2026); a banner offering no Accept is declined, to get it out of the way.
+    cookie = first(lambda a: banner(a, ACCEPT_COOKIES)) or first(lambda a: banner(a, COOKIES))
     if cookie:
         return decision("CLICK", cookie)
 
@@ -832,9 +1212,47 @@ def choose(page, candidate, exclude=(), history=()):
         if send and not CHAT_SEND.search(answered.get("action", "")):
             return decision("CLICK", send)
 
-    options = [a for a in actions if a["kind"] == "click" and a.get("role") == "option"]
+    # Workday's prompt ("How Did You Hear About Us?") keeps showing its categories while you type; Enter searches,
+    # and a single match is then chosen by Workday itself. So right after typing there: Enter, before any list.
+    just = next((h for h in reversed(history) if h.get("kind") not in {"wait", "scroll"}), None)
+    if just and just.get("kind") == "enter" and just.get("url") == url and PROMPT_ENTER_SITES.search(url or ""):
+        # Enter pressed there: Workday searches, then shows the pick as a chip. Give it a moment, or the agent
+        # retypes and wanders into the categories while the answer is on its way.
+        name = re.sub(r"^Press Enter in '(.*)'$", r"\1", just.get("action") or "")
+        field = next((a for a in actions if a["kind"] == "fill" and a["label"] == name), None)
+        # Results of this search (options naming what was typed: "OPC UA" for "OPC UA"), not a category list
+        # that stays open from before (Job Board, Social Media): those are what to pick from now.
+        searched = next((norm(h.get("typed") or "") for h in reversed(history) if h.get("kind") == "fill"
+                         and h.get("action") == name), "")  # fmt: skip
+        results = bool(searched) and any(
+            a.get("role") == "option" and not CHIP.search(a["label"]) and searched in norm(a["label"]) for a in actions
+        )
+        if field and not chosen_items(actions, field) and not results and wait and waiting(history) < 4:
+            return decision("WAIT", wait)
+    if just and just.get("kind") == "fill" and just.get("url") == url and PROMPT_ENTER_SITES.search(url or ""):
+        # Just typed there (each skill of a "Type to Add Skills" box too): Enter searches for that one.
+        typed = next((a for a in actions if a["kind"] == "fill" and a["label"] == just.get("action")), None)
+        # Workday's page has no <form> at all: in a form or not, its prompt searches on Enter.
+        if typed and (typed.get("value") or just.get("typed")) and is_prompt(typed):
+            return decision("PRESS_ENTER", {
+                "id": f"enter_{typed['node']}", "kind": "enter", "node": typed["node"], "role": typed.get("role"),
+                "label": f"Press Enter in '{typed['label']}'", "context": typed.get("context") or "",
+                "section": typed.get("section") or "", "in_form_ok": True,
+            })  # fmt: skip
+
+    # A chip holding several of your list's items run together ("OPC UA, OPC DA, Modbus, ..."): a whole list typed
+    # as one entry (an earlier run's mistake, kept in the portal's draft). Removed, so the items go in one by one.
+    blob = first(lambda a: a.get("remove_chip") and run_together(a["label"], facts)
+                 and not touched(history, url, label=a["label"]))  # fmt: skip
+    if blob:
+        return decision("CLICK", blob)
+
+    # Workday's chips ("LinkedIn, press delete to clear value.") show a pick; they are not a list to choose from.
+    options = [a for a in actions if a["kind"] == "click" and a.get("role") == "option" and not CHIP.search(a["label"])]
     if options:
         picked = answer_options(options, actions, candidate, facts, history)
+        if picked and picked.get("action") and TICKED.search(picked["action"].get("label") or ""):
+            picked = None  # already ticked: a click would untick it
         if picked:
             return picked
         last = opener(history)
@@ -845,11 +1263,52 @@ def choose(page, candidate, exclude=(), history=()):
     last = next((h for h in reversed(history) if h.get("kind") not in {"wait", "scroll"}), None)
     if not options and last and last.get("kind") == "enter" and wait and waiting(history) < 4:
         return decision("WAIT", wait)  # results of a search are loading
-    if not options and last and last.get("kind") == "fill":
-        typed = next((a for a in actions if a["kind"] == "fill" and a["label"] == last.get("action")), None)
+    opened = last and last.get("kind") == "click" and (
+        str(last.get("action", "")).startswith("Open ") or SHOWS_NOTHING.search(str(last.get("action") or ""))
+    )  # also a Workday "Select One" whose list draws late
+    if not options and opened and wait and waiting(history) < 4:
+        # A list just opened and nothing shows yet (some portals fetch it): wait. Clicking anything else now
+        # would close it again.
+        return decision("WAIT", wait)
+    if not options and last and last.get("kind") in {"fill", "enter"}:
+        # The field just typed into (or searched with Enter, "Press Enter in '<field>'").
+        name = re.sub(r"^Press Enter in '(.*)'$", r"\1", last.get("action") or "")
+        typed = next((a for a in actions if a["kind"] == "fill" and a["label"] == name), None)
         looks_up = typed and typed.get("value") and (is_prompt(typed) or LOOKUP.search(typed["label"]))
-        if looks_up and wait and waiting(history) < (6 if LOADING.search(page.get("text", "")) else 1):
+        if looks_up and wait and waiting(history) < (6 if LOADING.search(page.get("text", "")) else 2):
             return decision("WAIT", wait)  # suggestions fetched over the network can take a moment
+        where = f"{typed['label']} {typed.get('context') or ''}" if typed else ""
+        if typed and typed.get("value") and INSTITUTION.search(where):
+            # Your college's full name found nothing: its search may know it shorter ("Manipal University").
+            short = shorter_name(last.get("typed") or typed["value"])
+            if short and not any(h.get("kind") == "fill" and h.get("typed") == short for h in history):
+                return decision("TYPE_TEXT", {**typed, "retype": short})
+        pressed = any(h.get("kind") == "enter" and h.get("url") == url and typed and
+                      h.get("action") == f"Press Enter in '{typed['label']}'" for h in history)  # fmt: skip
+        if (
+            typed
+            and typed.get("value")
+            and is_prompt(typed)
+            and typed.get("in_form")
+            and not pressed
+            and (PROMPT_ENTER_SITES.search(url or ""))
+        ):
+            # A portal whose search box shows its values only after Enter, and where Enter there only searches.
+            return decision("PRESS_ENTER", {
+                "id": f"enter_{typed['node']}", "kind": "enter", "node": typed["node"], "role": typed.get("role"),
+                "label": f"Press Enter in '{typed['label']}'", "context": typed.get("context") or "",
+                "section": typed.get("section") or "", "in_form_ok": True,
+            })  # fmt: skip
+        if typed and typed.get("value") and is_prompt(typed) and typed.get("in_form"):
+            # Its search wants Enter, which inside a form could send it: open its list and choose there.
+            label = f"Open {typed['label']}"
+            opens = next((o for o in actions if o.get("node") == typed["node"] and o["label"] == label), None)
+            if not touched(history, url, label=label):
+                return decision("CLICK", opens or {
+                    "id": f"open_{typed['node']}", "kind": "click", "node": typed["node"],
+                    "role": typed.get("role") or "combobox", "label": label, "context": typed.get("context") or "",
+                    "section": typed.get("section") or "",
+                })  # fmt: skip
         # Enter in a <form> could submit it: only in a search box of its own ("type and press Enter").
         if typed and typed.get("value") and is_prompt(typed) and not typed.get("in_form"):
             enter = {
@@ -882,14 +1341,26 @@ def choose(page, candidate, exclude=(), history=()):
                 # else opened, and answered from its list.
                 if rules.match(a, facts, False, (), page.get("text", "")) not in facts.by_id:
                     return decision("CLICK", opens)
-        if kind == "fill" and (a.get("multiple") or not a.get("value")):
-            return decision("TYPE_TEXT", a)
-        if kind == "fill" and not touched(history, url, label=a["label"]):
-            # Filled in by the site (résumé parsing, autofill, an earlier visit): correct it once if your profile
-            # says something else.
+        if kind == "fill" and a.get("multiple") and chosen_items(actions, a):
+            # Workday's prompt shows its picks as chips: done once everything your profile gives is there.
+            shown = [norm(x) for x in chosen_items(actions, a)]
             choice = rules.match(a, facts, False, (), page.get("text", ""))
             fact = facts.by_id.get(choice) if choice else None
-            if fact and not same_value(a["value"], fact.value):
+            # One answer (How Did You Hear: LinkedIn) chipped: done. A list added item by item (skills) is the
+            # agent's to finish: it knows which items it typed, and stops at the field's limit.
+            wanted = [norm(v) for v in re.split(r"[,;]", str(fact.value)) if norm(v)] if fact else []
+            if wanted and all(any(w == s or w in s for s in shown) for w in wanted):
+                continue
+        if kind == "fill" and (a.get("multiple") or not a.get("value")):
+            return decision("TYPE_TEXT", a)
+        if kind == "fill" and not typed_times(history, url, a):
+            # Filled in by the site (résumé parsing, autofill, an earlier visit): correct it once if your profile
+            # says something else. This very field (its block and its From/To), not any field sharing its label.
+            choice = rules.match(a, facts, False, (), page.get("text", ""))
+            fact = facts.by_id.get(choice) if choice else None
+            # In the shape this box takes: a "Month" box showing "10" holds 2026-10-26's month already.
+            wanted = rules.fit(fact, a, facts) if fact else None
+            if fact and not same_value(a["value"], fact.value) and not (wanted and same_value(a["value"], wanted)):
                 return decision("TYPE_TEXT", {**a, "replaces": a["value"]})
             continue
         if kind == "setdate" and not a.get("value"):
@@ -936,7 +1407,8 @@ def choose(page, candidate, exclude=(), history=()):
                 if wanted and not any(norm(option_text(w)) == norm(a.get("current_value")) for w in wanted):
                     return decision("SELECT", {**wanted[0], "replaces": a.get("current_value")})
             continue
-        if is_choice(a) and a.get("context") and ("q", a["context"]) not in seen:
+        dropdown = role == "button" and SHOWS_NOTHING.search(a["label"])  # Workday's "Select One Required"
+        if is_choice(a) and a.get("context") and ("q", a["context"]) not in seen and not dropdown:
             seen.add(("q", a["context"]))
             group = [o for o in actions if o.get("context") == a["context"] and is_choice(o)]
             if len(group) < 2 and not (role == "radio" or a.get("pressed") in {"true", "false"}):
@@ -1072,6 +1544,19 @@ def choose(page, candidate, exclude=(), history=()):
                 return decision("CLICK", a)
             continue
         custom = role == "combobox" or (role == "button" and PLACEHOLDER.search(a["label"]) and a["label"].strip())
+        # Workday's dropdown button has no aria-expanded: opened once per page, never again (no loop).
+        # Several of them read just "Select One Required" (Application Questions): each one by its own question.
+        # Still showing "Select One" after it was answered: the pick didn't take (its list drew late), so it is
+        # opened once more; twice at most.
+        opened = opened_times(history, url, a)
+        untried = any(o is not a and o.get("role") == "button" and SHOWS_NOTHING.search(o["label"])
+                      and not opened_times(history, url, o) for o in actions)  # fmt: skip
+        workday_pick = (
+            kind == "click" and role == "button" and SHOWS_NOTHING.search(a["label"]) and a.get("expanded") is None
+            and (opened == 0 or (opened == 1 and not untried))  # questions not yet tried come first
+        )  # fmt: skip
+        if workday_pick and a.get("node") not in input_nodes:
+            return decision("CLICK", a)  # open it; its options are answered in step 3
         if kind == "click" and custom and a.get("expanded") == "false" and a.get("node") not in input_nodes:
             if role == "button" or not a.get("value") or PLACEHOLDER.search(a.get("value")):
                 return decision("CLICK", a)  # a custom dropdown ("Select One"): open it, answer it in step 3
@@ -1091,10 +1576,13 @@ def choose(page, candidate, exclude=(), history=()):
         # footer that is always on screen, so they are visible long before the last field).
         return decision("SCROLL_DOWN", scroll)
     invalid = invalid_fields(actions)
-    if has_fields and (invalid or ERRORS.search(page.get("text", ""))):
+    if has_fields and (invalid or ERRORS.search(page.get("text", ""))) and not stale_errors(actions, history, url):
         # The site says fields are missing or wrong (after a Next/Save click): don't press it again blindly.
         return decision("BLOCKED", None, reason=stuck("The site reports problems on this page.", actions, invalid))
     button = {"button", "link"}
+    way_in = None if has_fields else way_to_start(actions, history, url)
+    if way_in:
+        return decision("CLICK", way_in)
     advance = first(
         lambda a: (
             a["kind"] == "click"
@@ -1107,6 +1595,25 @@ def choose(page, candidate, exclude=(), history=()):
     # much more before Next/Save (pointless on a blank form) than before 'Apply' on a job posting. A form below
     # the fold looks the same, so once the page has stopped changing, look further down too.
     worked = any(h.get("url") == url and h.get("kind") in {"fill", "select", "setdate", "upload"} for h in history)
+    # The way in is on the page but above the screen (Maersk's "Continue Application" at the top, scrolled past
+    # while looking further down): back up for it, a few times.
+    up = first(lambda a: a.get("id") == "scroll_up")
+    named = WAY_IN_TEXT.search(page.get("text", ""))
+    way = first(lambda a: a["kind"] == "click" and a.get("role") in {"button", "link"} and WAY_IN_TEXT.search(a["label"])
+                and not touched(history, url, label=a["label"]))  # fmt: skip
+    if not has_fields and not worked and way:
+        # A job page's own way into its form, in view: clicked now. ("Continue Application" was read as a form's
+        # Continue, so the run waited for fields, then scrolled away from it.)
+        return decision("CLICK", way)
+    in_view = any(a["kind"] == "click" and a.get("role") in {"button", "link"} and WAY_IN_TEXT.search(a["label"])
+                  for a in actions)  # fmt: skip
+    ups = sum(h.get("kind") == "scroll" and h.get("url") == url and str(h.get("action", "")).startswith("Scroll up")
+              for h in history)  # fmt: skip
+    downs = sum(h.get("kind") == "scroll" and h.get("url") == url and str(h.get("action", "")).startswith("Scroll down")
+                for h in history)  # fmt: skip
+    # Only what is on screen is read: scrolled down from the way in, the page no longer names it. Back up as far.
+    if not has_fields and not worked and not in_view and up and ups < 3 and (named or ups < downs):
+        return decision("SCROLL_UP", up)
     loading = bool(LOADING.search(page.get("text", "")))  # Workday says "Loading" while it draws each field
     patience = NO_FORM_WAITS * 2 if loading else (NO_FORM_WAITS if advance else 8)
     if not has_fields and not worked and wait and waiting(history) < patience:
@@ -1128,6 +1635,17 @@ def choose(page, candidate, exclude=(), history=()):
             return decision(
                 "BLOCKED", None, reason=stuck(f"'{advance['label']}' didn't move the form on.", actions, invalid)
             )
+        # A list still open over the form (a dropdown Workday was loading) hides its fields: the page then looks
+        # done. Close it first, once; Next/Save comes after the form shows again.
+        escape = first(lambda a: a.get("id") == "escape")
+        listed = any(a.get("role") == "option" and not CHIP.search(a["label"]) for a in actions)
+        if escape and listed and not (last and last.get("kind") == "key" and last.get("url") == url):
+            return decision("KEY", escape)
+        # Required questions the page reports empty off screen (Workday adds an Education block above where the
+        # agent is, and its form only grows downward in our reading): look up for them, a few times, then go on.
+        up = first(lambda a: a.get("id") == "scroll_up")
+        if up and pending_above(page, actions, history, url) and ups_since_advance(history, url) < 4:
+            return decision("SCROLL_UP", up)
         return decision("CLICK", advance)
     submit = first(
         lambda a: (
@@ -1135,6 +1653,7 @@ def choose(page, candidate, exclude=(), history=()):
             and a.get("role") in button
             and SUBMIT.search(a["label"])
             and APPLY_BUTTON.search(a["label"])
+            and not SOCIAL_APPLY.search(a["label"])  # "Apply with LinkedIn" is never the way in
         )  # "Easy Apply", "Submit application"; not a job card mentioning them
     )
     if submit:

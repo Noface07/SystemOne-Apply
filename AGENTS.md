@@ -48,8 +48,12 @@ Read this before changing `agent.py`, `browser.py`, `snapshot.js` or `policy.py`
 15. **Claude only writes text and never acts.** Every Claude Code call goes through `model.claude_code`: no tools,
     no MCP servers, an empty working folder, untrusted input (job pages, résumés, photos) passed in as data.
     Claude drafts open answers, fills gaps in a résumé-learned draft and judges the benchmark. It never
-    decides a field, clicks or submits: Laya, Clef or Jev (`DECISION_BACKEND`) does that inside
-    `planner.py`'s procedure, whichever backend is set.
+    clicks or submits: Laya, Clef or Jev (`DECISION_BACKEND`) acts inside `planner.py`'s procedure. One
+    exception decides values (asked for on 2026-10-11): the teacher (`teacher.py`) answers questions rules and
+    System 1 left open, from profile facts only. Each answer must cite an existing fact; code accepts it only when
+    a text answer is that fact's value, an option is one shown, and a Yes/No option equals a Yes/No fact
+    (`teacher.checked`). Accepted answers become lessons (`data/lessons.json`) that later forms answer from
+    without Claude; every exchange is logged to `runs/teacher.jsonl` as training data for System 1.
 16. **`learn` never touches `profile.json`.** It writes `profile.learned.json`; code-extracted facts win over
     Claude's additions.
 17. **A captcha is never solved.** A form whose Submit runs one (Lever, any hCaptcha) ends at
@@ -72,12 +76,32 @@ Read this before changing `agent.py`, `browser.py`, `snapshot.js` or `policy.py`
     and starts that same process. Blocked companies and words (`data/search.json`) are deferred in
     `cli.plan_batch` too, so no batch applies to them, however it is started.
 
-21. **Sign-ins are clicks at most, never typing.** A sign-in wall (`planner.sign_in_wall`: a password box, Workday's
-    sign-in step, an identity provider's page, or only "Continue with Google"-style buttons with no application
-    fields) waits for the candidate. With `google_sign_in` on, `Agent.sign_in_with_google` may click the Google
-    button, the account whose address is the profile's e-mail (never another), and Google's confirmation only
-    when it shares no more than name, e-mail, language and picture; each click once. Anything to type, or wider
-    access, goes back to the candidate.
+21. **Sign-ins type only the portal account, and never retry.** A sign-in wall (`planner.sign_in_wall`: a password
+    box, Workday's sign-in step, an identity provider's page, or only "Continue with Google"-style buttons with no
+    application fields) waits for the candidate, unless: with `google_sign_in` on, `Agent.sign_in_with_google`
+    may click the Google button, the account whose address is the profile's e-mail (never another), and Google's
+    confirmation only when it shares no more than name, e-mail, language and picture; each click once. With
+    `portal_accounts` on (asked for on 2026-10-11), `Agent.sign_in_with_password` (page reading in
+    `accounts.py`) types the profile's e-mail and `JEV_PORTAL_PASSWORD` into a portal's own sign-in or sign-up
+    form, ticks its terms box, and presses Sign In / Create Account (one password box is a sign-in, two a
+    sign-up; with no account on record it creates one first, and "already exists" switches it to signing in).
+    Password boxes reach only this procedure: the snapshot marks them `secret` (value read only as filled or
+    empty) and `Browser.observe` moves them from `actions` to `secrets`, so the planner, the decision model,
+    reports and QUESTIONS.md never see them. Nothing else is typed there; the password is never written to a
+    report or log; a refused sign-in or a repeated step ends it (no lockouts); Google's own
+    pages are never typed into. Anything else (a code, wider access) goes back to the candidate.
+
+22. **The helper bubble is invisible to the agent.** `helper.py` puts it in a closed shadow root marked
+    aria-hidden (no text, no controls in the snapshot, no change to the fingerprint), and `Browser.observe`/`act`
+    hide it while reading or clicking, so it never covers a field. It only sends your presses (pause, resume,
+    continue, skip, answers); answers typed there go to QUESTIONS.md like answers in the app (rule 2: your typing).
+
+23. **Shared files are never half-written or overwritten blind.** JSON a batch, the app and you share goes
+    through `files.write_json` (temporary file, then swapped in). QUESTIONS.md changes only through
+    `inbox.update` (a lock file, read, change, swap): a batch adding questions and you answering them at the same
+    moment can't undo each other. Codes a site sends, cookie banners, screen-reader announcements and a
+    dropdown's placeholder ("Select One Required") never become questions or options (`profile.not_a_question`,
+    `profile.real_options`).
 
 ## Checks
 

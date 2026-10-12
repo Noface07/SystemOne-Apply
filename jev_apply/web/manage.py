@@ -1,13 +1,13 @@
 """What the app changes besides a profile's fields: documents (a track's résumé), new tracks and the settings in
 .env (keys, model paths). Every change is checked first; nothing outside data/ and .env is written."""
 
-import json
 import os
 import re
 import shutil
 from datetime import datetime
 from pathlib import Path
 
+from ..files import write_json
 from . import data
 
 # Accepted documents and the bytes a real one starts with.
@@ -79,7 +79,7 @@ def write_profile(folder, profile):
         backups.mkdir(exist_ok=True)
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
         (backups / f"profile-{stamp}.json").write_text(target.read_text(encoding="utf-8"), encoding="utf-8")
-    target.write_text(json.dumps(profile, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    write_json(target, profile)
     data._load.cache_clear()
 
 
@@ -130,6 +130,8 @@ SETTINGS = [
     ("TEXT_MODEL_API_KEY", "Drafting open answers", "API key", True, "Only for an OpenAI-compatible API."),
     ("TEXT_MODEL_BASE_URL", "Drafting open answers", "API address", False, "Only for an OpenAI-compatible API."),
     ("JEV_BACKGROUND_TABS", "Browser", "Background tabs", False, "1 keeps job tabs behind yours."),
+    ("JEV_PORTAL_PASSWORD", "Browser", "Portal password", True,
+     "Used to sign in and sign up on job portals (Workday...) when 'Sign in / sign up on portals' is on."),
 ]  # fmt: skip
 SETTING_KEYS = {s[0] for s in SETTINGS} | {"DECISION_BACKEND"}
 

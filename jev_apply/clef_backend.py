@@ -110,6 +110,34 @@ def commit_free_gb():
     return status.commit_free / 2**30
 
 
+def page_file_room_gb():
+    """How far Windows can still grow a system-managed page file ("c:\\pagefile.sys 0 0"), in GB: its drive's free
+    space less 5 GB kept for the disk itself. Windows enlarges it when memory runs short, so this counts as memory
+    it can promise. 0 for a fixed-size page file."""
+    if os.name != "nt":
+        return 0.0
+    import shutil
+    import winreg
+
+    try:
+        key = winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management"
+        )
+        files, _ = winreg.QueryValueEx(key, "PagingFiles")
+    except OSError:
+        return 0.0
+    room = 0.0
+    for line in files if isinstance(files, list) else [files]:
+        parts = str(line).split()
+        if len(parts) == 3 and parts[1:] == ["0", "0"]:  # system-managed size
+            drive = parts[0][:3] if parts[0][1:2] == ":" else os.environ.get("SystemDrive", "C:") + "\\"
+            try:
+                room += max(0.0, shutil.disk_usage(drive).free / 2**30 - 5)
+            except OSError:
+                continue
+    return room
+
+
 def needed_gb(s):
     """Windows charges the whole mapped model file, plus about 1 MB of output buffer per batch token."""
     return Path(s["path"]).stat().st_size / 2**30 + int(s["context"]) / 1024 + 0.6
@@ -122,7 +150,10 @@ def prepare():
     if healthy(s["base"]):
         return
     free, need = commit_free_gb(), needed_gb(s)
-    if free is not None and free < need + 1:
+    if free is not None:
+        free += page_file_room_gb()  # a system-managed page file grows onto its drive when memory runs short
+    # A margin for Chrome and Windows
+    if free is not None and free < need + 1.0:
         # Starting anyway starves Chrome and Windows itself (tabs fail to open, programs can't start threads).
         raise RuntimeError(
             f"Clef needs about {need:.1f} GB of memory and Windows can only promise {free:.1f} GB: close some "

@@ -408,6 +408,17 @@ def create_app(token=None, port=8765):
             raise HTTPException(404, "no such batch")
         return found
 
+    @app.post("/api/batches/{batch_id}/remove")
+    def batch_remove(batch_id: str, body: dict = Body(...)):
+        numbers = {int(n) for n in body.get("jobs") or [] if str(n).isdigit()}
+        return {"removed": batches.remove_jobs(batch_id, numbers)}
+
+    @app.post("/api/batches/{batch_id}/jobs/{n}/continue")
+    def batch_continue(batch_id: str, n: int):
+        if not batches.continue_job(batch_id, n):
+            raise HTTPException(409, "That job isn't waiting for you any more.")
+        return {"continuing": True}
+
     @app.post("/api/batches/{batch_id}/stop")
     def batch_stop(batch_id: str):
         if not batches.stop(batch_id):

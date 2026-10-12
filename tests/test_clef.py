@@ -49,6 +49,26 @@ def test_clef_is_not_started_when_windows_cannot_spare_the_memory(monkeypatch, t
     monkeypatch.setenv("CLEF_BASE_URL", "http://127.0.0.1:9")
     monkeypatch.setenv("CLEF_MODEL_PATH", str(model_file))
     monkeypatch.setattr(clef_backend, "commit_free_gb", lambda: 1.0)
+    monkeypatch.setattr(clef_backend, "page_file_room_gb", lambda: 0.0)  # a fixed-size page file
     monkeypatch.setattr(clef_backend.subprocess, "Popen", lambda *a, **k: pytest.fail("started anyway"))
     with pytest.raises(RuntimeError, match="close some programs"):
+        clef_backend.prepare()
+
+
+def test_a_page_file_windows_can_grow_counts_as_memory(monkeypatch, tmp_path):
+    """6.4 GB promised now, but a system-managed page file on a drive with 20 GB free: Clef starts."""
+    model_file = tmp_path / "clef.gguf"
+    model_file.write_bytes(b"0" * 1024)
+    monkeypatch.setenv("CLEF_BASE_URL", "http://127.0.0.1:9")
+    monkeypatch.setenv("CLEF_MODEL_PATH", str(model_file))
+    monkeypatch.setattr(clef_backend, "commit_free_gb", lambda: 6.4)
+    monkeypatch.setattr(clef_backend, "needed_gb", lambda s: 8.2)
+    monkeypatch.setattr(clef_backend, "page_file_room_gb", lambda: 15.8)
+
+    class Started(Exception):
+        pass
+
+    monkeypatch.setattr(clef_backend.subprocess, "Popen", lambda *a, **k: (_ for _ in ()).throw(Started()))
+    monkeypatch.setenv("CLEF_SERVER_LOG", str(tmp_path / "server.log"))
+    with pytest.raises(Started):
         clef_backend.prepare()

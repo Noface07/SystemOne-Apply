@@ -19,8 +19,16 @@ from . import data
 JOB = re.compile(r"^\[(\d+)/(\d+)\] (\S+)")
 EVENT = re.compile(r"^\s*· \[(\d+)/(\d+)\] (.*)$")
 PLAN = re.compile(r"^\s*(\d+)\. (.+?)(?:\s+résumé (\S+)|\s{2,})\s*(.*)$")
-RESULT = re.compile(r"^(submitted|review|stopped|failed|ready to submit|deferred|needs you)[^:]*:\s*(.*)$")
-SUMMARY = re.compile(r"^(\d+)\. (SUBMITTED|REVIEW|STOPPED|DEFERRED|READY TO CHECK|FAILED|READY TO SUBMIT[^ ]*)\s+(\S+)")
+# "waiting for your answers (up to 5 min, in Questions) [continue 1a2b3c4d]: Q1 | Q2", or for a code in the tab.
+WAITING = re.compile(
+    r"^waiting for (your answers|you to enter the verification code).*?\[continue ([0-9a-f]{8})\]:?\s*(.*)$"
+)
+RESULT = re.compile(
+    r"^(submitted|review|stopped|failed|ready to submit|deferred|already applied|needs you)[^:]*:\s*(.*)$"
+)
+SUMMARY = re.compile(
+    r"^(\d+)\. (SUBMITTED|REVIEW|STOPPED|DEFERRED|READY TO CHECK|FAILED|ALREADY APPLIED|READY TO SUBMIT[^ ]*)\s+(\S+)"
+)
 
 _batches = {}
 _lock = threading.Lock()
@@ -140,16 +148,50 @@ def from_disk(batch_id):
 
 
 def waiting():
-    """The running batch's jobs waiting for your answers: [{n, title, company, questions}]."""
+    """The running batch's jobs waiting for you: [{batch, n, title, company, kind, questions}]. kind "answers":
+    questions to answer in Questions; "code": a verification code to type in the open tab."""
     with _lock:
         live = [b for b in _batches.values() if b["state"] in {"starting", "planning", "running"}]
         return [
             {"batch": b["id"], "n": j["n"], "title": j.get("title") or j["url"], "company": j.get("company"),
-             "questions": j["waiting"].split(" | ")}
+             "kind": j["waiting"]["kind"], "questions": j["waiting"]["questions"]}
             for b in live
             for j in b["jobs"]
             if j.get("waiting")
         ]  # fmt: skip
+
+
+def remove_jobs(batch_id, numbers):
+    """Take jobs that haven't started out of a running batch: the batch skips them when it reaches them (it reads
+    <id>.skip before each job). Returns the numbers removed; a job already started or done stays."""
+    removed = []
+    with _lock:
+        b = _batches.get(batch_id)
+        if not b or b["state"] not in {"starting", "planning", "running"}:
+            return removed
+        for job in b["jobs"]:
+            if job["n"] in numbers and job["state"] == "waiting":
+                job["state"], job["result"] = "deferred", "removed by you"
+                removed.append(job["n"])
+    if removed:
+        with (folder() / f"{batch_id}.skip").open("a", encoding="utf-8") as skip:
+            skip.write("".join(f"{n}\n" for n in removed))
+    return removed
+
+
+def continue_job(batch_id, n):
+    """Your "Continue" for a job waiting on you: the run stops waiting and carries on (it watches for this file).
+    False when that job isn't waiting."""
+    with _lock:
+        b = _batches.get(batch_id)
+        job = next((j for j in (b or {}).get("jobs", []) if j["n"] == n), None)
+        token = ((job or {}).get("waiting") or {}).get("token")
+    if not token or not re.fullmatch(r"[0-9a-f]{8}", token):
+        return False
+    flag = data.runs_dir() / "continue" / token
+    flag.parent.mkdir(parents=True, exist_ok=True)
+    flag.write_text(datetime.now().isoformat(timespec="seconds"), encoding="utf-8")
+    return True
 
 
 def counts(b):
@@ -259,9 +301,15 @@ def _apply(b, line, current):
             return current
         job, message = b["jobs"][n - 1], event[3].strip()
         job["events"].append(message)
-        if message.startswith("waiting for your answers"):
-            job["waiting"] = message.split("): ", 1)[-1]  # the questions, " | " between them
-        elif message.startswith(("answered:", "no answer in time")):
+        waits = WAITING.match(message.lstrip("\a!").strip())
+        if waits:
+            code = waits[1].startswith("you to enter")
+            job["waiting"] = {
+                "kind": "code" if code else "answers",
+                "questions": [] if code else [q for q in waits[3].split(" | ") if q],
+                "token": waits[2],
+            }
+        elif message.startswith(("answered:", "no answer in time", "continuing:", "code entered", "no code entered")):
             job.pop("waiting", None)
         if message.startswith("résumé:"):
             job["resume"] = message.split("(", 1)[-1].rstrip(")")

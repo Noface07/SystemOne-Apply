@@ -12,16 +12,25 @@ import hashlib
 import json
 import re
 import time
+import uuid
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlparse
 
-from . import applied, model, planner, rules
+from . import applied, model, planner, replay, rules
 from .browser import ADVANCING, ExecutionUncertain, StalePage
-from .profile import native_date, safe_id, same_question
+from .files import write_text
+from .profile import native_date, not_a_question, one_time_code, safe_id, same_question
 from .questions import GOAL, SPECIAL
 
 FILLS = {"fill", "select", "setdate", "upload"}
 ANSWER_ROUNDS = 3  # a form that keeps asking new questions waits for you at most this often in one run
+# A job located in India, by its address or posting (Workday: ".../job/Bangalore/...").
+INDIAN_JOB = re.compile(
+    r"\bindia\b|bangalore|bengaluru|hyderabad|\bpune\b|chennai|mumbai|new[- ]?delhi|\bdelhi\b|gurgaon|gurugram|"
+    r"noida|kolkata|ahmedabad|jaipur|udaipur|kochi|coimbatore|chandigarh|indore|vadodara|nagpur|thiruvananthapuram",
+    re.I,
+)
 # What sites say once an application went through.
 # A challenge a person must answer before the form sends: hCaptcha's frame or its response field.
 CAPTCHA_CHECK = (
@@ -48,6 +57,16 @@ GOOGLE_WIDE = re.compile(
 
 class Stop(Exception):
     """You chose to stop."""
+
+
+class Skipped(Exception):
+    """You pressed "Skip job" in the bubble: this job ends here, the batch goes on."""
+
+
+RESCUE_STEPS = 5  # steps one rescue may take on a stuck page
+
+DOING = {"TYPE_TEXT": "Typing into", "CLICK": "Clicking", "SELECT": "Choosing", "SET_DATE": "Setting",
+         "UPLOAD": "Uploading", "OPEN_FORM": "Opening", "PRESS_ENTER": "Searching in"}  # fmt: skip
 
 
 def d_of(action):
@@ -85,7 +104,17 @@ class Agent:
         self.skipped_questions = {}
         self.optional_skipped = []  # unattended: optional fields no fact answers, left empty
         self.inbox = []  # unattended: required questions left for you, saved for `jev-apply answer`
+        self.paused = False  # you pressed Pause in the bubble
+        self.mail_since = time.time() - 120  # e-mails a portal sends from here on (or just before) are this run's
         self.answer_rounds = 0  # times this run waited for your answers (ANSWER_ROUNDS at most)
+        self.teacher_rounds = 0  # times this run asked the teacher (ANSWER_ROUNDS at most)
+        self.reloads = 0  # page reloads after a site error ("Something went wrong"), 2 at most
+        self.rescues = 0  # times Claude was asked for the next step on a stuck page (3 at most)
+        # (question, option) picked as your answer in the list's own words ("BS" for B.Tech), and questions already
+        # looked up this run (once each): see closest_pick
+        self.mapped, self.looked_up = set(), set()
+        self.rescue_log, self.closest_log = [], []  # what each did, for the run's report and metrics
+        self.recorder = replay.Recorder(self.run_dir)
         self.pending = None
         self.claude = []  # Claude calls this run made (drafts): time, tokens, cost
         self.receipt = None  # the site's page right after Submit: text and a screenshot
@@ -93,6 +122,14 @@ class Agent:
         self.started = time.perf_counter()
         self.page = browser.observe()
         self.start_url = self.page["url"]
+        # A job in your own country (job_in_your_country): "eligible to work in the country of this position" is then
+        # answered from your work authorization there. Anywhere else it is asked.
+        home = self.job_in_your_country()
+        if home:
+            self.profile.note_job_country(home)
+        # "Have you applied to <company> before?": from your record of applications on this company's site.
+        self.profile.note_fact("application.applied_here_before", "Yes" if self.applied_here() else "No",
+                               "Applied to this company before (from your application record)")  # fmt: skip
 
     # ---- loop -------------------------------------------------------------------------------------------------
 
@@ -109,12 +146,20 @@ class Agent:
         try:
             while True:
                 try:
-                    while self.status == "ready":
-                        self.tick()
-                except Stop:
-                    self.status = "stopped"
-                # About to stop on questions only you can answer: wait for your answers, then carry on here.
-                if not (self.unattended and self.status in {"stopped", "review"} and self.wait_for_answers()):
+                    try:
+                        while self.status == "ready":
+                            self.tick()
+                    except Stop:
+                        self.status = "stopped"
+                    # About to stop on questions only you can answer: wait for your answers, then carry on here.
+                    stuck = self.unattended and self.status in {"stopped", "review"}
+                    # Questions only you could answer: the teacher first (from your profile), then you.
+                    if not (stuck and (self.consult_teacher() or self.wait_for_answers())):
+                        break
+                except Skipped:
+                    self.status = "deferred"
+                    self.ui.event("deferred: skipped by you")
+                    self.show_helper("Skipped: on to the next job.")
                     break
         finally:
             for question in added:
@@ -122,9 +167,24 @@ class Agent:
         return self.finish()
 
     def tick(self):
+        self.helper_check()  # Pause holds the run right here; Skip ends the job
         try:
             self.step()
+            self.stale = (None, 0)
         except StalePage:
+            # The page changed under the action, or it was covered: decided again. The same action refused three
+            # times running is dropped (a Workday chip's ×, out of view, was retried 450 times without a trace).
+            action = getattr(self, "last_action", None)
+            key = (self.page.get("doc"), action.get("label") if action else None)
+            streak = self.stale[1] + 1 if getattr(self, "stale", (None, 0))[0] == key else 1
+            self.stale = (key, streak)
+            if action and streak >= 3 and action.get("kind") not in {"wait", "scroll", "key"}:
+                self.vetoed.add((*self.here(action), action["label"]))
+                self.ui.event(f"'{action['label'][:60]}' couldn't be done (the page kept changing); leaving it.")
+                self.left.append(
+                    {"what": f"'{action['label'][:80]}'", "why": "the page wouldn't take it", "url": self.page["url"]}
+                )
+                self.stale = (None, 0)
             self.reobserve()
         except ExecutionUncertain as error:
             self.handover(str(error))
@@ -141,11 +201,22 @@ class Agent:
         offered = {**self.page, "actions": [a for a in self.page["actions"] if not self.excluded(a)]}
         exclude = ("REVIEW",) if self.page.get("doc") in self.no_review else ()
         d = model.choose(offered, self.goal, self.history, self.profile.candidate_state(), exclude)
+        planned = d
+        d = self.closest_pick(d, offered) or d
+        # The page, what was read on it and decided, kept for replay tests (replay.py; once per layout)
+        self.recorder.record(self.browser, self.page, offered, self.history, self.profile.candidate_state(), exclude,
+                             planned, d)  # fmt: skip
         self.decisions.append(
             {k: d[k] for k in ("operation", "target", "operation_probability", "target_probability", "latency_ms")}
             | {"url": self.page["url"]}
         )
         operation, action = d["operation"], d["action"]
+        self.last_action = action
+        if action and operation in DOING:
+            self.show_helper(f"{DOING[operation]} '{action['label'][:70]}'")
+        elif operation in {"WAIT", "SCROLL_DOWN", "SCROLL_UP"}:
+            words = {"WAIT": "Waiting for the page", "SCROLL_UP": "Looking further up the form"}
+            self.show_helper(words.get(operation, "Looking further down the form"))
         if operation == "REVIEW":
             if not self.browser.fresh(self.page):
                 raise StalePage("Page changed since the decision")
@@ -170,14 +241,32 @@ class Agent:
                 company=self.company,
             )
             return
+        if operation == "BLOCKED" and d.get("reason") == planner.ALREADY_APPLIED:
+            # Done before (by you, or an earlier run): not a failure. Recorded, so no later batch tries it again.
+            self.status = "already applied"
+            applied.record(self.applied_path(), [self.start_url, self.page["url"]], "already applied",
+                           self.page.get("title", ""), company=self.company)  # fmt: skip
+            self.ui.event("already applied on the site: nothing to do")
+            return
+        if operation == "BLOCKED" and d.get("reason") == planner.SITE_ERROR_REASON and self.reloads < 2:
+            # "Something went wrong" that waiting didn't clear: load the page again (twice at most), as you would.
+            self.reloads += 1
+            self.ui.event("the site showed an error: loading the page again")
+            self.browser.navigate(self.page["url"])
+            self.history.append({"step": len(self.history) + 1, "action": "Reload after the site's error",
+                                 "kind": "wait", "context": "", "url": self.page["url"], "page_changed": True})  # fmt: skip
+            self.page = self.browser.observe()
+            return
         if operation == "BLOCKED":
             if planner.sign_in_wall(self.page):
                 if self.policy.google_sign_in and self.sign_in_with_google():
                     return  # signed in with Google: carry on from the form
+                if self.policy.portal_accounts and self.sign_in_with_password():
+                    return  # signed in (or signed up) with your portal account: carry on from the form
                 if self.unattended and self.wait_for_login():
                     return  # signed in: carry on from the form
             self.handover(
-                d.get("reason")
+                self.exhausted_reason(d.get("reason"))
                 or "The agent needs you here: a login, CAPTCHA/OTP, a question your profile can't answer, or the "
                 "site reporting missing or invalid fields (see the red messages on the page)."
             )
@@ -188,16 +277,28 @@ class Agent:
             # A model's pick only just ahead of the next option is a close call, however sure it sounds.
             or (d.get("target_margin") is not None and d["target_margin"] < self.policy.min_value_margin)
         )
+        if action and (*self.here(action), action["label"]) in self.vetoed:
+            # Given up on already, and proposed again (a step the planner makes up, not one the page offers): a
+            # loop. Hand over rather than spin.
+            self.handover(f"'{action['label'][:80]}' keeps coming back after the page wouldn't take it.")
+            return
         repeats = (  # tag fields take an item per entry and "Add another" a block per job: those repeat by design
             action
-            and action.get("kind") not in {"wait", "scroll", "key"}
+            # Enter is offered only right after something new was typed (each skill of a tag box): never a repeat.
+            and action.get("kind") not in {"wait", "scroll", "key", "enter"}
             and not action.get("multiple")
             and not planner.ADD.search(action.get("label", ""))
         )
         if repeats and self.repeated(action) >= 3:
-            # Done three times on this page and still proposed: the page doesn't take it. Drop it and go on.
+            # Done three times on this page and still proposed: the page doesn't take it. Claude, with the page and
+            # the last steps, may see what is missing (a dropdown left empty); otherwise drop it and go on.
+            stuck = f"'{action['label'][:80]}' was done three times and the page didn't move on."
+            if self.unattended and self.rescue(stuck, avoid=[action["label"]]):
+                return
             self.vetoed.add((*self.here(action), action["label"]))
             self.ui.event(f"'{action['label'][:60]}' was done three times without effect; leaving it for you.")
+            if getattr(self, "rescue_why", ""):
+                self.ui.event(f"Claude: {self.rescue_why[:160]}")
             self.left.append(
                 {"what": f"'{action['label'][:80]}'", "why": "the page didn't take it", "url": self.page["url"]}
             )
@@ -214,13 +315,21 @@ class Agent:
     def repeated(self, action):
         """How often this very action (same control, question and page) was already carried out."""
         context = (action.get("context") or "")[:160]
+        history = self.history
+        if planner.ADVANCE.search(action.get("label", "")):
+            # Save / Next pressed again after something was filled is a new attempt: only presses since the last
+            # answer count (Workday's Save pressed early, before the page was filled, must not ban it for good).
+            answered = [i for i, h in enumerate(history) if h.get("kind") in {"fill", "select", "setdate", "upload"}
+                        or (h.get("kind") == "click" and not planner.ADVANCE.search(str(h.get("action") or "")))]
+            history = history[answered[-1] + 1:] if answered else history
         return sum(
             1
-            for h in self.history
+            for h in history
             if h.get("kind") == action["kind"]
             and h.get("action") == action["label"]
             and h.get("context") == context
             and h.get("url") == self.page["url"]
+            and planner.same_block(h, action)  # "Month" of Work Experience 2 is not the Month of Work Experience 1
         )
 
     def empty_required(self):
@@ -239,6 +348,8 @@ class Agent:
         return (
             action.get("kind") == "click"
             and action.get("role") == "checkbox"
+            # "I currently work here" follows from your job's dates (planner): never a declaration to ask you about
+            and not planner.CURRENT_JOB.search(action.get("label") or "")
             and (
                 not action.get("context")  # no question around it: it stands alone
                 or len([o for o in self.group_of(action) if o.get("role") == "checkbox"]) < 2
@@ -254,10 +365,14 @@ class Agent:
             return action.get("checked") == "false" and norm(saved or "") in {"yes", "tick", "agree", "true"}
         if action["kind"] == "select":
             question, option = action["label"].split(" → ", 1)[0], action["label"].split(" → ", 1)[-1]
+        elif self.list_option(action) and self.opened_question():
+            question, option = self.opened_question(), action["label"]  # the dropdown just opened, whatever is around
         elif action["kind"] == "click" and action.get("context") and action.get("role") != "link":
             question, option = action["context"], action["label"]
         else:
             return False
+        if (norm(question), norm(planner.option_text(action) or option)) in self.mapped:
+            return True  # your answer in the list's own words, picked for this question (closest_pick)
         if planner.eeo_decline(question, option, self.profile.candidate_state()):
             return True
         group = self.group_of(action)
@@ -267,17 +382,109 @@ class Agent:
         saved = self.profile.saved_answer(planner.question_of(question, group))
         if saved and norm(saved) == norm(option):
             return True  # the answer you saved for this question
-        key = rules.key_for({"label": question, "context": question}, self.profile, set())
+        opened = self.opener() if self.list_option(action) else {}
+        key = rules.key_for({"label": question, "context": question, "field_id": (opened or {}).get("field_id")},
+                            self.profile, set())  # fmt: skip
+        # Workday names the country after the answer ("Single (India)", "Citizen (India)"): yours, or not this one
+        countries = {norm(f.value) for k, f in self.profile.facts.items() if k.endswith("country") and f.value}
+        place = re.fullmatch(r"(.+?)\s*\(([^()]+)\)\s*", planner.option_text(action) or option)
+        if place and norm(place.group(2)) in countries:
+            option = place.group(1)
+        elif place and countries and re.search(r"countr|citizen|nationality|marital|birth", question, re.I):
+            return False  # another country's ("Citizen (Belgium)")
         for k in key if isinstance(key, tuple) else (key,):
             fact = self.profile.by_id.get(safe_id(k)) if k and not k.isupper() else None
             if fact and norm(fact.value) == norm(option):
                 return True
+            if fact and norm(fact.value) in {"yes", "no", "true", "false"}:
+                # "Yes, I do" / "No, I don't": the one option of the question that starts with your Yes or No
+                word = "yes" if norm(fact.value) in {"yes", "true"} else "no"
+                starts = [o for o in group or [action] if re.match(rf"\s*{word}\b", planner.option_text(o), re.I)]
+                if re.match(rf"\s*{word}\b", option, re.I) and len(starts) <= 1:
+                    return True
         return False
+
+    def closest_pick(self, d, page):
+        """A list is open and your answer isn't in it as written (no pick, or only a near guess): the option that is
+        your answer in the list's own words ("BS" for your B.Tech, "Manipal University" or "Other" for Manipal
+        University Jaipur), from the fact the rules give that question. None leaves the decision as it was."""
+        from . import teacher
+
+        options = [a for a in page["actions"] if self.list_option(a) and not planner.CHIP.search(a["label"])]
+        sure = d.get("action") in options and (d.get("target_probability") or 0) >= 0.9
+        question = self.opened_question()
+        if not options or sure or not question:
+            return None
+        opener = self.opener() or {}
+        if opener.get("kind") in {"fill", "enter"}:
+            # Typed into: only a search or lookup box's own suggestions are its list, never a list that happens to be
+            # open beside a plain text box (an unrelated "Other" for your first name)
+            box = next((a for a in page["actions"] if a["kind"] == "fill" and a["label"] == question), None)
+            if not box or not (planner.is_prompt(box) or planner.LOOKUP.search(box["label"])):
+                return None
+        field = {"label": question, "context": opener.get("context") or question, "section": opener.get("section"),
+                 "field_id": opener.get("field_id")}  # fmt: skip
+        key = rules.key_for(field, self.profile, set(), page_text=self.page.get("text", ""))
+        fact = next((self.profile.by_id.get(safe_id(k)) for k in (key if isinstance(key, tuple) else (key,))
+                     if k and not k.isupper() and self.profile.by_id.get(safe_id(k))), None)  # fmt: skip
+        texts = list(dict.fromkeys(planner.option_text(o) for o in options))
+        asked = (question, fact.value if fact else None, tuple(texts))  # a new search's results: looked up anew
+        if fact is None or asked in self.looked_up:
+            return None  # nothing on file answers it (yours to say), or already looked up this run
+        if any(a["kind"] == "fill" and a.get("multiple") and a["label"] == question for a in page["actions"]):
+            return None  # a box of several items (your skills): each is matched as it is typed
+        picked = d.get("action") in options and planner.option_text(d["action"])
+        if picked and norm(picked).startswith(norm(fact.value)):
+            return None  # your answer and more ("Udaipur, Rajasthan, India" for Udaipur): that one
+        self.looked_up.add(asked)
+        found = teacher.closest_option(question, fact.key, fact.value, fact.about, texts, self.profile,
+                                       urlparse(self.page["url"]).hostname or "", self.run_dir)  # fmt: skip
+        if not found:
+            return None
+        text, match, why = found
+        option = next(o for o in options if planner.option_text(o) == text)
+        if planner.TICKED.search(option["label"]):
+            return None  # already ticked: a click would untick it
+        self.mapped.add((norm(question), norm(text)))
+        self.closest_log.append({"question": question[:120], "fact": fact.key, "value": fact.value[:80],
+                                 "option": text[:80], "match": match, "why": why[:120]})  # fmt: skip
+        self.ui.event(f"'{question[:50]}': {fact.value[:40]} is '{text[:40]}' here ({match}: {why[:60]})")
+        return planner.decision("CLICK", option, 1.0)
+
+    @staticmethod
+    def list_option(action):
+        """An entry of a list a dropdown or search box opened: an option, or a Workday result ("India not checked")."""
+        return action["kind"] == "click" and (
+            action.get("role") == "option" or bool(planner.TICKED_SUFFIX.search(action.get("label") or ""))
+        )
+
+    def opener(self):
+        """The last step that opened something: a dropdown clicked, a search typed or entered."""
+        return next((h for h in reversed(self.history) if h.get("kind") not in {"wait", "scroll", "skip"}), None)
+
+    def opened_question(self):
+        """The question of the list the last step opened, whose options carry no question of their own (Workday's sit
+        in a pop-up at the page's end, under its footer's "Follow Us"): a "Select One" dropdown's, or the search box
+        typed in ("Please specify your Citizenship Status" for "Citizen (India)"); else None."""
+        opened = next((h for h in reversed(self.history) if h.get("kind") == "click"
+                       and planner.SHOWS_NOTHING.search(str(h.get("action") or ""))), None)  # fmt: skip
+        last = next((h for h in reversed(self.history) if h.get("kind") not in {"wait", "scroll"}), None)
+        if last and last.get("kind") in {"fill", "enter"}:
+            return re.sub(r"^Press Enter in '(.*)'$", r"\1", str(last.get("action") or "")) or None
+        if not opened or last is not opened:
+            return None
+        # Its button names it ("Please specify your Country of Birth Select One"), sharper than any context
+        named = planner.SHOWS_NOTHING.sub("", str(opened.get("action") or "")).strip()
+        return named or opened.get("context") or None
 
     def group_of(self, action):
         """The other options of the question an option belongs to (same dropdown, or same question context)."""
         if action["kind"] == "select":
             return [a for a in self.page["actions"] if a["kind"] == "select" and a.get("node") == action.get("node")]
+        if action.get("role") == "option":
+            # The open list's options (Workday's carry no question; the one clicked is given its dropdown's)
+            return [a for a in self.page["actions"] if a["kind"] == "click" and a.get("role") == "option"
+                    and (a.get("context") or "") in {"", action.get("context") or ""}]  # fmt: skip
         return [a for a in self.page["actions"] if a["kind"] == "click" and a.get("context") == action.get("context")]
 
     def looks_final(self, action):
@@ -349,7 +556,20 @@ class Agent:
                 self.status = "review"
                 return
         else:
-            self.via_rule = self.matches_profile(action) or self.consents(action)
+            if self.list_option(action) and self.opened_question():
+                # An option of the dropdown just opened is judged with its question ("Yes, I do" to "Please confirm
+                # if you have a valid PAN card"), not with the footer it happens to sit under.
+                action = {**action, "context": self.opened_question()}
+            # Opening a "Select One" dropdown answers nothing (the option clicked next is the answer, and that one
+            # must come from your profile): a sensitive question's dropdown may be opened.
+            opens = action.get("role") == "button" and bool(planner.SHOWS_NOTHING.search(action.get("label", "")))
+            # A cookie banner's Accept (as you asked) or Decline only closes it and says nothing about you, though
+            # its text speaks of "consent" (Maersk's banner covered Continue Application).
+            label = action.get("label", "")
+            cookies = bool(planner.ACCEPT_COOKIES.search(label) or planner.COOKIES.search(label)) and bool(re.search(
+                r"cookie|tracking|consent manager|privacy preference",
+                f"{action.get('label', '')} {action.get('context', '')}", re.I))  # fmt: skip
+            self.via_rule = self.matches_profile(action) or self.consents(action) or opens or cookies
             if not self.confirm(action, d, low, f"Click '{action['label']}'"):
                 return
         self.execute(action, d)
@@ -391,6 +611,18 @@ class Agent:
             if q.get("question") and not any(same_question(q["question"], e["question"]) for e in entries):
                 entries.append({"question": q["question"], "options": q.get("options", []), "urls": [self.page["url"]]})
         return entries
+
+    def applied_here(self):
+        """Did you send an application on this company's site before (applied.json: same host, submitted/applied)?"""
+        from urllib.parse import urlparse
+
+        host = (urlparse(self.start_url).hostname or "").lower()
+        path = self.applied_path()
+        if not host or not path or not path.is_file():
+            return False
+        return any((urlparse(e.get("url") or "").hostname or "").lower() == host
+                   and re.search(r"submit|applied", str(e.get("status") or ""), re.I)
+                   for e in applied.read(path).values())  # fmt: skip
 
     def applied_path(self):
         folder = self.profile.questions_path.parent if self.profile.questions_path else None
@@ -504,19 +736,60 @@ class Agent:
             self.execute(action, d, source="choice", shown=option, expected=option, multiple=action.get("multiple"))
 
     def do_fill(self, action, d, low):
+        if one_time_code(f"{self.question(action)} {action.get('context') or ''}"):
+            # A code the site just sent you: yours to type in the tab, never asked in QUESTIONS.md or kept.
+            if self.unattended and self.wait_for_code():
+                return
+            self.skipped.add(self.here(action))
+            self.handover("The site sent you a verification code (e-mail or SMS): type it in the tab.")
+            return
         if self.policy.never_fill(action):
             self.skipped.add(self.here(action))
             self.handover(f"'{self.question(action)}' is on your never-fill list. Fill it yourself if it's needed.")
             return
-        resolved = self.resolve_text(action)
+        if action.get("retype"):
+            # Your school's name cut shorter (planner.shorter_name of what was typed from your profile): same fact.
+            resolved = (action["retype"], "profile")
+        else:
+            resolved = self.resolve_text(action)
         if resolved is None:
             return
         text, source = resolved
         checked = source in {"you", "draft"}  # you already saw this exact value
         if checked or self.confirm(action, d, low, f"Type {text!r} into '{self.question(action)}'"):
+            whole = self.whole_date(action, text)
+            if whole:
+                # Workday's MM / DD / YYYY boxes move on by themselves as each part is complete: the whole date typed
+                # key by key from the first box, as a person does (typing each box apart spilled into the next).
+                self.execute({**action, "masked": True}, d, text=whole, source=source, shown=whole, expected=text)
+                return
             self.execute(
                 action, d, text=text, source=source, shown=text, expected=text, multiple=action.get("multiple")
             )
+
+    def whole_date(self, action, text):
+        """The digits of a whole date when `action` is the first of a date's empty part boxes ("Month", "Day",
+        "Year" under one question): "10262026" for Month 10, Day 26, Year 2026. None otherwise."""
+        part = re.compile(r"\s*(month|day|year|mm|dd|yyyy)\s*\*?\s*", re.I)
+        if not part.fullmatch(action.get("label") or "") or action.get("value"):
+            return None
+        boxes = [a for a in self.page["actions"] if a["kind"] == "fill" and part.fullmatch(a.get("label") or "")
+                 and a.get("context") == action.get("context") and a.get("section") == action.get("section")]  # fmt: skip
+        boxes.sort(key=lambda a: ((a.get("rect") or {}).get("x", 0), a.get("node") or 0))
+        if len(boxes) < 2 or boxes[0].get("node") != action.get("node") or any(a.get("value") for a in boxes):
+            return None
+        digits = []
+        for box in boxes:
+            value = text if box is boxes[0] else None
+            if value is None:
+                choice = rules.match(box, self.profile, False, (), self.page.get("text", ""))
+                fact = self.profile.by_id.get(choice) if choice else None
+                value = rules.fit(fact, box, self.profile) if fact else None
+            width = 4 if re.match(r"\s*(year|yyyy)", box["label"], re.I) else 2
+            if not value or not str(value).isdigit():
+                return None
+            digits.append(str(value).zfill(width))
+        return "".join(digits)
 
     def do_date(self, action, d, low):
         if self.policy.never_fill(action):
@@ -717,6 +990,14 @@ class Agent:
             elif action["kind"] == "click" and action.get("context"):
                 nodes = {a.get("node") for a in self.page["actions"] if a.get("context") == action["context"]}
                 self.skipped_questions.setdefault((self.page.get("doc"), action["context"]), set()).update(nodes)
+                # and its "Select One" dropdown is not opened again for nothing: the one sharing its question, or
+                # (an option of the list just opened) the one that opened it, whose label names the question itself
+                opened = self.opener() if self.list_option(action) else None
+                for a in self.page["actions"]:
+                    by_label = opened and opened.get("kind") == "click" and a["label"] == opened.get("action")
+                    if planner.SHOWS_NOTHING.search(a.get("label", "")) and (a.get("context") == action["context"]
+                                                                             or by_label):  # fmt: skip
+                        self.vetoed.add((*self.here(a), a["label"]))
         elif not reasons or self.ui.approve(what, ", ".join(reasons)):
             return True
         self.vetoed.add((*self.here(action), action["label"]))
@@ -745,6 +1026,7 @@ class Agent:
             "kind": action["kind"],
             "operation": d["operation"],
             "section": action.get("section"),
+            "field_id": action.get("field_id"),  # the field's stable name (Workday), for the options it opens
             "chat": bool(action.get("chat")),  # a chat questionnaire's answer: its Save comes next
             "source": source,
             "operation_probability": d["operation_probability"],
@@ -757,10 +1039,37 @@ class Agent:
         self.history.append(entry)
         return entry
 
+    @staticmethod
+    def plain_box(action):
+        """A text box that only holds what is typed: no suggestion list, no tags, no search behind it."""
+        words = f"{action.get('label') or ''} {action.get('context') or ''}"
+        return (
+            action.get("role") in {"textbox", "spinbutton"}
+            and not action.get("multiple")
+            and not planner.is_prompt(action)
+            and not planner.LOOKUP.search(words)
+            and action.get("input_type") not in {"textarea", None}
+        )
+
     def execute(
         self, action, d, *, text=None, value=None, files=None, source=None, shown=None, expected=None, multiple=False
     ):
         self.browser.act(action, self.page, text=text, value=value, files=files)
+        if action["kind"] == "fill" and self.plain_box(action):
+            # Workday takes a typed value into its form only when focus leaves the box: pressed Save straight
+            # after typing, it says "Phone Number is required". Search and lookup boxes keep focus (their list).
+            try:
+                self.browser.evaluate("document.activeElement?.blur?.(), true")
+            except (StalePage, RuntimeError):
+                pass
+        # A person's pace (policy.pace_s): the site draws what changed before the next look (waits and scrolls aside).
+        if action["kind"] not in {"wait", "scroll"}:
+            advancing = action["kind"] == "click" and planner.ADVANCE.search(action.get("label", ""))
+            time.sleep(self.policy.pace_after_next_s if advancing else self.policy.pace_s)
+            if not advancing:
+                # Something new answered (MKS: its terms box, ticked after Save had been pressed three times): Save /
+                # Next given up on this page may be tried again.
+                self.vetoed = {v for v in self.vetoed if not planner.ADVANCE.search(str(v[-1]))}
         self.pending = None
         entry = self.log(action, d, source)  # logged before observing, so a navigation can't erase it
         if text is not None:
@@ -792,9 +1101,17 @@ class Agent:
             self.no_review.clear()  # a new step: its required fields are checked afresh
         if fill:
             self.verify(fill)
+        elif action["kind"] in {"enter", "click"}:
+            self.recheck_prompts(action)
         self.track_items()
         recent = self.history[-3:]
-        if len(recent) == 3 and all(h["page_changed"] is False and h["kind"] != "wait" for h in recent):
+        # Stuck only when a Save / Next among them didn't move the page either: typing a value the field already
+        # held changes nothing, and the run should go on to Save rather than stop.
+        if (
+            len(recent) == 3
+            and all(h["page_changed"] is False and h["kind"] != "wait" for h in recent)
+            and any(h["kind"] == "click" and planner.ADVANCE.search(str(h.get("action") or "")) for h in recent)
+        ):
             self.handover("Three actions in a row changed nothing on the page.")
 
     def stay_on_job(self):
@@ -822,12 +1139,50 @@ class Agent:
         if not same:
             return  # moved to another page/step; the value can't be re-read here
         current = same[0].get("current_value" if fill["kind"] == "select" else "value", "")
+        if not str(current).strip() and same[0].get("role") == "spinbutton" and fill["kind"] == "fill":
+            # Workday's Month box redraws as focus jumps to its Year: read it once more before calling it empty
+            # (typing it again would send the digits into the Year box).
+            time.sleep(0.6)
+            try:
+                self.page = self.browser.observe()
+            except StalePage:
+                return
+            again = [a for a in self.page["actions"] if a.get("node") == fill["node"]]
+            current = again[0].get("value", "") if again else current
         expected = fill["expected"]
         contains = fill["kind"] == "upload" or fill["multiple"]  # one of several files / selected options
         ok = norm(expected) in norm(current) if contains else norm(current) == norm(expected)
+        if not ok and re.fullmatch(r"\d{1,4}", str(expected).strip()) and re.fullmatch(r"\d{1,4}", str(current).strip()):
+            ok = int(expected) == int(current)  # Workday shows month "04" as "4"
+        if not ok and fill["kind"] == "fill" and planner.is_prompt(same[0]):
+            # A search prompt (Workday) empties its box and shows the pick beside it: "1 item selected, LinkedIn".
+            if self.prompt_picked(fill, same[0]):
+                ok = True
+            elif not norm(current):
+                fill["confirmed"] = None  # not chosen yet: judged again after its Enter or its list
+                return
         fill["confirmed"] = ok
         if not ok:
             self.ui.event(f"'{fill['label'][:50]}' now shows {current!r}, expected {expected!r}")
+
+    def prompt_picked(self, fill, field):
+        """Does a search prompt show the typed value as chosen ("1 item selected, LinkedIn", or its chip)?"""
+        shown = norm(" ".join([field.get("context") or ""] + [
+            a["label"] for a in self.page["actions"]
+            if a.get("role") == "option" and "press delete" in a["label"].lower()  # Workday's chosen-item chip
+        ]))  # fmt: skip
+        return bool(norm(fill["expected"])) and norm(fill["expected"]) in shown and (
+            bool(planner.SELECTED.search(field.get("context") or "")) or "press delete" in shown
+        )
+
+    def recheck_prompts(self, action):
+        """After Enter in (or a pick from) a search prompt: the fills still waiting there are read back now."""
+        for fill in self.fills:
+            if fill.get("confirmed") is not None or fill.get("doc") != self.page.get("doc"):
+                continue
+            field = next((a for a in self.page["actions"] if a.get("node") == fill["node"]), None)
+            if field and (action.get("node") == fill["node"] or action.get("role") == "option"):
+                fill["confirmed"] = self.prompt_picked(fill, field) or None
 
     def track_items(self):
         """Typing into a tag field only counts once the item shows up as added (a chip) in the field's context."""
@@ -898,16 +1253,316 @@ class Agent:
                     continue
         return False
 
+    def sign_in_with_password(self):
+        """At a portal's own sign-in: sign in with your profile's e-mail and JEV_PORTAL_PASSWORD, or create the
+        account first (accounts.py reads the page; the agent types only those two and ticks the terms box of a
+        sign-up form). True once past the sign-in; False hands over (or waits) as before. A refused sign-in, or
+        the same step twice, ends it: never retried, so no account gets locked."""
+        from . import accounts
+
+        secret = accounts.password()
+        fact = self.profile.facts.get("personal.email")
+        email = (fact.value if fact else "").strip()
+        if not secret or not email:
+            return False
+        start = self.page["url"]
+        known = accounts.book(self.profile).get(accounts.site(start), {})
+        done, signed_up, signing_up, waits, scrolls, typed = set(), False, False, 0, 0, set()
+        verified = False  # the e-mailed verification link was opened in this sign-in
+        for _ in range(30):
+            page = self.page
+            _, boxes, _, _ = accounts.fields(page)
+            if not planner.sign_in_wall(page) and not boxes:
+                now = datetime.now().isoformat(timespec="seconds")
+                created = now if signed_up and not known.get("created") else known.get("created")
+                accounts.note(self.profile, start, email=email, last_sign_in=now, created=created)
+                self.ui.event("signed in with your portal account: continuing")
+                return True
+            text = page.get("text") or ""
+            if signed_up and accounts.TAKEN.search(text) and not known.get("created"):
+                # The portal says this e-mail has an account already: sign in to it from now on.
+                known = {**known, "created": "existing"}
+                accounts.note(self.profile, start, email=email, created="existing")
+            # Workday may show its sign-in form again with a "verify your e-mail" note once the account is made.
+            # ... or ask for it at its sign-in, later, for an account made before ("Verify your account before you
+            # sign in"): the link from your e-mail, once.
+            if accounts.VERIFY.search(text) and not verified and (not boxes or signed_up or known.get("created")):
+                # The account exists now, whatever happens next: sign in, not up, next time.
+                if signed_up:
+                    accounts.note(
+                        self.profile, start, email=email, created=datetime.now().isoformat(timespec="seconds")
+                    )
+                verified = True
+                since = self.mail_since
+                try:  # the e-mail may have come during an earlier run: from the account's creation on
+                    since = min(since, datetime.fromisoformat(str(known.get("created"))).timestamp() - 300)
+                except ValueError:
+                    pass
+                link = self.mail("link", since=since)
+                if not link:
+                    self.ui.event("the portal wants its e-mail verified: waiting for that")
+                    return False
+                self.ui.event("opening the verification link from your e-mail")
+                try:
+                    self.browser.navigate(link)
+                    time.sleep(2)
+                    self.browser.navigate(start)  # back to the job: its sign-in now takes the verified account
+                    self.page = self.browser.observe()
+                except (StalePage, RuntimeError, ValueError):
+                    return False
+                self.history.append({"step": len(self.history) + 1, "action": "opened the e-mail verification link",
+                                     "kind": "handover", "context": "portal account", "source": "gmail",
+                                     "url": start, "page_changed": True})  # fmt: skip
+                known = {**known, "created": known.get("created") or "verified"}
+                done.clear()  # a new page after the link: its sign-in steps are new too
+                signed_up = signing_up = False
+                typed.clear()
+                continue
+            step = accounts.plan(
+                page, bool(known.get("created")), tried_sign_up=signed_up, sign_up_form=signing_up and not signed_up,
+                passwords_typed=len(typed), looked=scrolls > 0,
+            )
+            if step[0] == "stop":
+                self.ui.event(f"portal sign-in: {step[1]}")
+                return False
+            kind, target = step[0], step[1]
+            if kind == "wait":
+                waits += 1
+                if waits > 4:
+                    self.ui.event(f"portal sign-in: {step[2]}")
+                    return False
+                accounts.leave_box(self.browser)
+                time.sleep(1)
+                try:
+                    self.page = self.browser.observe()
+                except StalePage:
+                    pass
+                continue
+            if kind == "scroll":  # a pop-up form cut short by the window: down to the rest of it
+                scrolls += 1
+                if scrolls > 8:
+                    self.ui.event("portal sign-in: the form's button never came into view")
+                    return False
+                try:
+                    self.browser.act(target, page)
+                    self.page = self.browser.observe()
+                except (ExecutionUncertain, StalePage, ValueError):
+                    pass
+                continue
+            key = (page["url"], kind, target["label"], target.get("node"))
+            if key in done:
+                return False  # the same step again: the page isn't taking it
+            done.add(key)
+            text = (email if step[2] == "email" else secret) if kind == "fill" else None
+            try:
+                self.browser.act(target, page, text=text) if text else self.browser.act(target, page)
+            except (ExecutionUncertain, StalePage, ValueError):
+                return False
+            if kind == "fill":
+                accounts.leave_box(self.browser)
+                if step[2] == "password":
+                    typed.add(target.get("node"))
+            if kind == "switch":  # the other form: its boxes are new
+                typed.clear()
+            signing_up = (signing_up or len(boxes) >= 2) and kind != "switch"
+            signed_up = signed_up or (kind == "click" and step[2] == "sign up")
+            shown = {"fill": email if text == email else "********"}.get(kind)  # the password is never written down
+            self.history.append({"step": len(self.history) + 1, "action": f"{kind}: {target['label'][:60]}",
+                                 "kind": "fill" if kind == "fill" else "click", "typed": shown,
+                                 "context": "portal account", "source": "portal account", "url": page["url"],
+                                 "page_changed": None})  # fmt: skip
+            # A sign-in (or Create Account) navigates, and Workday takes a few seconds: until the page changes.
+            settle = 12 if kind == "click" else 1
+            deadline = time.monotonic() + settle
+            while True:
+                time.sleep(0.8 if kind in {"fill", "tick"} else 1.5)
+                try:
+                    self.page = self.browser.observe()
+                except StalePage:
+                    if time.monotonic() < deadline + 6:
+                        continue
+                    return False
+                moved = self.page.get("fingerprint") != page.get("fingerprint")
+                if kind != "click" or moved or time.monotonic() > deadline:
+                    break
+        return False
+
+    # ---- the bubble in the tab (helper.py) -------------------------------------------------------------------
+
+    def show_helper(self, status, **state):
+        """What the bubble says: what the run is doing, or what it waits for (and the questions, to answer there)."""
+        put = getattr(self.browser, "helper_state", None)
+        if put:
+            put({"status": status, "paused": self.paused, **state})
+
+    def helper_check(self):
+        """Your presses in the bubble. Pause holds the run here until Resume (or Continue); Skip ends the job
+        (Skipped); answers typed there are saved like answers in Questions. Returns whether you pressed Continue."""
+        drain = getattr(self.browser, "helper_events", None)
+        if not drain:
+            return False
+        pressed, told = False, False
+        while True:
+            for event in drain():
+                kind = event.get("type")
+                if kind == "pause":
+                    self.paused = True
+                elif kind in {"resume", "continue"}:
+                    self.paused, pressed = False, pressed or kind == "continue"
+                elif kind == "skip":
+                    raise Skipped()
+                elif kind == "answers":
+                    self.save_answers(event.get("answers") or {})
+                    pressed = True
+            if not self.paused:
+                if told:
+                    self.ui.event("resumed by you")
+                return pressed
+            if not told:
+                self.show_helper("Paused. Nothing happens until you press Resume.")
+                self.ui.event("paused by you")
+                told = True
+            time.sleep(1)
+
+    def save_answers(self, answers):
+        """Answers you typed in the bubble, into QUESTIONS.md (every later form reuses them, as from the app)."""
+        from . import inbox
+
+        path = self.profile.questions_path
+        if not path or not answers:
+            return
+
+        def change(entries):
+            for question, answer in answers.items():
+                entry = next((e for e in entries if same_question(e["question"], question)), None)
+                if entry is None:
+                    entry = {"question": question, "options": [], "urls": [self.page["url"]], "answer": ""}
+                    entries.append(entry)
+                entry["answer"] = " ".join(str(answer).split())
+
+        inbox.update(path, change)
+
+    def askable(self, question):
+        """A question for QUESTIONS.md: not a code the site just sent (typed in the tab, never kept) and not a
+        field on your never-fill list."""
+        return not not_a_question(question) and not self.policy.never_fill({"label": question, "context": ""})
+
     def open_questions(self):
         """The required questions this page still needs and nothing on file answers, once each."""
         out, seen = [], set()
         for entry in self.inbox + self.unanswered_entries():
             question = entry["question"]
-            if question in seen or self.profile.saved_answer(question):
+            if question in seen or self.profile.saved_answer(question) or not self.askable(question):
                 continue
             seen.add(question)
             out.append(entry)
         return out
+
+    def continue_token(self):
+        """A fresh token for a wait: the app's Continue button drops runs/continue/<token> to end it early."""
+        return uuid.uuid4().hex[:8]
+
+    def continued(self, token):
+        """You pressed Continue in the app for this wait (and the signal is used up)."""
+        flag = self.run_dir / "continue" / token
+        if not flag.exists():
+            return False
+        flag.unlink(missing_ok=True)
+        return True
+
+    def resume_page(self, what, context):
+        """Carry on with this form after you stepped in: offer again what was set aside, and log it."""
+        self.skipped.clear()
+        self.vetoed.clear()
+        self.skipped_questions.clear()
+        self.no_review.clear()
+        self.left = [x for x in self.left if x.get("url") != self.page["url"]]
+        if getattr(self.ui, "stopped", None):
+            self.ui.stopped = None
+        self.history.append(
+            {
+                "step": len(self.history) + 1,
+                "action": what,
+                "kind": "handover",
+                "context": context[:160],
+                "source": "you",
+                "page_changed": None,
+                "url": self.page["url"],
+            }
+        )
+        self.status = "ready"
+
+    def mail(self, want, timeout=150, since=None):
+        """The newest code ("code") or verification link ("link") this portal e-mailed since the wait began (or
+        `since`), from your Gmail (gmail.py, read-only), or None when Gmail isn't connected or nothing came."""
+        from . import gmail
+
+        folder = self.profile.questions_path.parent if self.profile.questions_path else None
+        if not self.policy.email_codes or not folder or not gmail.configured(folder):
+            return None
+        self.show_helper(f"Reading the {'code' if want == 'code' else 'verification link'} from your e-mail…")
+        start = self.mail_since if since is None else since
+        return gmail.wait_for(folder, start, self.page["url"], want, timeout=timeout)
+
+    def type_mailed_code(self):
+        """A code box (or one box per digit): the code from your e-mail typed in. True once it's in."""
+        boxes = [a for a in self.page["actions"] if a["kind"] == "fill" and one_time_code(self.question(a))]
+        empty = [a for a in boxes if not a.get("value")]
+        if not empty:
+            return False
+        code = self.mail("code")
+        if not code:
+            return False
+        parts = list(code) if len(empty) == len(code) and len(empty) > 1 else [code]
+        for box, part in zip(empty, parts):
+            try:
+                self.browser.act(box, self.page, text=part)
+            except (ExecutionUncertain, StalePage, ValueError):
+                return False
+        self.history.append({"step": len(self.history) + 1, "action": "typed the e-mailed verification code",
+                             "kind": "fill", "typed": "******", "context": "verification code", "source": "gmail",
+                             "url": self.page["url"], "page_changed": None})  # fmt: skip
+        try:
+            self.page = self.browser.observe()
+        except StalePage:
+            pass
+        self.resume_page("Typed the code from your e-mail", "verification code")
+        self.ui.event("code typed from your e-mail: carrying on")
+        return True
+
+    def wait_for_code(self):
+        """Unattended, at a box for a code the site just sent you (e-mail or SMS verification): alert you, show the
+        tab and wait (login_wait_s) for you to type it there. Codes are new every time, so they never go to
+        QUESTIONS.md. True once the code boxes are filled or gone, or you press Continue in the app."""
+        wait = self.policy.login_wait_s
+        if wait <= 0:
+            return False
+        self.browser.show()
+        token = self.continue_token()
+        self.ui.event(
+            f"\a!!! waiting for you to enter the verification code in the open tab (up to {max(1, wait // 60)} min) "
+            f"[continue {token}]: {self.page['url'][:100]}"
+        )
+        if self.type_mailed_code():
+            return True
+        deadline = time.monotonic() + wait
+        self.show_helper(
+            "Type the verification code the site sent you (e-mail or SMS), then it carries on.", waiting=True
+        )
+        while time.monotonic() < deadline:
+            time.sleep(3)
+            done = self.continued(token) or self.helper_check()
+            try:
+                self.page = self.browser.observe()
+            except StalePage:
+                continue  # the site is checking the code
+            boxes = [a for a in self.page["actions"] if a["kind"] == "fill" and one_time_code(self.question(a))]
+            if done or not boxes or all(a.get("value") for a in boxes):
+                self.resume_page("The candidate entered the verification code", "verification code")
+                self.ui.event("code entered: carrying on")
+                return True
+        self.ui.event("no code entered in time: the job stops here")
+        return False
 
     def answers_given(self, entries):
         """{question: your answer} for those of `entries` answered in QUESTIONS.md so far."""
@@ -921,6 +1576,32 @@ class Agent:
                 if wanted["question"] not in found and same_question(entry["question"], wanted["question"]):
                     found[wanted["question"]] = entry["answer"]
         return found
+
+    def consult_teacher(self):
+        """The teacher (teacher.py) answers what it can of this page's open questions from your profile. Any answer:
+        it is used like a saved answer, and the run carries on with this form (True). The rest go to you."""
+        from . import teacher
+
+        if not self.policy.teacher or self.teacher_rounds >= ANSWER_ROUNDS or not teacher.available():
+            return False
+        try:
+            self.page = self.browser.observe()
+        except StalePage:
+            pass
+        entries = self.open_questions()
+        if not entries:
+            return False
+        self.teacher_rounds += 1
+        self.show_helper(f"Working out {len(entries)} question(s) from your profile…")
+        given = teacher.ask(entries, self.profile, self.page["url"], self.run_dir)
+        if not given:
+            return False
+        self.profile.saved.update(given)
+        self.asked += [{"question": q, "answered": True, "saved": True, "source": "teacher"} for q in given]
+        self.inbox = [e for e in self.inbox if e["question"] not in given]
+        self.ui.event(f"teacher answered {len(given)} of {len(entries)} from your profile: carrying on")
+        self.resume_page(f"The teacher answered {len(given)} question(s) from the profile", " | ".join(given)[:160])
+        return True
 
     def wait_for_answers(self):
         """Unattended, about to stop on questions only you can answer: put them in QUESTIONS.md now, then wait
@@ -940,37 +1621,33 @@ class Agent:
         self.answer_rounds += 1
         self.profile.add_pending(entries)
         asked = " | ".join(e["question"][:80] for e in entries)
-        self.ui.event(f"waiting for your answers (up to {max(1, wait // 60)} min, in Questions): {asked}")
+        token = self.continue_token()
+        self.ui.event(
+            f"waiting for your answers (up to {max(1, wait // 60)} min, in Questions) [continue {token}]: {asked}"
+        )
         deadline = time.monotonic() + wait
+        self.show_helper(f"Waiting for your answer{'s' if len(entries) > 1 else ''}: answer here or in the app.",
+                         waiting=True, questions=[{"question": e["question"], "options": e.get("options") or []}
+                                                  for e in entries])  # fmt: skip
         while time.monotonic() < deadline:
             time.sleep(3)
+            pressed_here = self.helper_check()  # answers typed in the bubble are saved before they're read below
             given = self.answers_given(entries)
-            if len(given) < len(entries):
+            # All answered, or you pressed Continue (you filled them on the page yourself, or want it to try again).
+            pressed = self.continued(token) or (pressed_here and len(given) < len(entries))
+            if len(given) < len(entries) and not pressed:
                 continue
             self.profile.saved.update(given)  # your answers, typed by you: used as saved answers from here on
             self.asked += [{"question": q, "answered": True, "saved": True} for q in given]
-            # What was set aside on this page was set aside for want of these answers: offer it all again.
-            self.skipped.clear()
-            self.vetoed.clear()
-            self.skipped_questions.clear()
-            self.no_review.clear()
             self.inbox = [e for e in self.inbox if e["question"] not in given]
-            self.left = [x for x in self.left if x.get("url") != self.page["url"]]
-            if getattr(self.ui, "stopped", None):
-                self.ui.stopped = None
-            self.history.append(
-                {
-                    "step": len(self.history) + 1,
-                    "action": f"The candidate answered {len(given)} question(s)",
-                    "kind": "handover",
-                    "context": asked[:160],
-                    "source": "you",
-                    "page_changed": None,
-                    "url": self.page["url"],
-                }
-            )
-            self.status = "ready"
-            self.ui.event("answered: carrying on with this form")
+            # What was set aside on this page was set aside for want of these answers: offer it all again.
+            what = f"The candidate answered {len(given)} question(s)" + (" and pressed Continue" if pressed else "")
+            try:
+                self.page = self.browser.observe()  # you may have typed on the page itself
+            except StalePage:
+                pass
+            self.resume_page(what, asked)
+            self.ui.event("answered: carrying on with this form" if not pressed else "continuing: you said go ahead")
             return True
         self.ui.event("no answer in time: the job stops here, and can be re-run once you answer")
         return False
@@ -984,7 +1661,7 @@ class Agent:
         self.browser.show()
         self.ui.event(
             f"\a!!! LOGIN NEEDED: sign in (or create your account) in the open tab: {self.page['url'][:120]}  "
-            f"Waiting up to {wait // 60} min; the agent never types into a login page."
+            f"Waiting up to {wait // 60} min (with 'Sign in / sign up on portals' on, it signs in itself where it can)."
         )
         deadline = time.monotonic() + wait
         while time.monotonic() < deadline:
@@ -1010,6 +1687,11 @@ class Agent:
         return False
 
     def handover(self, reason, observe=True):
+        # Not the Save / Next already given up on here: what it is waiting for
+        if self.unattended and self.rescue(reason, avoid=[v[-1] for v in self.vetoed]):
+            return  # Claude found the next step on this page: the run goes on
+        if getattr(self, "rescue_why", ""):
+            reason = f"{reason} Claude: {self.rescue_why}"
         self.browser.show()
         self.handovers.append({"reason": reason, "url": self.page["url"]})
         if not self.ui.handover(reason):
@@ -1027,6 +1709,129 @@ class Agent:
         )
         if observe:
             self.reobserve()
+
+    def job_in_your_country(self):
+        """Your country when the job's address or page names it, your city or a place you'd work in (for India
+        also its main cities): "eligible to work in the country of this position" then has your answer. Else None
+        (a job elsewhere: that question is yours)."""
+        country = getattr(self.profile.by_id.get(safe_id("personal.country")), "value", "") or ""
+        if not country:
+            return None
+        places = {country}
+        for key, fact in self.profile.facts.items():
+            if key == "personal.city" or key.startswith("preferences.preferred_locations"):
+                places.update(p.strip() for p in re.split(r"[,;/]", fact.value) if p.strip())
+        where = f"{self.start_url} {self.page.get('title', '')} {self.page.get('text', '')[:3000]}"
+        named = "|".join(rf"\b{re.escape(p)}\b" for p in places if len(p) >= 3)
+        if (named and re.search(named, where, re.I)) or (norm(country) == "india" and INDIAN_JOB.search(where)):
+            return country
+        return None
+
+    def exhausted_reason(self, reason):
+        """The planner's "no application form here" when the page does have fields, every one of them already tried
+        or left for you (Maersk, after its Save was given up on): say that, what was left and the site's errors."""
+        from . import teacher
+
+        if not reason or not reason.startswith("Nothing here leads to an application form"):
+            return reason
+        fields = [a for a in self.page["actions"] if a["kind"] in {"fill", "select", "setdate", "upload"}
+                  or (a["kind"] == "click" and a.get("role") in {"option", "checkbox", "radio"})]  # fmt: skip
+        here = [x["what"] for x in self.left if x.get("url") == self.page["url"]]
+        if not fields and not here:
+            return reason
+        errors = teacher.page_errors(self.page)[:3]
+        return (
+            "Everything the agent could do on this page was tried or left for you"
+            + (": " + "; ".join(dict.fromkeys(here[-4:])) if here else "")
+            + "." + (" The site says: " + " / ".join(errors) if errors else "")
+        )
+
+    def rescue(self, reason, avoid=()):
+        """About to stop, nobody watching: Claude (teacher.rescue) gets the page moving again, up to RESCUE_STEPS steps,
+        seeing after each what happened. Code checks every step (teacher.rescue, rescue_refusal): no submit,
+        text only a fact's value, a sensitive question only with your profile's answer. Three rescues at most in a
+        run, never a control in `avoid` (the one that just failed). True once a step was carried out (the run goes
+        on); False with Claude's reason in self.rescue_why (said in the handover)."""
+        from . import teacher
+
+        self.rescue_why = ""
+        if self.rescues >= 3 or not self.policy.teacher or not teacher.available():
+            return False
+        self.rescues += 1
+        self.show_helper("Stuck here: asking Claude to get the page moving…")
+        tried = []
+        for _ in range(RESCUE_STEPS):
+            try:
+                self.page = self.browser.observe()
+            except StalePage:
+                break
+            reply = teacher.rescue(self.page, self.history, self.profile, reason, self.policy, self.run_dir, avoid,
+                                   tried)  # fmt: skip
+            if reply.get("done"):
+                self.ui.event(f"Claude: fixed, carrying on ({reply.get('why', '')[:80]})")
+                if not tried:
+                    self.rescue_why = f"saw nothing left to fix here ({reply.get('why', '')[:120]})"
+                break
+            action = reply.get("action")
+            refusal = self.rescue_refusal(action, reply) if action else None
+            if not action or refusal:
+                tried.append({"did": action["label"][:70] if action else None,
+                              "result": f"refused: {refusal}" if refusal else reply.get("why", "")[:120]})  # fmt: skip
+                if action or reply.get("refused"):
+                    continue  # refused: Claude may find another way
+                self.rescue_why = reply.get("why", "")
+                break
+            text = reply.get("text")
+            self.ui.event(f"Claude's next step: {action['label'][:60]} ({reply.get('why', '')[:80]})")
+            operation = {"fill": "TYPE_TEXT", "select": "SELECT", "key": "KEY", "scroll": "SCROLL_DOWN"}
+            d = {"operation": operation.get(action["kind"], "CLICK"), "target": action.get("id"),
+                 "operation_probability": 1.0, "target_probability": 1.0, "latency_ms": 0}  # fmt: skip
+            before = self.page
+            try:
+                self.execute(action, d, text=text, source="teacher", shown=text, expected=text)
+            except (StalePage, ExecutionUncertain, ValueError) as error:
+                tried.append({"did": action["label"][:70], "result": f"failed: {error}"[:120]})
+                continue
+            moved = self.page.get("fingerprint") != before.get("fingerprint")
+            tried.append({"did": f"{action['kind']} {action['label'][:60]}", "typed": (text or "")[:40],
+                          "result": "page changed" if moved else "nothing changed",
+                          "errors_after": teacher.page_errors(self.page)[:5]})  # fmt: skip
+        else:
+            self.rescue_why = self.rescue_why or "five steps didn't get the page moving"
+        done = any(t["result"] in {"page changed", "nothing changed"} for t in tried)
+        self.rescue_log.append({"reason": reason[:160], "steps": [t.get("did") for t in tried], "helped": done,
+                                "why": "" if done else self.rescue_why[:200], "url": self.page.get("url")})  # fmt: skip
+        if done:
+            self.vetoed = {v for v in self.vetoed if not planner.ADVANCE.search(str(v[-1]))}  # Save may be tried again
+        elif not self.rescue_why:
+            self.rescue_why = "; ".join(str(t["result"]) for t in tried)[:200]
+        if not done:
+            self.rescue_log[-1]["why"] = self.rescue_why[:200]
+        return done
+
+    def rescue_refusal(self, action, reply):
+        """Why a step Claude proposed can't be taken here, or None. A sensitive question (your citizenship, a
+        consent) only with the answer your profile gives: the option your facts settle, the list's own wording of
+        the fact Claude names when that fact is the one the rules give this question, or a plain consent box.
+        Opening its dropdown answers nothing, so that may always be done."""
+        question = self.opened_question() if self.list_option(action) else None
+        judged = {**action, "context": question} if question else action
+        if not self.policy.sensitive(judged):
+            return None
+        if action.get("role") == "button" and planner.SHOWS_NOTHING.search(action.get("label") or ""):
+            return None  # opening a dropdown: the option clicked next is the answer
+        if self.matches_profile(judged) or self.consents(action):
+            return None
+        cited = str(reply.get("fact") or "")
+        asked = question or action["label"]
+        field = ({"label": question, "context": question, "field_id": (self.opener() or {}).get("field_id")}
+                 if question else {k: action.get(k) for k in ("label", "context", "section", "field_id")})  # fmt: skip
+        key = rules.key_for(field, self.profile, set(), page_text=self.page.get("text", ""))
+        if cited and cited in (key if isinstance(key, tuple) else (key,)) and cited in self.profile.facts:
+            # The fact the rules give this question, in the list's own words ("India" for nationality "Indian")
+            self.mapped.add((norm(asked), norm(planner.option_text(action))))
+            return None
+        return "a sensitive question that nothing on file answers this way"
 
     def finish(self):
         self.browser.show()
@@ -1047,6 +1852,12 @@ class Agent:
             "optional_skipped": self.optional_skipped,
             "handovers": self.handovers,
             "decisions": len(self.decisions),
+            # The latest decisions, with their targets: a loop that does nothing visible shows up here.
+            "decisions_tail": [
+                {**{k: v for k, v in x.items() if k != "url"},
+                 "label": next((a["label"][:60] for a in self.page.get("actions") or [] if a.get("id") == x.get("target")), None)}
+                for x in self.decisions[-30:]
+            ],  # fmt: skip
             "history": self.history,
             # The last page as the agent saw it (labels, not values), for fixing sites it can't handle yet.
             "last_page": [
@@ -1073,6 +1884,7 @@ class Agent:
                 for a in self.page["actions"]
             ],
             "path": str(folder / "report.json"),
+            "pages": str(self.recorder.folder) if self.recorder.count else None,  # kept for replay tests
         }
         if self.unattended and self.status != "submitted":
             self.inbox += self.unanswered_entries()
@@ -1083,12 +1895,17 @@ class Agent:
             for q in (h.get("action"), h.get("context"))
             if q
         ]
+        self.inbox = [e for e in self.inbox if self.askable(e["question"])]  # codes are typed in the tab, not kept
         report["pending_total"] = self.profile.add_pending(self.inbox, done)
         # The questions this job stopped on: once all are answered, the app offers to run it again.
         report["waiting_on"] = list(
             dict.fromkeys(e["question"] for e in self.inbox if not self.profile.saved_answer(e["question"]))
         )
         report["claude"] = self.claude
+        from . import metrics
+
+        report.update(metrics.tags(self.start_url, self.status, self.handovers, self.left))
+        report["rescues"], report["closest"] = self.rescue_log, self.closest_log
         if self.receipt:
             receipt = {k: v for k, v in self.receipt.items() if not k.startswith("_")}
             head = f"{receipt['at']}  {receipt['url']}\n{receipt['title']}\n\n"
@@ -1097,6 +1914,6 @@ class Agent:
                 (folder / "receipt.png").write_bytes(self.receipt["_png"])
                 receipt["screenshot"] = "receipt.png"
             report["receipt"] = {k: v for k, v in receipt.items() if k != "text"} | {"text": receipt["text"][:1500]}
-        Path(report["path"]).write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+        write_text(Path(report["path"]), json.dumps(report, indent=2, ensure_ascii=False))
         self.ui.review(report)
         return report

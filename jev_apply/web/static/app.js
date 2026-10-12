@@ -99,10 +99,11 @@ const STATUS = {
   submitted: "Submitted", applied: "Applied", review: "Left for you", ready_to_check: "Ready to check",
   ready_to_submit: "Submit yourself", stopped: "Stopped", failed: "Failed", deferred: "Deferred",
   running: "Running", waiting: "Waiting", not_run: "Not run", needs: "Needs you", closed: "Closed",
-  planning: "Planning", starting: "Starting", done: "Done",
+  planning: "Planning", starting: "Starting", done: "Done", already_applied: "Already applied",
 };
 function statusKey(s) {
   const t = String(s || "").toLowerCase();
+  if (t.startsWith("already applied")) return "already_applied";
   if (t.startsWith("submitted") || t.startsWith("applied")) return "submitted";
   if (t.startsWith("ready to submit")) return "ready_to_submit";
   return t.replace(/[^a-z]+/g, "_").replace(/^_|_$/g, "") || "waiting";
@@ -178,19 +179,48 @@ async function refreshShell() {
 
 // A run waiting for your answers: say so once per question set, here and as a desktop notification.
 function noticeWaiting(waiting) {
-  const key = waiting.map((w) => `${w.batch}:${w.n}:${w.questions.join("|")}`).join(";");
+  const key = waiting.map((w) => `${w.batch}:${w.n}:${w.kind}:${w.questions.join("|")}`).join(";");
   if (!key || key === state.waitingKey) { state.waitingKey = key || state.waitingKey; return; }
   state.waitingKey = key;
+  const first = waiting[0];
   const n = waiting.reduce((a, w) => a + w.questions.length, 0);
-  const text = `A run is waiting for your answer${n > 1 ? `s to ${n} questions` : ""}: ${waiting[0].questions[0]}`;
-  toast(`${text} (Questions)`, "var(--amber)");
+  const text = first.kind === "code"
+    ? "A run needs the verification code the site sent you: type it in the open Chrome tab."
+    : `A run is waiting for your answer${n > 1 ? `s to ${n} questions` : ""}: ${first.questions[0]}`;
+  const where = first.kind === "code" ? `#/batch/${first.batch}` : "#/questions";
+  toast(text, "var(--amber)");
   try {
     if (window.Notification && Notification.permission === "granted") {
-      const note = new Notification("jev-apply needs an answer", { body: text, tag: "jev-waiting" });
-      note.onclick = () => { window.focus(); location.hash = "#/questions"; };
+      const note = new Notification("jev-apply is waiting for you", { body: text, tag: "jev-waiting" });
+      note.onclick = () => { window.focus(); location.hash = where; };
     }
   } catch { /* notifications unavailable */ }
   if (onPage("questions") && !document.activeElement?.matches?.("input, textarea")) questions();
+}
+
+// A job waiting for you: what it needs (questions, or a code to type in the tab) and a way to say "go ahead".
+function waitBox(w, batch, n) {
+  const qs = w.questions || [];
+  return html`<div class="wait-box">
+    <div class="wait-title"><span class="chip s-review live"><i></i>Waiting for you</span></div>
+    ${w.kind === "code"
+      ? html`<p>Type the verification code the site sent you (e-mail or SMS) in the open Chrome tab. It's never saved.</p>`
+      : html`<p>${qs.length} question${qs.length === 1 ? "" : "s"} to answer:</p>
+        <ul>${qs.slice(0, 3).map((q) => html`<li title="${q}">${q}</li>`)}</ul>
+        ${qs.length > 3 ? html`<p class="faint">and ${qs.length - 3} more</p>` : ""}`}
+    <div class="wait-actions">
+      ${w.kind === "code" ? "" : html`<a class="btn sm" href="#/questions">${icon.chat}Answer</a>`}
+      <button class="btn sm primary" data-continue="${n}" data-batch="${batch}" title="You've handled it (answered, or typed it on the page yourself): the run carries on now">${icon.play}Continue</button>
+    </div>
+  </div>`;
+}
+
+async function pressContinue(button) {
+  button.disabled = true;
+  try {
+    await api(`/batches/${button.dataset.batch}/jobs/${button.dataset.continue}/continue`, { method: "POST" });
+    toast("Carrying on with that form.", "var(--green)");
+  } catch (e) { button.disabled = false; toast(e.message, "var(--red)"); }
 }
 
 function askNotifications() {
@@ -712,10 +742,10 @@ function confirmBatch(urls, title = "Start applying?") {
 
 // ---- batches --------------------------------------------------------------------------------------------------
 
-const OUTCOMES = [["submitted", "Submitted", "var(--green)"], ["review", "Left for you", "var(--amber)"], ["stopped", "Stopped", "var(--red)"], ["deferred", "Deferred / not run", "var(--gray)"]];
+const OUTCOMES = [["submitted", "Submitted", "var(--green)"], ["review", "Left for you", "var(--amber)"], ["stopped", "Stopped", "var(--red)"], ["deferred", "Skipped (applied before, closed, not run)", "var(--gray)"]];
 function outcome(counts, k) {
   const c = (x) => counts[x] || 0;
-  if (k === "deferred") return c("deferred") + c("not_run") + c("closed");
+  if (k === "deferred") return c("deferred") + c("not_run") + c("closed") + c("already_applied");
   if (k === "stopped") return c("stopped") + c("failed");
   if (k === "review") return c("review") + c("ready_to_submit") + c("ready_to_check");
   return c(k);
@@ -752,6 +782,7 @@ function batchDetail(id) {
     <a class="back" href="#/batch">← All batches</a>
     <div class="page-head" id="b-head"></div>
     <div class="grid g4" style="margin-bottom:16px" id="b-kpis"></div>
+    <div id="b-filter"></div>
     <div class="jobs" id="b-jobs"></div>
     <details class="card" style="margin-top:16px" ${state.consoleOpen ? "open" : ""} id="console-box">
       <summary style="cursor:pointer;font-weight:600">Live log <span class="faint" id="log-n"></span></summary>
@@ -764,6 +795,29 @@ function batchDetail(id) {
     if (e.target.closest("#stop")) modal(html`<h2 style="font-size:18px">Stop this batch?</h2><p class="muted">The job in progress stops where it is (nothing half-submitted is sent). Jobs not reached stay unapplied.</p>
       <div class="actions"><button class="btn ghost" data-close>Keep going</button><button class="btn danger" id="really">${icon.stop}Stop batch</button></div>`,
       (el, close) => ($("#really", el).onclick = async () => { await api(`/batches/${id}/stop`, { method: "POST" }); close(); toast("Batch stopped."); }));
+    const go = e.target.closest("[data-continue]");
+    if (go) return pressContinue(go);
+    const pickTrack = e.target.closest("[data-bt]"), pickState = e.target.closest("[data-bs]");
+    if (pickTrack || pickState) {
+      if (pickTrack) state.batchTrack = pickTrack.dataset.bt;
+      if (pickState) state.batchState = pickState.dataset.bs;
+      return patchBatch(b, [], false);
+    }
+    const drop = e.target.closest("[data-remove]");
+    const dropShown = e.target.closest("#remove-shown");
+    if (drop || dropShown) {
+      const jobs = drop ? [+drop.dataset.remove] : batchShown(b).filter((j) => j.state === "waiting").map((j) => j.n);
+      const go = async () => {
+        try {
+          const { removed } = await api(`/batches/${id}/remove`, { method: "POST", body: { jobs } });
+          toast(removed.length ? `Removed ${removed.length} job${removed.length > 1 ? "s" : ""} from this batch.` : "Nothing removed: those jobs have started.", removed.length ? "var(--green)" : "var(--amber)");
+        } catch (err) { toast(err.message, "var(--red)"); }
+      };
+      if (jobs.length === 1) return go();
+      return modal(html`<h2 style="font-size:18px">Remove ${jobs.length} jobs from this batch?</h2><p class="muted">They haven't started; the batch skips them. Jobs already done stay as they are.</p>
+        <div class="actions"><button class="btn ghost" data-close>Keep them</button><button class="btn danger" id="really-remove">${icon.x}Remove ${jobs.length}</button></div>`,
+        (el, close) => ($("#really-remove", el).onclick = () => { close(); go(); }));
+    }
     if (e.target.closest("#rerun")) {
       const urls = b.jobs.filter((j) => ["stopped", "failed", "review", "not_run"].includes(statusKey(j.state))).map((j) => j.url);
       if (!urls.length) return toast("Nothing to rerun: every job finished.", "var(--green)");
@@ -782,6 +836,26 @@ function batchDetail(id) {
   });
 }
 
+const BATCH_STATES = [["all", "All"], ["waiting", "Not started"], ["running", "Running"], ["done", "Finished"]];
+function batchStateOf(j) { return j.state === "waiting" ? "waiting" : j.state === "running" ? "running" : "done"; }
+function batchShown(b) {
+  const t = state.batchTrack || "all", s = state.batchState || "all";
+  return b.jobs.filter((j) => (t === "all" || (trackKey(j.track) || "none") === t) && (s === "all" || batchStateOf(j) === s));
+}
+function batchFilter(b) {
+  const tracks = {};
+  b.jobs.forEach((j) => { const k = trackKey(j.track) || "none"; tracks[k] = (tracks[k] || 0) + 1; });
+  if (state.batchTrack && state.batchTrack !== "all" && !tracks[state.batchTrack]) state.batchTrack = "all";
+  const t = state.batchTrack || "all", s = state.batchState || "all";
+  const shownWaiting = batchShown(b).filter((j) => j.state === "waiting").length;
+  const filtered = t !== "all" || s !== "all";
+  return html`<div class="batch-filter">
+    <div class="seg">${[["all", `All ${b.jobs.length}`], ...Object.entries(tracks).map(([k, n]) => [k, `${k === "none" ? "No résumé yet" : trackName(k)} ${n}`])].map(([k, l]) => html`<button data-bt="${k}" class="${t === k ? "on" : ""}">${l}</button>`)}</div>
+    <div class="seg">${BATCH_STATES.map(([k, l]) => html`<button data-bs="${k}" class="${s === k ? "on" : ""}">${l} <span class="faint">${k === "all" ? b.jobs.length : b.jobs.filter((j) => batchStateOf(j) === k).length}</span></button>`)}</div>
+    ${filtered && shownWaiting && !["done", "failed", "stopped"].includes(b.state) ? html`<button class="btn sm danger" id="remove-shown">${icon.x}Remove the ${shownWaiting} not started</button>` : ""}
+  </div>`;
+}
+
 function patchBatch(b, newLines, full) {
   const finished = ["done", "failed", "stopped"].includes(b.state);
   const counts = {};
@@ -797,7 +871,8 @@ function patchBatch(b, newLines, full) {
     <div style="display:flex;gap:8px">${finished ? html`<button class="btn" id="rerun">${icon.play}Rerun stopped jobs</button>` : html`<button class="btn danger" id="stop">${icon.stop}Stop</button>`}</div>`);
   setHtml($("#b-kpis"), html`${OUTCOMES.map(([k, l, c]) => html`
     <div class="card kpi" style="--kpi-glow:color-mix(in srgb, ${c} 25%, transparent)"><div class="label">${l}</div><div class="value" style="color:${c}">${outcome(counts, k)}</div></div>`)}`);
-  const byN = new Map(b.jobs.map((j) => [String(j.n), j]));
+  setHtml($("#b-filter"), batchFilter(b));
+  const byN = new Map(batchShown(b).map((j) => [String(j.n), { ...j, batch: b.id }]));
   reconcile($("#b-jobs"), [...byN.keys()], (k) => JSON.stringify(byN.get(k)), (k) => jobCard(byN.get(k)));
   const c = $("#console");
   if (c) {
@@ -817,16 +892,19 @@ function patchBatch(b, newLines, full) {
   }
 }
 
+// A job not yet named (its page hasn't been read): the site, not a long address.
+const hostOf = (url) => { try { return new URL(url).hostname.replace(/^www\./, ""); } catch { return String(url || "").slice(0, 40); } };
+
 function jobCard(j) {
   const k = statusKey(j.state);
   const last = (j.events || []).filter((e) => !/^(résumé|submitted|review|stopped|failed|deferred|ready to submit)\b/.test(e)).slice(-1)[0];
   return html`<div class="job ${k}">
-    <div class="top"><span class="n">#${j.n}</span>${statusChip(j.state, k === "running")}</div>
-    <div class="who">${j.title || j.url.replace(/^https?:\/\/(www\.)?/, "").slice(0, 60)}${j.company ? html`<small>${j.company}</small>` : ""}</div>
+    <div class="top"><span class="n">#${j.n}</span><span style="display:flex;gap:6px;align-items:center">${statusChip(j.state, k === "running")}${j.state === "waiting" && j.batch ? html`<button class="btn ghost sm icon-only" data-remove="${j.n}" title="Remove from this batch (it hasn't started)">${icon.x}</button>` : ""}</span></div>
+    <div class="who">${j.title || hostOf(j.url)}${j.company ? html`<small>${j.company}</small>` : ""}</div>
     <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">${j.track ? trackChip(j.track.includes("/") ? j.track : `data/${j.track}`) : ""}
       ${j.seconds ? html`<span class="chip plain">${j.seconds}s</span>` : ""}
       <a class="btn ghost sm" href="${safeUrl(j.url)}" target="_blank" rel="noopener" style="margin-left:auto">${icon.link}</a></div>
-    ${j.waiting ? html`<div class="needs waiting-answer">Waiting for your answer: ${j.waiting.split(" | ").join(" · ")} <a href="#/questions">Answer now →</a></div>`
+    ${j.waiting ? waitBox(j.waiting, j.batch, j.n)
       : j.needs ? html`<div class="needs">${j.needs}</div>` : last && k !== "waiting" ? html`<div class="ev">${last}</div>` : ""}
     ${j.result && !j.needs ? html`<div class="ev">${j.result}</div>` : ""}
   </div>`;
@@ -839,18 +917,25 @@ async function questions() {
   const [list, rerun, ov] = await Promise.all([api("/questions"), api("/rerun"), api("/overview")]);
   const waitingQs = (ov.waiting_for_answers || []).flatMap((w) => w.questions);
   const isWaiting = (q) => waitingQs.some((w) => q.question.startsWith(w.slice(0, 78)));
-  const open = list.filter((q) => !q.answer).sort((a, b) => isWaiting(b) - isWaiting(a)); // a waiting run first
+  // What a run waits for first, then the newest (older entries have no date: later in the file is newer).
+  const newest = (a, b) => String(b.added || "").localeCompare(String(a.added || "")) || b.index - a.index;
+  const open = list.filter((q) => !q.answer).sort((a, b) => isWaiting(b) - isWaiting(a) || newest(a, b));
+  const today = new Date().toISOString().slice(0, 10);
   const done = list.filter((q) => q.answer);
   const tab = state.qTab || "open";
   const shown = tab === "open" ? open : done;
   mount(main, html`
     <div class="page-head"><div><h1>Questions</h1><p class="sub">Answer once: every later form that asks the same question fills it itself.</p></div>
       <div class="seg" id="qtab"><button data-t="open" class="${tab === "open" ? "on" : ""}">Open <span class="faint">${open.length}</span></button><button data-t="bank" class="${tab === "bank" ? "on" : ""}">Answer bank</button></div></div>
-    ${waitingQs.length ? html`<div class="banner warn"><span>${icon.chat}</span><span><b>A run is waiting for ${waitingQs.length > 1 ? "these answers" : "this answer"}.</b> <span class="muted">Answer below and it carries on by itself.</span></span></div>` : ""}
+    ${(ov.waiting_for_answers || []).map((w) => html`<div class="banner warn waiting-banner"><span>${icon.chat}</span>
+      <span><b>${w.kind === "code" ? "A run needs a verification code" : `A run is waiting for ${w.questions.length > 1 ? "these answers" : "this answer"}`}</b>
+        <span class="muted">${w.company || w.title} · ${w.kind === "code" ? "type it in the open Chrome tab" : "answer below and it carries on by itself"}</span></span>
+      <button class="btn sm primary" data-continue="${w.n}" data-batch="${w.batch}" style="margin-left:auto" title="You've handled it: the run carries on now">${icon.play}Continue</button></div>`)}
     ${rerunBanner(rerun.jobs)}
     <div class="qs">${shown.length ? shown.map((q) => html`
       <div class="card q ${isWaiting(q) && !q.answer ? "waiting-q" : ""}" data-i="${q.index}" data-q="${q.question}">
-        ${isWaiting(q) && !q.answer ? html`<span class="chip s-review live" style="margin-bottom:8px"><i></i>A run is waiting for this</span>` : ""}
+        ${isWaiting(q) && !q.answer ? html`<span class="chip s-review live" style="margin-bottom:8px"><i></i>A run is waiting for this</span>`
+          : q.added && q.added.startsWith(today) && !q.answer ? html`<span class="chip fresh" style="margin-bottom:8px"><i></i>New today</span>` : ""}
         <div class="text">${q.question}</div>
         ${q.urls?.length ? html`<div class="muted" style="font-size:12.5px">Asked on ${q.urls.length} job${q.urls.length > 1 ? "s" : ""}: ${q.urls.slice(0, 3).map((u, i) => html`<a href="${safeUrl(u)}" target="_blank" rel="noopener">${i ? ", " : ""}${u.replace(/^https?:\/\/(www\.)?/, "").split("?")[0].slice(0, 46)}</a>`)}</div>` : ""}
         ${q.options?.length
@@ -859,6 +944,7 @@ async function questions() {
       </div>`) : html`<div class="card empty">${icon.check}${tab === "open" ? "No open questions. Every form can finish without you." : "No answers yet."}</div>`}</div>`);
   $$("#qtab button").forEach((b) => (b.onclick = () => { state.qTab = b.dataset.t; questions(); }));
   wireRerun(rerun.jobs);
+  $$("[data-continue]").forEach((b) => (b.onclick = () => pressContinue(b)));
   $$(".q").forEach((card) => {
     const save = async (answer) => {
       try {
