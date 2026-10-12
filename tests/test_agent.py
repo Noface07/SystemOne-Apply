@@ -507,6 +507,14 @@ def test_an_open_list_without_your_answer_as_written_gets_the_closest_option(mak
     assert agent.closest_pick(escape, agent.page) is None and len(asked) == 1  # once for these options
     agent.history.append({"kind": "click", "action": "Gender Select One", "context": "", "url": page["url"]})
     assert agent.closest_pick(escape, agent.page) is None and len(asked) == 1  # no fact: yours, never looked up
+    # Your answer written exactly as one option ("India", "Male"): picked with no Claude call
+    agent.mapped.clear()
+    agent.history.append({"kind": "click", "action": "Degree Select One Required", "context": "",
+                          "section": "Education 1", "url": page["url"]})  # fmt: skip
+    exact = options + [{"id": "o9", "node": 59, "kind": "click", "role": "option", "label": "B.Tech", "context": ""}]
+    agent.page = {**page, "actions": exact}
+    d = agent.closest_pick(escape, agent.page)
+    assert d["action"]["label"] == "B.Tech" and len(asked) == 1  # Claude not asked
     # A plain text box just typed into is no list's question, whatever list is open beside it
     agent.page = {**page, "actions": options + [{"id": "f1", "node": 70, "kind": "fill", "role": "textbox",
                                                  "label": "Degree", "value": "B.Tech"}]}  # fmt: skip
@@ -1284,9 +1292,18 @@ def test_a_verify_your_account_sign_in_opens_the_link_from_your_email(make_agent
     monkeypatch.setattr(agent, "mail", mail)
     opened = []
     monkeypatch.setattr(agent.browser, "navigate", lambda u: opened.append(u), raising=False)
+    # The activation page confirms the token after loading: the agent waits for its answer before leaving
+    monkeypatch.setattr(agent.browser, "evaluate", lambda js: "Your account has been verified.", raising=False)
     assert agent.sign_in_with_password()
     assert asked["want"] == "link" and asked["since"] < agent.mail_since  # back to the account's creation
     assert opened[0].endswith("/careers/activate/abc")
+    # Blue Yonder: a one-time link opened twice says "invalid token": the same link is never opened again
+    book = json.loads((tmp_path / "accounts.json").read_text(encoding="utf-8"))["acme.wd5.myworkdayjobs.com"]
+    assert book.get("link_used")
+    again = with_email(make_agent([verify], ui=UnattendedFakeUI(handover=False), portal_accounts=True))
+    monkeypatch.setattr(again, "mail", mail)
+    monkeypatch.setattr(again.browser, "navigate", lambda u: opened.append(u), raising=False)
+    assert not again.sign_in_with_password() and len(opened) == 2  # only the first run's link and its way back
 
 
 def test_a_refused_sign_in_is_never_retried(make_agent, monkeypatch):
@@ -1336,3 +1353,21 @@ def test_a_job_is_in_your_country_when_its_page_names_it_your_city_or_where_you_
     assert agent.job_in_your_country() == "India"
     agent.page = {**page, "title": "Software Engineer - Berlin", "text": "Our team in Berlin"}
     assert agent.job_in_your_country() is None  # a job elsewhere: eligibility there is yours to answer
+
+
+def test_after_signing_in_a_portal_home_page_leads_back_to_the_job(make_agent, monkeypatch):
+    """Blue Yonder: signed in, Workday showed "My Applications" instead of the job; Claude then wandered to Search
+    for Jobs. The agent goes back to the job link the run started from."""
+    job = "https://jda.wd5.myworkdayjobs.com/jda_careers/job/Hyderabad/Software-Engineer-II_263104"
+    home = {**make_page(), "url": "https://jda.wd5.myworkdayjobs.com/en-US/jda_careers/userHome", "actions": [
+        {"id": "b1", "node": 1, "kind": "click", "role": "button", "label": "Search for Jobs"}]}  # fmt: skip
+    agent = make_agent([home])
+    agent.start_url, agent.page = job, home
+    opened = []
+    monkeypatch.setattr(agent.browser, "navigate", lambda u: opened.append(u), raising=False)
+    agent.back_to_job()
+    assert opened == [job]
+    opened.clear()
+    agent.page = {**home, "url": job + "/apply/applyManually"}
+    agent.back_to_job()
+    assert opened == []  # already on the job's own pages

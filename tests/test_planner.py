@@ -1383,3 +1383,25 @@ def test_a_page_saying_you_applied_already_in_other_words_is_already_applied(lay
     for text in ("Thank you for applying! We will review your profile.", "You have already applied for this job.",
                  "We have received your application", "Your application has been submitted"):  # fmt: skip
         assert choose({**page(button(1, "View job")), "text": text})["reason"] == planner.ALREADY_APPLIED, text
+
+
+def test_a_portal_start_page_that_wants_an_account_first_is_a_sign_in(tmp_path):
+    """Blue Yonder: "Use My Last Application" led to /apply/useMyLastApplication showing only a Sign In button; it
+    wasn't seen as a sign-in, and the rescuer's "Apply Manually" was refused as a submit."""
+    from jev_apply import accounts
+    from jev_apply.policy import Policy
+
+    sign_in = {"id": "e1", "node": 1, "kind": "click", "role": "button", "label": "Sign In"}
+    url = "https://jda.wd5.myworkdayjobs.com/jda_careers/job/Hyderabad/SE-II_263104/apply/useMyLastApplication"
+    page = {"url": url, "text": "Search for Jobs Sign In", "actions": [sign_in]}
+    assert planner.sign_in_wall(page)
+    assert not planner.sign_in_wall({**page, "url": url.replace("/apply/useMyLastApplication", "")})  # a job page
+    form = {"id": "e2", "node": 2, "kind": "fill", "role": "textbox", "label": "First Name", "value": ""}
+    assert not planner.sign_in_wall({**page, "actions": [sign_in, form]})  # the form itself: its header button
+    assert accounts.plan(page, known=False)[:2] == ("switch", sign_in)  # opens the sign-in form
+    policy = Policy()
+    button = lambda label: {"kind": "click", "role": "button", "label": label}  # noqa: E731
+    for start in ("Apply Manually", "Autofill with Resume", "Use My Last Application"):
+        assert not policy.submit_like(button(start))
+    for final in ("Apply", "Apply Now", "Submit", "Submit Application", "Easy Apply"):
+        assert policy.submit_like(button(final))

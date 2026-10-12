@@ -9,6 +9,7 @@ from pathlib import Path
 CONFIRM = [
     "gender",
     "sex",
+    "sexual",  # "sex" is a whole word only (compile_patterns): sexual orientation still asks you
     "pronoun",
     "race",
     "ethnic",
@@ -70,6 +71,13 @@ NEVER_FILL = [
     "cvv",
     "uan",
 ]
+# Workday's "Start Your Application" choices only pick how the form begins (Blue Yonder: the rescuer's "Apply
+# Manually" was refused five times as a submit). Whole labels only: "Apply" and "Submit application" stay submits.
+START_ONLY = re.compile(
+    r"^\W*(apply manually|auto-?fill with (my )?(r[ée]sum[ée]|cv)|apply with (my )?(r[ée]sum[ée]|cv)|"
+    r"use my (last|previous) application)\W*$",
+    re.I,
+)
 # "I'm interested" opens a form as Apply does (Zoho Recruit), so it is held back the same way once a form is open.
 SUBMIT = [
     "submit", "send application", "apply", "finish", "complete", "confirm and", "send", "i'm interested",
@@ -89,8 +97,14 @@ DECLARATION = [
 
 
 def compile_patterns(words):
-    # Match at the start of a word: "disab" catches "disability", "pan card" does not catch "company".
-    return re.compile("|".join(r"(?<![a-z0-9])" + re.escape(w.lower()) for w in words) or r"(?!x)x", re.I)
+    # Match at the start of a word: "disab" catches "disability", "pan card" does not catch "company". A pattern of
+    # three letters or fewer is a whole word: "age" is not "Agents" (Blue Yonder's "OpenAI Agents SDK" made its whole
+    # start page a sensitive question), "pay" is not "payments".
+    def one(w):
+        w = w.lower()
+        return r"(?<![a-z0-9])" + re.escape(w) + (r"(?![a-z0-9])" if len(w) <= 3 else "")
+
+    return re.compile("|".join(one(w) for w in words) or r"(?!x)x", re.I)
 
 
 NAVIGATION = re.compile(r"(next|continue|review|back|previous|proceed|save (and|&) continue)( step)?")
@@ -129,6 +143,10 @@ class Policy:
     # your profile settles, citing the fact, code checks it, and each answer becomes a lesson the rules use next
     # time. Needs TEXT_MODEL_PROVIDER=claude-code. False: questions come straight to you.
     teacher: bool = True
+    # Sensitive questions (confirm_patterns: gender, citizenship, salary, declarations...) answered unattended only
+    # with your profile's answer. False switches that guard off (testing, asked for on 12 Oct 2026): those questions
+    # are then answered like any other. Never-fill fields and the final-submit guard stay on either way.
+    sensitive_check: bool = True
     # At a "Continue with Google" sign-in: click it, choose the Google account whose address is your profile's e-mail
     # and confirm Google's "share your name, email and picture" page. Clicks only: nothing is ever typed into Google
     # (an e-mail, password or code request waits for you), and wider access (Drive, Gmail...) is left for you.
@@ -181,10 +199,14 @@ class Policy:
         return " ".join(str(action.get(k) or "") for k in ("label", "context", "help", "placeholder"))
 
     def sensitive(self, action):
-        # A button that only moves between steps (Next, Review...) carries no answer: its own label decides, not
-        # the step around it ("Work authorization" heads LinkedIn's step; its Review button declares nothing).
+        # A button that only moves between steps (Next, Review...) or picks how to start ("Apply Manually") carries
+        # no answer: its own label decides, not the step around it ("Work authorization" heads LinkedIn's step; its
+        # Review button declares nothing; Blue Yonder's start dialog holds the job title).
+        if not self.sensitive_check:
+            return None  # switched off for testing (policy.sensitive_check)
         label = str(action.get("label") or "")
-        if action.get("role") in {"button", "link"} and NAVIGATION.fullmatch(label.strip().lower()):
+        own = NAVIGATION.fullmatch(label.strip().lower()) or START_ONLY.search(label)
+        if action.get("role") in {"button", "link"} and own:
             return self._confirm.search(label)
         return self._confirm.search(self.text(action))
 
@@ -199,5 +221,7 @@ class Policy:
         return self._never.search(self.text(action))
 
     def submit_like(self, action):
-        # Buttons and links only, judged by their own label: "Apply" in a paragraph is not a submit button.
-        return action.get("role") in {"button", "link"} and self._submit.search(action.get("label", ""))
+        # Buttons and links only, judged by their own label: "Apply" in a paragraph is not a submit button. A button
+        # that only chooses how to start the form ("Apply Manually") never sends anything.
+        label = action.get("label", "")
+        return action.get("role") in {"button", "link"} and self._submit.search(label) and not START_ONLY.search(label)

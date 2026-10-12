@@ -161,7 +161,12 @@ class Browser:
         return self.transport.call(method, **params)
 
     def show(self):
-        self.transport.show()
+        """Bring the tab to the front, as a courtesy: a tab you closed (or a portal replaced) never ends the run here;
+        the next look at the page says what happened."""
+        try:
+            self.transport.show()
+        except Exception:  # noqa: BLE001 - see above
+            pass
 
     def close(self):
         self.transport.close()

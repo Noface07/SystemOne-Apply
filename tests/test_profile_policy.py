@@ -174,3 +174,28 @@ def test_a_step_button_is_not_sensitive_because_of_the_step_it_sits_in():
     assert policy.sensitive(
         {"kind": "click", "role": "button", "label": "Yes", "context": "Will you require visa sponsorship?"}
     )
+
+
+def test_short_sensitive_words_are_whole_words_and_start_buttons_go_by_their_label():
+    """Blue Yonder: "age" matched "OpenAI Agents SDK" in the job title, so its start dialog was a sensitive question
+    and "Apply Manually" and "Use My Last Application" were both refused."""
+    from jev_apply.policy import Policy
+
+    p = Policy()
+    ctx = "Start Your Application Software Engineer II- Python, LangGraph,OpenAI Agents SDK, RAG,LLM"
+    for label in ("Apply Manually", "Use My Last Application", "Autofill with Resume"):
+        assert not p.sensitive({"kind": "click", "role": "button", "label": label, "context": ctx})
+    for asked in ("What is your age?", "Age group", "Sex", "Sexual orientation", "Expected pay", "Current CTC"):
+        assert p.sensitive({"kind": "fill", "label": asked}), asked
+    for plain in ("Years with Agentic AI", "Agency name", "Your payments experience"):
+        assert not p.sensitive({"kind": "fill", "label": plain}), plain
+
+
+def test_the_sensitive_check_can_be_switched_off_for_testing_and_never_fill_stays():
+    from jev_apply.policy import Policy
+
+    off = Policy(sensitive_check=False)
+    assert not off.sensitive({"kind": "fill", "label": "What is your gender?"})
+    assert Policy().sensitive({"kind": "fill", "label": "What is your gender?"})  # on by default
+    assert off.never_fill({"kind": "fill", "label": "Aadhaar number"})  # never-fill doesn't move
+    assert off.submit_like({"kind": "click", "role": "button", "label": "Submit"})

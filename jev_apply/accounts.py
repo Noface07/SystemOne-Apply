@@ -144,6 +144,8 @@ def plan(page, known, tried_sign_up=False, sign_up_form=False, passwords_typed=0
     if not passwords and not email and not signing_up:
         if to_sign_up and not known:
             return ("switch", to_sign_up)
+        if to_sign_in:
+            return ("switch", to_sign_in)  # only a Sign In button (Blue Yonder): it opens the form
         return ("scroll", down) if down else ("stop", "no e-mail or password box here")
     if signing_up:
         filled = sum(1 for box in passwords if box.get("value"))

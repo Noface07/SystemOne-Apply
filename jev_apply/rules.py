@@ -586,7 +586,8 @@ def key_for(action, profile, tried, dates_only=False, page_text=""):
     if re.search(r"authori[sz]ed to work|work authori[sz]ation|legally (eligible|allowed|permitted)", t):
         return "work_authorization.authorized_to_work_in_india"
     in_india = getattr(profile.by_id.get(safe_id("job.country")), "value", None) == "India"
-    if re.search(r"(eligible|permitted|allowed|right) to work in (the|this) country", t):
+    # "...to work for Blue Yonder in the country where this position is located": the company may stand between
+    if re.search(r"(eligible|permitted|allowed|right) to work\b.{0,60}?\bin (the|this) country", t):
         # "...in the country in which this position is located": your India authorization, for a job in India.
         return "work_authorization.authorized_to_work_in_india" if in_india else None
     if re.search(r"sponsor", t):
@@ -604,6 +605,13 @@ def key_for(action, profile, tried, dates_only=False, page_text=""):
         card = held.group(2)
         return ("personal.has_aadhaar_card" if card.startswith("aadh") else
                 "personal.has_pan_card" if card.startswith("pan") else "personal.has_driving_licence")  # fmt: skip
+    # A bare "Date" (or "Date signed", "Today's date"), or its Month / Day / Year boxes: the date the form is signed
+    # Workday reads its date widget as "Date :* Calendar"
+    signed_on = re.compile(r"\W*(date( signed)?|signed date|signature date|today'?s date|current date)\W*(calendar)?\W*",
+                           re.I)  # fmt: skip
+    part = re.fullmatch(r"(month|day|year|mm|dd|yyyy)\*?", label)
+    if signed_on.fullmatch(label) or (part and signed_on.fullmatch(str(action.get("context") or ""))):
+        return "application.today"
     if re.search(r"earliest|joining date|start date|availability|when can you (start|join)|date of availability", t):
         # A calendar date when the field asks for one (a date input, "DD/MM/YYYY", "...date"), else your words.
         # Workday's Month / Day / Year boxes of "desired start date" want the date's parts, never your words.

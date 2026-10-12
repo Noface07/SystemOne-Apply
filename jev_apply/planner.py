@@ -675,7 +675,21 @@ def sign_in_wall(page):
         or SIGN_IN_STEP.search(page.get("text") or "")
         or IDP.match(page.get("url") or "")
         or (sso_buttons(page) and not application_fields(page))
+        or sign_in_to_apply(page)
     )
+
+
+def sign_in_to_apply(page):
+    """An application's own address (".../apply/useMyLastApplication") showing only a Sign In button, no form:
+    the portal wants an account before it shows the form (Blue Yonder's Workday)."""
+    if not re.search(r"/apply(/|$|\?)", page.get("url") or "", re.I) or application_fields(page):
+        return False
+    if re.search(r"\bcurrent step \d+ of \d+", page.get("text") or "", re.I):
+        return False  # inside the form's steps (one still loading): its own sign-in step is SIGN_IN_STEP's
+
+    return any(a.get("kind") == "click" and a.get("role") in {"button", "link"}
+               and re.fullmatch(r"\W*(sign ?in|log ?in)\W*", a.get("label") or "", re.I)
+               for a in page.get("actions") or [])  # fmt: skip
 
 
 def declaration_question(action):

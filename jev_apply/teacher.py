@@ -208,6 +208,8 @@ Next again).
 How:
 - First the errors: page_errors (often a banner at the top) and each control's "error" or "invalid". Fix the field an \
 error names: open its dropdown, then click the option that answers it; tick its box; type a fact's value into it.
+- controls lists only what is on screen. A field named in page_errors or required_but_empty that has no control is \
+scrolled out of view: choose "Scroll up" (when it is in required_above_the_screen) or "Scroll down" to reach it.
 - An option written differently from the fact: the option that IS the fact in the list's own words ("BS" or \
 "Bachelor of Science" for "B.Tech", "India" for nationality "Indian", "Manipal University" for "Manipal University \
 Jaipur"), else the list's "Other". Never a different school, country, level or field. Give the fact's key.
@@ -249,6 +251,9 @@ def rescue(page, history, profile, why, policy, run_dir=Path("runs"), avoid=(), 
         "action", "")).lower() else str(h.get("typed") or "")[:30], "changed": h.get("page_changed")}
              for h in history if h.get("kind") != "wait"][-15:]  # fmt: skip
     payload = {"why_stopped": why[:300], "page_errors": page_errors(page), "steps_this_rescue": list(tried),
+               # Required fields still empty, also those scrolled out of view (controls lists only what is on screen)
+               "required_but_empty": list(page.get("required_empty") or [])[:20],
+               "required_above_the_screen": list(page.get("required_above") or [])[:10],
                "does_not_work": list(avoid), "last_steps": steps, "controls": controls,
                "page_text": (page.get("text") or "")[:4000], "facts": facts_for(profile)}  # fmt: skip
     content, _ = model.claude_code(RESCUE, payload, stage="rescue")

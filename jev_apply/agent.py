@@ -33,6 +33,10 @@ INDIAN_JOB = re.compile(
 )
 # What sites say once an application went through.
 # A challenge a person must answer before the form sends: hCaptcha's frame or its response field.
+# What a portal's page says once an e-mailed verification link did its work, or why it didn't.
+ACTIVATED = re.compile(r"(account|e-?mail)\W+(has been |is |was )?(verified|activated|confirmed)|verification "
+                       r"(was )?successful|successfully (verified|activated)|you can now sign in", re.I)  # fmt: skip
+INVALID_LINK = re.compile(r"invalid (token|link)|link (has )?expired|token (has )?expired|no longer valid", re.I)
 CAPTCHA_CHECK = (
     '!!document.querySelector(\'iframe[src*="hcaptcha.com"],textarea[name="h-captcha-response"],'
     "[data-hcaptcha-widget-id],.h-captcha')"
@@ -130,6 +134,9 @@ class Agent:
         # "Have you applied to <company> before?": from your record of applications on this company's site.
         self.profile.note_fact("application.applied_here_before", "Yes" if self.applied_here() else "No",
                                "Applied to this company before (from your application record)")  # fmt: skip
+        # The date a form is filled ("Date:" beside a signature, Blue Yonder's attestation): today, for this run only
+        self.profile.note_fact("application.today", datetime.now().date().isoformat(), "Today's date")
+        self.profile.facts["application.today"].kind = "date"
 
     # ---- loop -------------------------------------------------------------------------------------------------
 
@@ -437,8 +444,11 @@ class Agent:
         if picked and norm(picked).startswith(norm(fact.value)):
             return None  # your answer and more ("Udaipur, Rajasthan, India" for Udaipur): that one
         self.looked_up.add(asked)
-        found = teacher.closest_option(question, fact.key, fact.value, fact.about, texts, self.profile,
-                                       urlparse(self.page["url"]).hostname or "", self.run_dir)  # fmt: skip
+        exact = next((t for t in texts if norm(t) == norm(fact.value)), None)
+        # Written exactly as your answer ("India", "Male"): that one, with no Claude call (ABB asked Claude for both)
+        found = (exact, "same", "written as your answer") if exact else teacher.closest_option(
+            question, fact.key, fact.value, fact.about, texts, self.profile,
+            urlparse(self.page["url"]).hostname or "", self.run_dir)  # fmt: skip
         if not found:
             return None
         text, match, why = found
@@ -1253,6 +1263,23 @@ class Agent:
                     continue
         return False
 
+    def back_to_job(self):
+        """After a sign-in, a portal may land on your candidate home ("My Applications") instead of the job (Blue
+        Yonder's Workday): with no application form showing and the job no longer in the address, back to the job
+        link this run started from, whose Apply now goes on with the signed-in account."""
+        slug = urlparse(self.start_url).path.rstrip("/").split("/")[-1]
+        url = self.page.get("url") or ""
+        if not slug or slug in url or planner.application_fields(self.page):
+            return
+        self.ui.event("signed in, but the portal showed its home page: back to the job")
+        try:
+            self.browser.navigate(self.start_url)
+            self.page = self.browser.observe()
+        except (StalePage, RuntimeError, ValueError):
+            pass
+        self.history.append({"step": len(self.history) + 1, "action": "Back to the job after signing in",
+                             "kind": "wait", "context": "", "url": self.start_url, "page_changed": True})  # fmt: skip
+
     def sign_in_with_password(self):
         """At a portal's own sign-in: sign in with your profile's e-mail and JEV_PORTAL_PASSWORD, or create the
         account first (accounts.py reads the page; the agent types only those two and ticks the terms box of a
@@ -1277,6 +1304,7 @@ class Agent:
                 created = now if signed_up and not known.get("created") else known.get("created")
                 accounts.note(self.profile, start, email=email, last_sign_in=now, created=created)
                 self.ui.event("signed in with your portal account: continuing")
+                self.back_to_job()
                 return True
             text = page.get("text") or ""
             if signed_up and accounts.TAKEN.search(text) and not known.get("created"):
@@ -1299,13 +1327,27 @@ class Agent:
                 except ValueError:
                     pass
                 link = self.mail("link", since=since)
+                used = hashlib.sha256(link.encode()).hexdigest()[:16] if link else None
+                if link and used == known.get("link_used"):
+                    link = None  # opened once already: a one-time link only says "invalid token" the second time
                 if not link:
                     self.ui.event("the portal wants its e-mail verified: waiting for that")
                     return False
                 self.ui.event("opening the verification link from your e-mail")
+                accounts.note(self.profile, start, link_used=used)
                 try:
                     self.browser.navigate(link)
-                    time.sleep(2)
+                    # Workday's activation page confirms the token from its script after loading: leaving at once
+                    # spends the one-time link without the account being verified (Blue Yonder: "invalid token")
+                    said = ""
+                    for _ in range(20):
+                        time.sleep(1)
+                        said = (self.browser.evaluate("document.body ? document.body.innerText : ''") or "")[:2000]
+                        if ACTIVATED.search(said) or INVALID_LINK.search(said):
+                            break
+                    self.ui.event("e-mail verified" if ACTIVATED.search(said) else
+                                  "the verification link was refused (used or expired)" if INVALID_LINK.search(said)
+                                  else "verification page gave no answer in 20 s")  # fmt: skip
                     self.browser.navigate(start)  # back to the job: its sign-in now takes the verified account
                     self.page = self.browser.observe()
                 except (StalePage, RuntimeError, ValueError):

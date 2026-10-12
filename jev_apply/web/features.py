@@ -44,6 +44,9 @@ SAFETY = [
     ("teacher", "Claude helps when the rules can't", "Answers what your profile settles (citing the fact, checked, "
      "then reused without Claude), finds your answer in a list worded differently (\"BS\" for B.Tech) and gets a "
      "stuck page moving (up to 5 checked steps, 3 times a run). Never a submit or an invented fact. Off: all to you."),
+    ("sensitive_check", "Ask before sensitive answers", "On: gender, citizenship, salary and declaration questions "
+     "are answered unattended only with your profile's answer. Off (testing): answered like any other question. "
+     "Never-fill fields and the final Submit stay guarded either way."),
     ("answer_wait_s", "Wait for your answers (s)", "A required question nothing on file answers: the run waits "
      "this long for you to answer it in Questions, then carries on. 0: it stops, to re-run later."),
     ("confirm_wait_s", "Wait for the site's confirmation (s)", "After Submit."),

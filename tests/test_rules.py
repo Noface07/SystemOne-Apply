@@ -598,3 +598,24 @@ def test_a_workday_field_name_says_what_is_asked_when_its_label_agrees():
     assert profile.by_id[rules.match(unknown, profile)].key == "personal.city_of_birth"  # read from its label
     assert rules.by_field_id(field("Primary Nationality", field_id="nationality")) == (
         "personal.nationality", "personal.citizenship_country")
+
+
+def test_blue_yonders_eligibility_and_signature_date_are_answered():
+    """Blue Yonder: "eligible to work for Blue Yonder in the country where this position is located" (the company
+    between), and a "Date:" of Month / Day / Year boxes beside the attestation's signature."""
+    from jev_apply.profile import Fact
+
+    data = json.loads((ROOT / "data" / "profile.example.json").read_text(encoding="utf-8"))
+    profile = Profile(data, ROOT / "data")
+    profile.note_job_country("India")
+    q = "Are you eligible to work for Blue Yonder in the country where this position is located?"
+    assert rules.key_for(field(q), profile, set()) == "work_authorization.authorized_to_work_in_india"
+    profile.note_fact("application.today", "2026-10-12", "Today's date")
+    profile.facts["application.today"].kind = "date"
+    assert rules.key_for(field("Month", context="Date :"), profile, set()) == "application.today"
+    for part in ("Month", "Day", "Year"):  # as Workday reads them: "Date :* Calendar"
+        assert rules.key_for(field(part, context="Date :* Calendar"), profile, set()) == "application.today"
+    assert rules.fit(profile.facts["application.today"], field("Day", context="Date :* Calendar"), profile) == "12"
+    assert rules.key_for(field("Date"), profile, set()) == "application.today"
+    assert rules.key_for(field("Month", context="From*"), profile, set()) != "application.today"  # a job's dates
+    assert isinstance(Fact, type)
