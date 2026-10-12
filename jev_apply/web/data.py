@@ -139,8 +139,15 @@ def summary(run_id, report, stems=None):
         a.get("question") for a in report.get("asked") or [] if not a.get("answered")
     ]
     reason = next((h.get("reason") for h in report.get("handovers") or []), None)
+    from .. import metrics
+
+    tags = {k: report[k] for k in ("host", "ats", "stop_code") if k in report} or metrics.tags(
+        report.get("start_url"), report.get("status"), report.get("handovers") or [], report.get("left_for_you") or []
+    )  # older reports: worked out here, as `jev-apply metrics` does
     return {
         "id": run_id,
+        "ats": tags["ats"],
+        "stop_code": tags["stop_code"],
         "at": run_at(run_id),
         "status": report.get("status"),
         "url": report.get("start_url"),
@@ -202,6 +209,8 @@ def run_detail(run_id, apps=None, stems=None):
         "decisions": report.get("decisions"),
         "claude": report.get("claude") or [],
         "receipt": report.get("receipt"),
+        "rescues": report.get("rescues") or [],  # what Claude did on a stuck page, and why not when it couldn't
+        "closest": report.get("closest") or [],  # your answers in the lists' own words ("BS" for B.Tech)
     }
 
 
@@ -341,15 +350,15 @@ def system():
         out["years"] = float(years.value) if years else None
     if backend == "clef":
         s = clef_backend.settings()
-        free = clef_backend.commit_free_gb()
-        need = clef_backend.needed_gb(s) if s["path"] and Path(s["path"]).is_file() else None
+        mem = clef_backend.memory(s)  # the same numbers Clef's start is judged on
         out["clef"] = {
             "running": clef_backend.healthy(s["base"]),
             "base": s["base"],
             "model": s["model"],
             "path": s["path"],
-            "memory_free_gb": round(free, 1) if free is not None else None,
-            "memory_needed_gb": round(need + 1, 1) if need else None,
+            "memory_free_gb": round(mem["free"], 1) if mem["free"] is not None else None,
+            "memory_page_file_gb": round(mem["page_file"], 1),
+            "memory_needed_gb": round(mem["needed"], 1) if mem["needed"] else None,
         }
     return out
 

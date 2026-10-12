@@ -206,3 +206,55 @@ def test_claude_usage_sums_time_tokens_and_cost_per_stage(home):  # noqa: F811
     used = client().get("/api/claude-usage", headers=AUTH).json()
     assert used["total"]["calls"] == 3 and used["total"]["failed"] == 1 and used["total"]["cost_usd"] == 0.04
     assert used["stages"]["draft"]["avg_seconds"] == 5.0 and used["stages"]["draft"]["input_tokens"] == 4000
+
+
+def test_safety_settings_offer_the_pace_and_say_what_the_teacher_does(home):  # noqa: F811
+    rows = {r["field"]: r for r in client().get("/api/safety", params={"track": "data/dotnet"}, headers=AUTH).json()}
+    assert rows["pace_s"]["default"] == 0.6 and rows["pace_after_next_s"]["default"] == 1.5
+    assert "stuck page" in rows["teacher"]["help"] and "list worded differently" in rows["teacher"]["help"]
+    res = client().put("/api/safety", params={"track": "data/dotnet"}, json={"values": {"pace_after_next_s": 2.5}},
+                       headers=AUTH)  # fmt: skip
+    assert res.status_code == 200  # a pause over 1 s is fine (only probabilities stop at 1)
+
+
+def test_a_runs_report_shows_its_stop_code_rescues_and_closest_picks(home):  # noqa: F811
+    run = home / "runs" / "20261012-010101"
+    run.mkdir(parents=True)
+    report = {"status": "stopped", "start_url": "https://maersk.wd3.myworkdayjobs.com/x", "fills": [], "history": [],
+              "left_for_you": [], "asked": [], "handovers": [{"reason": "The site reports problems on this page."}],
+              "rescues": [{"reason": "stuck", "steps": ["click Select One"], "helped": False, "why": "no fact"}],
+              "closest": [{"question": "Degree", "value": "B.Tech", "option": "BS", "match": "closest"}]}  # fmt: skip
+    (run / "report.json").write_text(json.dumps(report), encoding="utf-8")
+    detail = client().get(f"/api/runs/{run.name}", headers=AUTH).json()
+    assert detail["ats"] == "workday" and detail["stop_code"] == "site_errors"
+    assert detail["rescues"][0]["why"] == "no fact" and detail["closest"][0]["option"] == "BS"
+    metrics = client().get("/api/insights", headers=AUTH).json()["metrics"]
+    assert metrics["first_contact"] == {"sites": 1, "reached": 0} and metrics["stop_codes"] == [["site_errors", 1]]
+    assert metrics["rescues"]["tried"] == 1 and metrics["closest"] == {"closest": 1}
+
+
+def test_list_wordings_and_lessons_show_in_the_answer_bank(home):  # noqa: F811
+    (home / "data" / "equivalents.json").write_text(json.dumps(
+        {"education.0.degree|btech": {"BS": {"match": "closest", "hosts": ["maersk.wd3.myworkdayjobs.com"]}}}),
+        encoding="utf-8")  # fmt: skip
+    (home / "data" / "lessons.json").write_text(json.dumps({"answers": [
+        {"id": "lesson_1", "question": "Your nickname?", "answer": "Raj", "fact": "personal.nickname"}]}),
+        encoding="utf-8")  # fmt: skip
+    c = client()
+    bank = c.get("/api/answers", headers=AUTH).json()
+    wording = next(a for a in bank if a.get("kind") == "closest")
+    assert wording["answer"] == "BS" and wording["readonly"] and wording["hosts"] == ["maersk.wd3.myworkdayjobs.com"]
+    lesson = next(a for a in bank if a.get("kind") == "teacher")
+    assert lesson["source"] == "Claude, from your profile" and lesson["inactive"]  # no such fact on file: not used
+    assert c.put(f"/api/answers/{wording['id']}", json={"answer": "BA"}, headers=AUTH).status_code == 400
+    c.delete(f"/api/answers/{wording['id']}", headers=AUTH)
+    assert json.loads((home / "data" / "equivalents.json").read_text(encoding="utf-8")) == {}
+
+
+def test_clef_memory_counts_the_page_file_room(home, monkeypatch):  # noqa: F811
+    from jev_apply import clef_backend
+
+    monkeypatch.setattr(clef_backend, "commit_free_gb", lambda: 6.4)
+    monkeypatch.setattr(clef_backend, "page_file_room_gb", lambda: 15.8)
+    status = features.clef_status()
+    assert status["memory_free_gb"] == 22.2 and status["memory_page_file_gb"] == 15.8

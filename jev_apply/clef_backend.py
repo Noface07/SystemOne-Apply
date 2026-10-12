@@ -143,17 +143,29 @@ def needed_gb(s):
     return Path(s["path"]).stat().st_size / 2**30 + int(s["context"]) / 1024 + 0.6
 
 
+MARGIN_GB = 1.0  # left for Chrome and Windows
+
+
+def memory(s=None):
+    """What Clef's start is judged on (here and in the web app): {free, page_file, needed} in GB. `free` counts
+    what Windows can promise now plus the room a system-managed page file can still grow into (page_file); None
+    where Windows can't say. `needed` includes the margin; None without a model file."""
+    s = s or settings()
+    now = commit_free_gb()
+    room = page_file_room_gb() if now is not None else 0.0
+    need = needed_gb(s) + MARGIN_GB if s.get("path") and Path(s["path"]).is_file() else None
+    return {"free": None if now is None else now + room, "page_file": room, "needed": need}
+
+
 def prepare():
     """Start llama-server with Clef when nothing answers yet; wait until it has loaded the model."""
     global _server
     s = settings()
     if healthy(s["base"]):
         return
-    free, need = commit_free_gb(), needed_gb(s)
-    if free is not None:
-        free += page_file_room_gb()  # a system-managed page file grows onto its drive when memory runs short
-    # A margin for Chrome and Windows
-    if free is not None and free < need + 1.0:
+    # A system-managed page file grows onto its drive when memory runs short: its room counts (memory())
+    free, need = memory(s)["free"], needed_gb(s)
+    if free is not None and free < need + MARGIN_GB:
         # Starting anyway starves Chrome and Windows itself (tabs fail to open, programs can't start threads).
         raise RuntimeError(
             f"Clef needs about {need:.1f} GB of memory and Windows can only promise {free:.1f} GB: close some "

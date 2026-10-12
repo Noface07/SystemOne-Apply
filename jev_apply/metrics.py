@@ -76,13 +76,16 @@ def reached(report):
     return report.get("status") == "review" or str(report.get("status") or "").startswith("submitted")
 
 
-def load(run_dir):
-    """Every report, oldest first, each with its tags (older reports get them computed here)."""
+def load(run_dir, read=None):
+    """Every report, oldest first, each with its tags (older reports get them computed here). `read` parses one
+    report.json (the web app passes its cached reader); None by default."""
     reports = []
     for path in sorted(Path(run_dir).glob("*/report.json")):
         try:
-            report = json.loads(path.read_text(encoding="utf-8"))
+            report = dict(read(path) or {}) if read else json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
+            continue
+        if not report:
             continue
         if "stop_code" not in report:
             report.update(tags(report.get("start_url"), report.get("status"), report.get("handovers") or [],

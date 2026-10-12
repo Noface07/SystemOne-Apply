@@ -300,7 +300,7 @@ async function overview() {
       <a class="card kpi" href="#/questions" style="text-decoration:none;--kpi-glow:rgba(251,191,36,.22)"><div class="label">${icon.chat}Open questions</div><div class="value">${ov.open_questions}</div><div class="hint">${ov.open_questions ? "Answer once, reused on every form" : "Nothing waiting on you"}</div></a>
       <div class="card kpi" style="--kpi-glow:rgba(45,212,191,.22)"><div class="label">${icon.cpu}Decision model</div>
         <div class="value" style="font-size:22px;margin-top:10px">${system.backend === "clef" ? "Clef-Flash" : system.backend}</div>
-        <div class="hint">${clef ? (clef.running ? "Loaded on the GPU" : clef.memory_free_gb != null ? `${clef.memory_free_gb} GB free · needs ${clef.memory_needed_gb}` : "Starts with a batch") : system.problem || "Ready"}</div></div>
+        <div class="hint">${clef ? (clef.running ? "Loaded on the GPU" : clef.memory_free_gb != null ? `${clef.memory_free_gb} GB free (page file included) · needs ${clef.memory_needed_gb}` : "Starts with a batch") : system.problem || "Ready"}</div></div>
     </div>
     <div class="grid g2" style="margin-top:16px">
       <div class="card">
@@ -978,11 +978,14 @@ async function answerBank() {
         <div class="bank-item" data-id="${a.id}">
           <div class="bank-q"><b>${a.question}</b>
             <div class="meta muted" style="font-size:12px;margin-top:3px"><span class="chip plain">${a.source}</span>${a.track ? trackChip(a.track) : ""}
-              ${a.times_used ? html`<span class="chip s-submitted"><i></i>Used ${a.times_used}× · last ${ago(a.last_used)}</span>` : html`<span class="chip s-deferred"><i></i>Not used yet</span>`}</div></div>
-          ${a.options?.length
+              ${a.kind === "closest" ? html`<span class="chip plain" title="same: means the same · closest: nearest equivalent · other: the list's way out">${a.match}</span><span class="chip s-submitted"><i></i>Picked on ${a.hosts.length} site${a.hosts.length === 1 ? "" : "s"}</span>`
+                : a.times_used ? html`<span class="chip s-submitted"><i></i>Used ${a.times_used}× · last ${ago(a.last_used)}</span>` : html`<span class="chip s-deferred"><i></i>Not used yet</span>`}
+              ${a.fact ? html`<span class="faint mono" title="The profile fact this answer came from">${a.fact}</span>` : ""}
+              ${a.inactive ? html`<span class="chip s-stopped" title="Its fact no longer has this value, or lessons no longer cover this kind of question"><i></i>Not in use: no longer matches your profile</span>` : ""}</div></div>
+          ${a.readonly ? html`<div class="mono" style="font-size:13px">${a.answer}</div>` : a.options?.length
             ? html`<div class="opts">${a.options.map((o) => html`<button data-bo="${o}" class="${a.answer === o ? "on" : ""}">${o}</button>`)}</div>`
             : html`<textarea rows="${Math.min(6, Math.max(1, Math.ceil(String(a.answer).length / 90)))}" data-ba>${a.answer}</textarea>`}
-          <div class="actions-row" style="margin-top:8px"><button class="btn sm primary" data-bsave>${icon.check}Save</button><button class="btn sm ghost danger" data-bdel>${icon.x}${a.id.startsWith("questions:") ? "Clear (ask me again)" : "Delete"}</button></div>
+          <div class="actions-row" style="margin-top:8px">${a.readonly ? "" : html`<button class="btn sm primary" data-bsave>${icon.check}Save</button>`}<button class="btn sm ghost danger" data-bdel>${icon.x}${a.id.startsWith("questions:") ? "Clear (ask me again)" : "Delete"}</button></div>
         </div>`)}</div>
       ${shown.length ? "" : html`<div class="empty">Nothing matches.</div>`}
     </div>`);
@@ -995,7 +998,8 @@ async function answerBank() {
       catch (e) { toast(e.message, "var(--red)"); }
     };
     $$("[data-bo]", item).forEach((b) => (b.onclick = () => save(b.dataset.bo)));
-    $("[data-bsave]", item).onclick = () => { const t = $("[data-ba]", item); if (t) save(t.value); };
+    const saveBtn = $("[data-bsave]", item);
+    if (saveBtn) saveBtn.onclick = () => { const t = $("[data-ba]", item); if (t) save(t.value); };
     $("[data-bdel]", item).onclick = async () => {
       if (!confirm("Remove this answer? Forms that ask it will ask you again.")) return;
       try { await api(`/answers/${encodeURIComponent(id)}`, { method: "DELETE" }); refreshShell(); answerBank(); } catch (e) { toast(e.message, "var(--red)"); }
@@ -1040,6 +1044,14 @@ async function history() {
   draw();
 }
 
+// Why a run ended, in words (metrics.STOP_CODES)
+const STOP_CODES = {
+  already_applied: "already applied", budget: "action budget used", job_closed: "job closed",
+  all_tried: "everything tried", no_form_found: "no form found", no_way_forward: "no way forward",
+  model_error: "model error", resume_mismatch: "résumé not matched", login: "login needed",
+  site_errors: "site errors", no_progress: "no progress", needs_answer: "needs your answer", other: "other",
+};
+
 async function openRun(id) {
   const el = document.getElementById("drawer");
   el.hidden = false;
@@ -1049,9 +1061,16 @@ async function openRun(id) {
     const r = await api(`/runs/${id}`);
     mount(el, html`<div>
       <div class="card-head"><div><h2 style="font-size:18px">${r.title || r.job || "Run"}</h2>${r.company ? html`<div class="muted">${r.company}</div>` : ""}<p class="sub">${new Date(r.at).toLocaleString()} · ${Math.round(r.elapsed_s || 0)}s</p></div><button class="btn ghost" data-close>${icon.x}</button></div>
-      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px">${statusChip(r.status)}${trackChip(r.track)}<a class="btn sm" href="${safeUrl(r.url)}" target="_blank" rel="noopener">${icon.link}Open posting</a></div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px">${statusChip(r.status)}${trackChip(r.track)}${r.ats && r.ats !== "other" ? html`<span class="chip plain">${r.ats}</span>` : ""}${r.stop_code && !["review", "submitted"].includes(r.stop_code) ? html`<span class="chip plain" title="Why the run ended (jev-apply metrics)">${STOP_CODES[r.stop_code] || r.stop_code}</span>` : ""}<a class="btn sm" href="${safeUrl(r.url)}" target="_blank" rel="noopener">${icon.link}Open posting</a></div>
       ${r.reason ? html`<div class="banner warn">${r.reason}</div>` : ""}
       ${r.left_for_you.length || r.asked.length ? html`<div class="card" style="margin-bottom:14px"><h2>Left for you</h2><ul>${[...r.left_for_you.map((x) => `${x.what} (${x.why})`), ...r.asked.filter((a) => !a.answered).map((a) => a.question)].map((x) => html`<li>${x}</li>`)}</ul></div>` : ""}
+      ${r.rescues.length ? html`<div class="card" style="margin-bottom:14px"><h2 style="margin-bottom:6px">Claude on a stuck page <span class="faint">${r.rescues.length}</span></h2>
+        <p class="muted" style="font-size:12.5px;margin-top:0">Each step checked by code: never a submit, a password box or an answer your profile doesn't give.</p>
+        ${r.rescues.map((x) => html`<div class="rescue"><div>${x.helped ? html`<span class="chip s-submitted"><i></i>got it moving</span>` : html`<span class="chip s-stopped"><i></i>couldn't</span>`} <span class="muted">${x.reason}</span></div>
+          ${(x.steps || []).filter(Boolean).length ? html`<ol>${x.steps.filter(Boolean).map((st) => html`<li class="mono" style="font-size:12.5px">${st}</li>`)}</ol>` : ""}
+          ${x.why ? html`<div style="font-size:13px">Why not: ${x.why}</div>` : ""}</div>`)}</div>` : ""}
+      ${r.closest.length ? html`<div class="card" style="margin-bottom:14px"><h2 style="margin-bottom:10px">Your answers in the lists' own words <span class="faint">${r.closest.length}</span></h2>
+        <table class="data"><thead><tr><th>Question</th><th>Your answer</th><th>Picked</th><th></th></tr></thead><tbody>${r.closest.map((c) => html`<tr><td style="max-width:260px">${c.question}</td><td class="mono" style="font-size:12.5px">${c.value}</td><td class="mono" style="font-size:12.5px">${c.option}</td><td><span class="chip plain" title="${c.why || ""}">${c.match}</span></td></tr>`)}</tbody></table></div>` : ""}
       ${r.receipt ? html`<div class="card" style="margin-bottom:14px"><div class="card-head"><h2>Receipt</h2>${r.receipt.confirmed ? html`<span class="chip s-submitted"><i></i>The site confirmed it</span>` : html`<span class="chip s-review"><i></i>No confirmation text seen</span>`}</div>
         <p class="muted" style="font-size:12.5px;margin-top:0">What the page showed right after Submit · ${new Date(r.receipt.at).toLocaleString()} · <a href="${safeUrl(r.receipt.url)}" target="_blank" rel="noopener">${String(r.receipt.url || "").slice(0, 60)}</a></p>
         ${r.receipt.screenshot ? html`<img class="receipt-img" id="receipt-img" alt="Screenshot of the confirmation page">` : ""}
@@ -1105,7 +1124,7 @@ async function settings() {
           <dt>Backend</dt><dd>${{ clef: "Cloudflare Clef-Flash 9B (local, llama-server)", laya: "Laya 441M (local, in the batch process)", typesafe: "TypeSafe Jev (hosted API)", llm: "Chat model (OpenAI-compatible API)" }[system.backend] || system.backend}</dd>
           ${c ? html`<dt>Server</dt><dd>${c.running ? html`<span class="chip s-submitted live"><i></i>Running</span>` : html`<span class="chip s-deferred"><i></i>Starts with each batch</span>`} <span class="mono faint">${c.base}</span></dd>
             <dt>Model file</dt><dd class="mono" style="font-size:12.5px">${c.path}</dd>
-            <dt>Memory</dt><dd>${c.memory_free_gb != null ? html`${c.memory_free_gb} GB free of the ${c.memory_needed_gb} GB Clef needs ${c.memory_free_gb >= c.memory_needed_gb ? html`<span class="chip s-submitted"><i></i>OK</span>` : html`<span class="chip s-stopped"><i></i>Close some apps</span>`}` : "—"}</dd>` : ""}
+            <dt>Memory</dt><dd>${c.memory_free_gb != null ? html`${c.memory_free_gb} GB free${c.memory_page_file_gb ? ` (${c.memory_page_file_gb} GB of it the page file can still grow into)` : ""} of the ${c.memory_needed_gb} GB Clef needs ${c.memory_free_gb >= c.memory_needed_gb ? html`<span class="chip s-submitted"><i></i>OK</span>` : html`<span class="chip s-stopped"><i></i>Close some apps</span>`}` : "—"}</dd>` : ""}
           <dt>Drafting</dt><dd>${system.drafting === "claude-code" ? "Claude (Claude Code) writes open answers only" : system.drafting || "Off: open questions are asked"}</dd>
           ${system.problem ? html`<dt>Problem</dt><dd style="color:var(--red)">${system.problem}</dd>` : ""}
         </dl>
@@ -1553,6 +1572,29 @@ async function inboxPage() {
 
 // ---- insights: results by résumé track ---------------------------------------------------------------------
 
+// The numbers of `jev-apply metrics`: how the agent does on companies it has never seen, per ATS, and why runs stop
+function metricsSection(m) {
+  if (!m || !m.runs) return "";
+  const pct = (a, b) => (b ? `${Math.round((100 * a) / b)}%` : "—");
+  const ats = Object.entries(m.per_ats).sort((x, y) => y[1].runs - x[1].runs);
+  return html`
+    <div class="grid g4" style="margin-bottom:16px">
+      <div class="card kpi"><div class="label">First run on a new site</div><div class="value">${pct(m.first_contact.reached, m.first_contact.sites)}</div><div class="hint">reached Review: ${m.first_contact.reached} of ${m.first_contact.sites} sites. The number to raise</div></div>
+      <div class="card kpi"><div class="label">All runs</div><div class="value">${pct(m.reached, m.runs)}</div><div class="hint">${m.reached} of ${m.runs} reached Review or Submit</div></div>
+      <div class="card kpi"><div class="label">Claude on stuck pages</div><div class="value">${m.rescues.tried ? `${m.rescues.helped}/${m.rescues.tried}` : "—"}</div><div class="hint">rescues that got the page moving</div></div>
+      <div class="card kpi"><div class="label">Closest-option picks</div><div class="value">${Object.values(m.closest).reduce((a, b) => a + b, 0) || "—"}</div><div class="hint">${Object.entries(m.closest).map(([k, n]) => `${k} ${n}`).join(" · ") || "your answers in a list's own words"}</div></div>
+    </div>
+    <div class="grid g2" style="margin-bottom:16px">
+      <div class="card"><div class="card-head"><h2>By applicant tracking system</h2><p class="sub">one fix for a platform helps every company on it</p></div>
+        <table class="data"><thead><tr><th>ATS</th><th>Sites</th><th>Runs</th><th>Reached Review</th><th>First run</th></tr></thead><tbody>${ats.map(([name, c]) => html`<tr><td>${name}</td><td>${c.sites}</td><td>${c.runs}</td><td>${pct(c.reached, c.runs)}</td><td>${pct(c.first_reached, c.sites)}</td></tr>`)}</tbody></table>
+        ${m.runs_until_reached.length ? html`<p class="muted" style="font-size:12.5px;margin:10px 0 0">Runs until a site first reached Review: ${m.runs_until_reached.map(([h, n]) => `${h.split(".")[0]} ${n}`).join(", ")}</p>` : ""}</div>
+      <div class="card"><div class="card-head"><h2>Why runs stopped</h2><p class="sub">all runs that didn't reach Review</p></div>
+        <div class="list">${m.stop_codes.map(([code, n]) => html`<div class="row"><span>${STOP_CODES[code] || code}</span><b>${n}</b></div>`)}</div>
+        ${m.rescues.why_not.filter(([w]) => w).length ? html`<div class="muted" style="font-size:11.5px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;margin-top:12px">When Claude couldn't help</div>
+          <ul class="left">${m.rescues.why_not.filter(([w]) => w).map(([w, n]) => html`<li>${w} <span class="faint">×${n}</span></li>`)}</ul>` : ""}</div>
+    </div>`;
+}
+
 async function insightsPage() {
   const [d, cu] = await Promise.all([api("/insights"), api("/claude-usage")]);
   const color = (t) => `var(--${trackKey(t) in TRACK_NAMES ? trackKey(t) : "gray"})`;
@@ -1561,6 +1603,7 @@ async function insightsPage() {
   const outcomeColor = { submitted: "var(--green)", review: "var(--amber)", stopped: "var(--red)", failed: "var(--red)", ready: "var(--amber)" };
   mount(main, html`
     <div class="page-head"><div><h1>Insights</h1><p class="sub">${d.total_runs} runs · ${d.total_sent} applications sent. Which résumé works, and why runs stop.</p></div></div>
+    ${metricsSection(d.metrics)}
     <div class="grid g3">${d.tracks.map((t) => html`
       <div class="card">
         <div class="card-head">${trackChip(t.track === "unknown" ? null : t.track)}${t.track === "unknown" ? html`<span class="muted" style="font-size:12px">older runs, résumé not recorded</span>` : ""}</div>
@@ -1577,7 +1620,7 @@ async function insightsPage() {
       <div class="card"><div class="card-head"><h2>Companies</h2><p class="sub">most applied to</p></div>
         <div class="list">${d.companies.map(([c, n]) => html`<div class="row"><span>${c}</span><b>${n}</b></div>`)}</div></div>
     </div>
-    <div class="card-head" style="margin-top:26px"><h2>Claude</h2><p class="sub">Last ${cu.days} days, from runs/claude-usage.jsonl: every call jev-apply made to Claude (drafting answers, reading résumés, the benchmark judge).</p></div>
+    <div class="card-head" style="margin-top:26px"><h2>Claude</h2><p class="sub">Last ${cu.days} days, from runs/claude-usage.jsonl: every call jev-apply made to Claude (drafting answers, answering from your profile, closest options, rescues, reading résumés, the benchmark judge).</p></div>
     <div class="grid g4">
       <div class="card kpi"><div class="label">Calls</div><div class="value">${cu.total.calls}</div><div class="hint">${cu.total.failed} failed</div></div>
       <div class="card kpi"><div class="label">Average time</div><div class="value">${cu.total.avg_seconds != null ? html`${cu.total.avg_seconds}<span style="font-size:16px">s</span>` : "—"}</div><div class="hint">per call</div></div>
@@ -1612,7 +1655,7 @@ async function renderSystemExtras() {
       <div class="grid g2">
         <div><div class="meter-label"><span>GPU memory ${gpu ? html`<span class="faint">${gpu.name}</span>` : ""}</span><b>${gpu ? `${(gpu.used_mb / 1024).toFixed(1)} / ${(gpu.total_mb / 1024).toFixed(1)} GB` : "no NVIDIA GPU found"}</b></div>
           <div class="meter"><span style="width:${gpu ? (gpu.used_mb / gpu.total_mb) * 100 : 0}%"></span></div></div>
-        <div><div class="meter-label"><span>Memory Windows can spare</span><b>${clef.memory_free_gb ?? "?"} GB · Clef needs ${clef.memory_needed_gb ?? "?"}</b></div>
+        <div><div class="meter-label"><span title="What Windows can promise now, plus the room a system-managed page file can still grow into">Memory Windows can spare${clef.memory_page_file_gb ? ` (incl. ${clef.memory_page_file_gb} GB page file)` : ""}</span><b>${clef.memory_free_gb ?? "?"} GB · Clef needs ${clef.memory_needed_gb ?? "?"}</b></div>
           <div class="meter ${clef.memory_free_gb != null && clef.memory_free_gb < clef.memory_needed_gb ? "bad" : ""}"><span style="width:${clef.memory_free_gb && clef.memory_needed_gb ? Math.min(100, (clef.memory_free_gb / clef.memory_needed_gb) * 100) : 0}%"></span></div></div>
       </div>
       <p class="muted" style="font-size:12.5px;margin:12px 0 0">Starting it here keeps Clef loaded between batches (each batch then starts instantly). Batches also start it themselves.</p>
@@ -1623,7 +1666,7 @@ async function renderSystemExtras() {
       <div class="safety">${safety.map((s) => html`<div class="frow"><span class="flabel">${s.label}${s.custom ? html` <span class="chip plain" style="font-size:10.5px">changed</span>` : ""}</span><span class="finput">
         ${typeof s.default === "boolean" ? html`<label class="toggle"><input type="checkbox" data-saf="${s.field}" ${s.value ? "checked" : ""}>${s.value ? "On" : "Off"}</label>`
           : s.field === "drafts" ? html`<select data-saf="${s.field}"><option value="confirm" ${s.value === "confirm" ? "selected" : ""}>Draft with Claude</option><option value="ask" ${s.value === "ask" ? "selected" : ""}>Always ask me</option></select>`
-          : html`<input type="number" step="${String(s.default).includes(".") ? "0.05" : "1"}" min="0" ${String(s.default).includes(".") ? 'max="1"' : ""} data-saf="${s.field}" value="${s.value}">`}
+          : html`<input type="number" step="${s.field.startsWith("pace_") ? "0.1" : String(s.default).includes(".") ? "0.05" : "1"}" min="0" ${s.field.startsWith("min_") ? 'max="1"' : ""} data-saf="${s.field}" value="${s.value}">`}
         <small>${s.help} Default: ${String(s.default)}.</small></span><span></span></div>`)}</div>
       <div style="display:flex;justify-content:flex-end;margin-top:12px"><button class="btn primary" id="saf-save">${icon.check}Save safety settings</button></div>
     </div>

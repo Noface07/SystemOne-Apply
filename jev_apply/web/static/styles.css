@@ -398,3 +398,7 @@ nav .count.pulse { animation: ping 1.4s infinite; box-shadow: 0 0 0 0 var(--ambe
 .batch-filter { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-bottom: 12px; }
 .btn.icon-only { padding: 3px 6px; }
 .btn.icon-only svg { width: 14px; height: 14px; }
+
+.rescue { padding: 8px 0; border-top: 1px solid var(--line); }
+.rescue:first-of-type { border-top: 0; }
+.rescue ol { margin: 6px 0 4px 18px; padding: 0; }

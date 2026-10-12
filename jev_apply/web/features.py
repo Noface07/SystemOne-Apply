@@ -38,8 +38,12 @@ SAFETY = [
     ("portal_accounts", "Sign in / sign up on portals for me", "Workday, iCIMS... without a Google button: your "
      "e-mail and the portal password from System settings. A refused sign-in isn't retried."),
     ("login_wait_s", "Wait at a sign-in page (s)", "How long a run waits for you to sign in. 0 stops at once."),
-    ("teacher", "Teacher (Claude) answers from your profile", "Before asking you: Claude answers what your "
-     "profile settles, citing the fact; checked, then reused without Claude. Off: questions come to you."),
+    ("pace_s", "Pause after each action (s)", "A person's pace: the site draws what changed before the next "
+     "look. Raise it if fields get missed on a slow site."),
+    ("pace_after_next_s", "Pause after Save / Next (s)", "The next page needs longer to draw."),
+    ("teacher", "Claude helps when the rules can't", "Answers what your profile settles (citing the fact, checked, "
+     "then reused without Claude), finds your answer in a list worded differently (\"BS\" for B.Tech) and gets a "
+     "stuck page moving (up to 5 checked steps, 3 times a run). Never a submit or an invented fact. Off: all to you."),
     ("answer_wait_s", "Wait for your answers (s)", "A required question nothing on file answers: the run waits "
      "this long for you to answer it in Questions, then carries on. 0: it stops, to re-run later."),
     ("confirm_wait_s", "Wait for the site's confirmation (s)", "After Submit."),
@@ -82,8 +86,10 @@ def save_safety(track, values):
             value = int(value)
         elif kind in (float, "float"):
             value = float(value)
-            if not 0 <= value <= 1:
+            if name.startswith("min_") and not 0 <= value <= 1:  # how sure the model must be: a probability
                 raise ValueError(f"{name} must be between 0 and 1")
+            if name.startswith("pace_") and not 0 <= value <= 10:  # seconds between actions
+                raise ValueError(f"{name} must be between 0 and 10 seconds")
         if name.endswith(("_s", "_days")) or name == "per_company":
             if value < 0:
                 raise ValueError(f"{name} can't be negative")
@@ -206,16 +212,16 @@ def clef_status():
     from .. import clef_backend
 
     s = clef_backend.settings()
-    free = clef_backend.commit_free_gb()
-    need = clef_backend.needed_gb(s) if s["path"] and Path(s["path"]).is_file() else None
+    mem = clef_backend.memory(s)  # the same numbers Clef's start is judged on (page file room included)
     running = clef_backend.healthy(s["base"])
     state = "running" if running else _clef["state"] if _clef["state"] == "starting" else "stopped"
     return {
         "state": state,
         "error": _clef["error"],
         "owned": clef_backend._server is not None,
-        "memory_free_gb": round(free, 1) if free is not None else None,
-        "memory_needed_gb": round(need + 1, 1) if need else None,
+        "memory_free_gb": round(mem["free"], 1) if mem["free"] is not None else None,
+        "memory_page_file_gb": round(mem["page_file"], 1),
+        "memory_needed_gb": round(mem["needed"], 1) if mem["needed"] else None,
         "gpu": gpu(),
     }
 
@@ -303,7 +309,18 @@ def insights():
         "companies": sorted(companies.items(), key=lambda kv: -kv[1])[:12],
         "total_runs": len(runs),
         "total_sent": len(apps),
+        "metrics": _metrics(),
     }
+
+
+def _metrics():
+    """`jev-apply metrics` for the page: first-run Review rate per site and ATS, stop codes, rescues, closest picks."""
+    from .. import metrics
+
+    s = metrics.summary(metrics.load(data.runs_dir(), read=data.read_report))
+    slowest = sorted(s["runs_until_reached"].items(), key=lambda kv: -kv[1])[:8]
+    return {**s, "runs_until_reached": slowest, "closest": dict(s["closest"]),
+            "rescues": {**s["rescues"], "why_not": [list(x) for x in s["rescues"]["why_not"]]}}  # fmt: skip
 
 
 # ---- 3. review queue ------------------------------------------------------------------------------------------
@@ -724,16 +741,61 @@ def answer_bank():
             stored = json.loads(path.read_text(encoding="utf-8")).get("answers") or []
         except ValueError:
             continue
-        label = "answers.json" if kind == "answers" else "Saved while applying"
+        label = {"answers": "answers.json", "teacher": "Claude, from your profile"}.get(kind, "Saved while applying")
+        profiles = _track_profiles() if kind == "teacher" else []
         for n, entry in enumerate(stored):
             if entry.get("question") and entry.get("answer") is not None:
-                items.append({"id": f"{kind}:{track}:{n}", "source": label, "track": track,
-                              "question": entry["question"], "answer": entry["answer"], "options": []})  # fmt: skip
+                item = {"id": f"{kind}:{track}:{n}", "source": label, "track": track, "kind": kind,
+                        "question": entry["question"], "answer": entry["answer"], "options": []}  # fmt: skip
+                if kind == "teacher":
+                    # A lesson is used only while it still holds against a profile (Profile.load): its fact unchanged
+                    from ..teacher import still_holds
+
+                    item["fact"] = entry.get("fact")
+                    item["inactive"] = bool(profiles) and not any(still_holds(entry, p) for p in profiles)
+                items.append(item)
+    items += _list_wordings()
     for item in items:
+        if item.get("kind") == "closest":
+            continue  # picked on its sites (hosts), not typed as a saved answer
         hits = [when for asked, when in used if asked and same(item["question"], asked)]
         item["times_used"] = len(hits)
         item["last_used"] = max((w for w in hits if w), default=None)
     return sorted(items, key=lambda i: (-(i["times_used"]), i["question"].lower()))
+
+
+def _track_profiles():
+    """Each track's profile as runs load it (a lesson holds when it holds for one of them)."""
+    out = []
+    for t in data.tracks():
+        try:
+            out.append(data.load_track(data.track_folder(t["id"]))[0])
+        except Exception:  # noqa: BLE001 - a track that doesn't load just isn't checked
+            continue
+    return out
+
+
+def _equivalents_path():
+    return data.data_dir() / "equivalents.json"
+
+
+def _list_wordings():
+    """Your answers in other lists' words (teacher.closest_option, data/equivalents.json): "BS" for B.Tech."""
+    path = _equivalents_path()
+    try:
+        stored = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+    except ValueError:
+        return []
+    items = []
+    for entry, picks in stored.items():
+        key, _, value = entry.partition("|")
+        for option, seen in picks.items():
+            hosts = seen.get("hosts") or []
+            items.append({"id": f"closest:{entry}||{option}", "source": "List wording (Claude)", "track": None,
+                          "kind": "closest", "question": f"{key.split('.')[-1].replace('_', ' ')}: {value}",
+                          "answer": option, "options": [], "match": seen.get("match"), "hosts": hosts,
+                          "readonly": True, "times_used": 0, "last_used": None})  # fmt: skip
+    return items
 
 
 def _answer_target(answer_id):
@@ -748,6 +810,8 @@ def _answer_target(answer_id):
 
 
 def update_answer(answer_id, answer):
+    if answer_id.startswith("closest:"):
+        raise ValueError("A list wording can only be removed; the next list asks Claude again.")
     kind, _, n, path = _answer_target(answer_id)
     text = " ".join(str(answer or "").split()) if kind == "questions" else str(answer or "").strip()
     if kind == "questions":
@@ -761,6 +825,17 @@ def update_answer(answer_id, answer):
 
 
 def delete_answer(answer_id):
+    if answer_id.startswith("closest:"):
+        entry, _, option = answer_id[len("closest:"):].partition("||")
+        path = _equivalents_path()
+        stored = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+        if option not in (stored.get(entry) or {}):
+            raise ValueError("no such answer")
+        del stored[entry][option]
+        if not stored[entry]:
+            del stored[entry]
+        write_json(path, stored)
+        return answer_bank()
     kind, _, n, path = _answer_target(answer_id)
     if kind == "questions":
         data.answer_question(n, "")  # back to an open question
