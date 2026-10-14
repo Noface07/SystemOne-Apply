@@ -245,6 +245,14 @@ def main():
             city and not re.search(r"Date of Birth|Personal information|Marital", city.get("context") or ""),
             city,
         )
+        citizenship = find(page, "Citizenship Status", "fill")
+        month = next((a for a in page["actions"] if a["label"] == "Month" and "Date of Birth" in (a.get("context") or "")),
+                     None)  # fmt: skip
+        check(
+            "a field beside a date's boxes in its group isn't the date (GEA: Citizenship got the birth date)",
+            citizenship and "Date of Birth" not in (citizenship.get("context") or "") and month,
+            [citizenship, month],
+        )
         check("a table row's first cell is the radios' question", find(page, "No", context="valid passport"))
         night = find(page, "No", context="night shifts")
         check("div Yes/No choices offered with their question", night and night.get("chosen") == "false", night)

@@ -98,9 +98,14 @@ def test_a_rule_answers_value_source_without_calling_any_model(monkeypatch):
 
 
 def test_tag_fields_stop_at_the_limit_they_state():
-    action = field("Key skills (add up to 2)", multiple=True, context="")
+    """The limit counts skills added, not searches: one the site doesn't list costs a search (HPE kept 6 of 12)."""
     tried = {safe_id("skills.item_1"), safe_id("skills.item_2")}
-    assert rules.match(action, PROFILE, False, tried) == "SKIP_FIELD"
+    full = field("Key skills (add up to 2)", multiple=True, context="Key skills (add up to 2) Python × Go ×")
+    assert rules.match(full, PROFILE, False, tried) == "SKIP_FIELD"
+    missed = field("Key skills (add up to 2)", multiple=True, context="")  # neither was found
+    assert rules.match(missed, PROFILE, False, tried) == safe_id("skills.item_3")
+    tried |= {safe_id("skills.item_3"), safe_id("skills.item_4")}
+    assert rules.match(missed, PROFILE, False, tried) == "SKIP_FIELD"  # twice the limit searched: done
 
 
 WORKDAY = Profile(
@@ -524,6 +529,10 @@ def test_certifications_come_from_the_profile_fact():
     asked = field("Have you completed any relevant certifications or training programs? Please list them.")
     assert rules.match(asked, profile) == safe_id("certifications")
     assert rules.match(field("Certification number"), profile) != safe_id("certifications")
+    listed = field("Please enter any professional licenses or certifications you may have, including the "
+                   "expiration date for each license.")  # Harman: the list, though it names the date
+    assert rules.match(listed, profile) == safe_id("certifications")
+    assert rules.match(field("Certification expiration date"), profile) != safe_id("certifications")
     assert rules.match(field("Upload your certifications", kind="upload"), profile) != safe_id("certifications")
     # Without the fact, nothing stands in for it: drafted (and asked when the facts don't cover it).
     assert rules.match(asked, PROFILE) == "DRAFT_ANSWER"
@@ -619,3 +628,133 @@ def test_blue_yonders_eligibility_and_signature_date_are_answered():
     assert rules.key_for(field("Date"), profile, set()) == "application.today"
     assert rules.key_for(field("Month", context="From*"), profile, set()) != "application.today"  # a job's dates
     assert isinstance(Fact, type)
+
+
+def test_a_fields_own_label_wins_over_the_question_around_it():
+    """GEA: "Citizenship Status" read with "Date of Birth*" around it got the birth date typed into its search."""
+    data = json.loads((ROOT / "data" / "profile.example.json").read_text(encoding="utf-8"))
+    personal = {**data["personal"], "date_of_birth": "2002-02-07", "citizenship_country": "India",
+                "citizenship_status": "Citizen"}  # fmt: skip
+    profile = Profile({**data, "personal": personal}, ROOT / "data")
+    citizenship = field("Citizenship Status", context="Date of Birth*")
+    assert rules.family(rules.key_for(citizenship, profile, set())) == "personal.citizenship_country"
+    ctc = field("Current CTC", context="Current CTC in LPA")  # the context still says the unit
+    assert rules.key_for(ctc, profile, set()) == rules.key_for(field("Current CTC in LPA"), profile, set())
+
+
+def test_your_record_answers_ncrs_declarations():
+    """NCR Atleos: bankruptcy, convictions, misconduct, Board of Director commitments; you stated a clean record."""
+    profile = Profile.load(ROOT / "data" / "dotnet" / "profile.json") if (ROOT / "data" / "dotnet").is_dir() else None
+    if profile is None or "background.convicted" not in profile.facts:
+        pytest.skip("needs your profile with its background section")
+    cases = {
+        "Were you involved in bankruptcy, financial delinquency or any other litigation?*": "No",
+        "I confirm that I have not been convicted by a court in any criminal offence*": "Yes",
+        "Have you ever been convicted of a criminal offence?": "No",
+        "Were any of your previous employment or services suspended or terminated on the grounds of misconduct, "
+        "fraud or abandonment of services?*": "No",
+        "Do you have any Board of Director commitments and/or business relationships that may pose a competing "
+        "interest to NCR Atleos?*": "No",
+        "Do you have a disability?": "No",
+    }
+    for question, answer in cases.items():
+        choice = rules.match(field(question), profile)
+        assert choice and profile.by_id[choice].value == answer, (question, choice)
+
+
+def test_an_attestations_signature_gets_your_full_name_once_you_agreed():
+    """Blue Yonder's "Signed:" box: your full name, as you agreed; asked when you haven't. Non-compete: your answer."""
+    data = json.loads((ROOT / "data" / "profile.example.json").read_text(encoding="utf-8"))
+    attest = field("Attestation and acknowledgement statement By signing below, I hereby attest ... Signed:")
+    without = Profile(data, ROOT / "data")
+    assert rules.match(attest, without) == "ASK_USER"
+    agreed = Profile({**data, "background": {"sign_attestations": "Yes", "non_compete": "No"}}, ROOT / "data")
+    assert agreed.by_id[rules.match(attest, agreed)].key == "personal.full_name"
+    assert rules.key_for(field("Date", context="Signed: Date"), agreed, set()) != "personal.full_name"
+    q = "Are you subject to a non-compete/non-solicitation or other post-employment restriction?*"
+    assert agreed.by_id[rules.match(field(q), agreed)].value == "No"
+
+
+def test_a_language_level_is_asked_until_it_is_on_file():
+    """Harman's Languages block: "Overall" (1 - Beginner … 6 - Native) is your English level, never guessed."""
+    overall = {"kind": "click", "role": "button", "label": "Overall Select One Required", "section": "Languages 1"}
+    rating = {"kind": "fill", "label": "Overall rating of the interview", "section": "Feedback"}
+    assert rules.key_for(overall, WORKDAY, set(), page_text="Languages") == "ASK_USER"
+    assert rules.key_for(rating, WORKDAY, set(), page_text="Languages") != "language_levels.english"
+
+
+def test_the_fluent_in_this_language_box_follows_your_english_level():
+    box = {"kind": "click", "role": "checkbox", "label": "I am fluent in this language.", "section": "Languages 1"}
+    assert rules.key_for(box, WORKDAY, set(), page_text="Languages") == "ASK_USER"  # nothing on file: asked
+    data = json.loads((ROOT / "data" / "profile.example.json").read_text(encoding="utf-8"))
+    profile = Profile({**data, "language_levels": {"english": "Fluent", "english_fluent": "Yes"}}, ROOT / "data")
+    assert rules.key_for(box, profile, set(), page_text="Languages") == "language_levels.english_fluent"
+
+
+def test_holding_a_work_permit_is_your_authorization_not_a_visa_need():
+    """HPE: "Do you possess a valid work permit?" went to the sponsorship fact, whose No is the wrong answer."""
+    data = json.loads((ROOT / "data" / "profile.example.json").read_text(encoding="utf-8"))
+    profile = Profile(data, ROOT / "data")
+    profile.note_job_country("India")
+    held = rules.key_for(field("Do you possess a valid work permit for the country you are applying to?"), profile, set())
+    assert held == "work_authorization.authorized_to_work_in_india"
+    need = "Will you need support for a work visa and residence permit?"
+    assert rules.key_for(field(need), profile, set()) == "work_authorization.requires_visa_sponsorship"
+
+
+def test_hpe_declarations_come_from_your_stated_answers():
+    """HPE: US government work, export-control countries, conflicts, a non-compete in other words, permits. The
+    salary rule ("compensation") and the years rule ("employment experience") had taken two of them."""
+    data = json.loads((ROOT / "data" / "profile.example.json").read_text(encoding="utf-8"))
+    data["personal"]["citizenship_country"] = "India"
+    data["personal"]["other_citizenship_or_residency"] = "No"
+    data["background"] = {"us_government_employment": "No", "government_official_relationship": "No",
+                          "competing_interests": "No", "non_compete": "No"}  # fmt: skip
+    profile = Profile(data, ROOT / "data")
+    profile.note_job_country("India")
+
+    def key(q):
+        return rules.key_for({"kind": "click", "role": "button", "label": "Select One Required", "context": q},
+                             profile, set())  # fmt: skip
+
+    assert key("I have United States government or public institution employment experience (federal, state, or "
+               "local) either as an employee or contractor/consultant.") == "background.us_government_employment"
+    countries = ("For any of the countries listed below: Are you a citizen or have a passport, or Have been granted a "
+                 "permanent resident status? Armenia, Belarus, China(PRC), Cuba, Iran, Russia, Vietnam, or Yemen")
+    assert key(countries) == "personal.other_citizenship_or_residency"
+    assert key(countries.replace("Cuba", "India")) == "ASK_USER"  # your own country listed: yours to answer
+    assert key("HPE Policy prohibits activities that pose a conflict(s) of interest such as: Outside employment with "
+               "or receiving compensation from a customer") == "background.competing_interests"
+    assert key("Have you signed or accepted any agreement with a current or prior employer that includes "
+               "restrictions on competition or solicitation") == "background.non_compete"
+    assert key("Legal and ethical restrictions may apply with respect to relationships with government officials. "
+               "To avoid a conflict of interest") == "background.government_official_relationship"
+    for permit in ("work", "residency"):
+        assert key(f"Do you possess a valid {permit} permit in the country for which the position resides?") == (
+            "work_authorization.authorized_to_work_in_india"
+        )  # "Required" on the button is not a need for a visa
+
+
+def test_base_plus_bonus_is_the_total_not_the_base():
+    """Stryker: "annual compensation (base plus bonus and/or commission) desired" read as the base, left empty."""
+    q = "Please provide the annual compensation (base plus bonus and/or commission) desired to consider a role."
+    assert rules.key_for(field(q), PROFILE, set()) == "compensation.expected.total_annual"
+    assert rules.key_for(field("Expected base salary (annual)"), PROFILE, set()) == "compensation.expected.fixed_annual"
+
+
+def test_worked_with_a_company_before_is_your_record_not_a_skill():
+    """Arabelle: "Have you worked with Arabelle Solutions before?" (Workday's candidateIsPreviousWorker) went
+    unanswered: "worked with" was read as a tool. A skill of yours after "with" still is one."""
+    company = field("Have you worked with Arabelle Solutions before?")
+    assert rules.key_for(company, PROFILE, set()) == "work.worked_for_this_company_before"
+    radio = {"kind": "click", "role": "radio", "label": "No", "field_id": "candidateIsPreviousWorker", "context": ""}
+    assert rules.key_for(radio, PROFILE, set()) == "work.worked_for_this_company_before"
+    assert rules.key_for(field("Have you worked with Python before?"), PROFILE, set()) != (
+        "work.worked_for_this_company_before"
+    )
+
+
+def test_current_or_most_recent_employer_is_your_company():
+    """Aptiv: "Who is your current or most recent employer?" was left for Claude."""
+    q = field("Who is your current or most recent employer? (Enter the legal name)")
+    assert rules.key_for(q, PROFILE, set()) == "work.current_company"

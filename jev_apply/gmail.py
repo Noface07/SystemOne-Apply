@@ -210,6 +210,20 @@ def recent(data_dir, since, url):
     return [(s, subj, text) for _, _, s, subj, text in sorted(out)]
 
 
+def applied_before(data_dir, url):
+    """Has this company's own Workday (<tenant>@myworkday.com) written to you about an application before ("We've
+    received your application")? None when Gmail isn't connected or the portal isn't a Workday one; read-only."""
+    _, tenant = senders_for(url)
+    if not tenant or not configured(data_dir):
+        return None
+    query = (f"from:{tenant}@myworkday.com subject:(application OR applying OR applied OR received OR "
+             f"\"thank you\") -subject:(verify OR verification OR password OR reset OR activate)")  # fmt: skip
+    try:
+        return bool(get(data_dir, "messages", q=query, maxResults=1).get("messages"))
+    except Exception:  # noqa: BLE001 - a Gmail hiccup leaves the record as the only answer
+        return None
+
+
 def code_in(subject, text):
     found = CODE.search(f"{subject}\n{text}")
     return next((g for g in (found.group(1), found.group(2)) if g), None) if found else None

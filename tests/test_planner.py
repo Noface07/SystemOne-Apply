@@ -1405,3 +1405,286 @@ def test_a_portal_start_page_that_wants_an_account_first_is_a_sign_in(tmp_path):
         assert not policy.submit_like(button(start))
     for final in ("Apply", "Apply Now", "Submit", "Submit Application", "Easy Apply"):
         assert policy.submit_like(button(final))
+
+
+def test_a_workday_step_still_loading_is_waited_for_not_saved_unseen(laya):
+    """GEA: every Workday step has one address; the earlier steps' fields counted as "worked here", so Application
+    Questions, still "Loading", was saved after two waits and its questions never answered."""
+    wait = {"id": "wait", "kind": "wait", "label": "Wait for the page to update"}
+    loading = {**page(button(1, "Save and Continue"), wait), "text": "Application Questions Loading Back Save"}
+    url = loading["url"]
+    earlier = [{"kind": "fill", "action": "Job Title", "url": url, "page_changed": True},
+               {"kind": "click", "action": "Save and Continue", "url": url, "page_changed": True},
+               {"kind": "wait", "url": url}, {"kind": "wait", "url": url}]  # fmt: skip
+    assert model.choose(loading, "goal", earlier, CANDIDATE)["operation"] == "WAIT"
+
+
+def test_a_create_account_form_gets_your_email_in_every_box_that_asks_for_it():
+    """Mercedes: User Name (already your e-mail), Password, Re-enter Password, Email Address and Re-enter Email
+    Address. Only the first e-mail-like box was looked at, so the two Email Address boxes stayed empty."""
+    from jev_apply import accounts
+
+    user = fill(1, "User Name", "yuvrajsoni7@gmail.com")
+    mail, again = fill(2, "Email Address"), fill(3, "Re-enter Email Address")
+    pw1 = {**fill(4, "Password"), "input_type": "password", "secret": True}
+    pw2 = {**fill(5, "Re-enter Password"), "input_type": "password", "secret": True}
+    register = button(6, "Register")
+    form = {**page(user, mail, again, register), "secrets": [pw1, pw2], "text": "Create an account"}
+    assert accounts.plan(form, known=False)[:2] == ("fill", mail)
+    form["actions"][1] = {**mail, "value": "yuvrajsoni7@gmail.com"}
+    assert accounts.plan(form, known=False)[:2] == ("fill", again)
+    form["actions"][2] = {**again, "value": "yuvrajsoni7@gmail.com"}
+    assert accounts.plan(form, known=False)[:2] == ("fill", pw1)
+
+
+def test_a_way_into_the_form_tried_before_signing_in_is_offered_again_after(laya):
+    """NCR Atleos: "Use My Last Application" led to the sign-in; once signed in, every way counted as tried, so none
+    was picked and Apply was pressed three times without effect."""
+    url = "https://ncratleos.wd1.myworkdayjobs.com/ext/job/HYD/SWE_R1"
+    ways = [button(1, "Autofill with Resume"), button(2, "Apply Manually"), button(3, "Use My Last Application")]
+    before = [{"kind": "click", "action": "Use My Last Application", "url": url},
+              {"kind": "click", "action": "Autofill with Resume", "url": url},
+              {"kind": "click", "action": "Apply Manually", "url": url}]  # fmt: skip
+    assert planner.way_to_start(ways, before, url) is None  # all tried, no sign-in since
+    signed = before + [{"kind": "click", "action": "click: Sign In", "source": "portal account", "url": url}]
+    assert planner.way_to_start(ways, signed, url)["label"] == "Use My Last Application"
+
+
+def test_a_step_whose_fields_were_all_left_is_not_waited_on_at_length(laya):
+    """NCR Atleos: after Save the page's remaining question had been left for you, so it looked empty; the planner
+    waited 75 times after each Save, three times, until the run's budget ran out."""
+    wait = {"id": "wait", "kind": "wait", "label": "Wait for the page to update"}
+    left = {**page(button(1, "Save and Continue"), wait), "text": "Application Questions Back Save and Continue"}
+    url = left["url"]
+    history = [{"kind": "fill", "action": "Phone Number", "url": url, "page_changed": True},
+               {"kind": "click", "action": "Save and Continue", "url": url, "page_changed": True},
+               {"kind": "wait", "url": url}, {"kind": "wait", "url": url}]  # fmt: skip
+    assert model.choose(left, "goal", history, CANDIDATE)["operation"] != "WAIT"  # not "Loading": no long wait
+
+
+def test_errors_already_on_a_step_when_it_opens_are_filled_past_first(laya):
+    """NCR Atleos: its draft reopened Application Questions with an earlier run's "Errors Found"; the last Save was
+    the one that left My Experience, so the errors looked like the site refusing it, and nothing was filled."""
+    url = "https://jobs.example/apply"
+    sponsor = fill(1, "Do you require sponsorship?", required=True, invalid=True)
+    text = "current step 4 of 6 Application Questions Errors Found"
+    history = [{"kind": "click", "action": "Save and Continue", "url": url, "page_changed": True, "form_step": "3"}]
+    assert planner.stale_errors([sponsor], history, url, text)  # opened with them: fill first
+    history.append({"kind": "click", "action": "Save and Continue", "url": url, "page_changed": True,
+                    "form_step": "4"})  # fmt: skip
+    assert not planner.stale_errors([sponsor], history, url, text)  # saved here, nothing answered: they stand
+
+
+def test_a_resume_listed_below_the_screen_is_not_uploaded_again(laya):
+    """NCR Atleos: three copies of the same résumé after three runs; its card sat below the upload box, out of the
+    page text the planner read, so each run uploaded it again."""
+    candidate = {**CANDIDATE, "document.resume": "Yuvraj_Soni_Resume_CSharp_DotNET.pdf"}
+    upload = {"id": "u1", "node": 40, "kind": "upload", "role": "file", "label": "Drop files here or Select files",
+              "value": "", "context": "Resume/CV"}  # fmt: skip
+    listed = {**page(upload, button(60, "Save and Continue")), "text": "Resume/CV Drop files here",
+              "files": ["Yuvraj_Soni_Resume_CSharp_DotNET.pdf"]}  # fmt: skip
+    assert model.choose(listed, "goal", [], candidate)["operation"] != "UPLOAD"
+
+
+def test_a_file_card_counts_as_uploaded_and_a_second_copy_is_deleted(laya):
+    """Harman: the draft's résumé card ("Delete x.pdf") was there before its name showed in the text, so the run
+    uploaded a second copy. A card counts as uploaded; two cards of your résumé: one is deleted, once."""
+    name = "YuvrajSoni_GenAI-ML_Resume.pdf"
+    candidate = {**CANDIDATE, "document.resume": name}
+    upload = {"id": "u1", "node": 40, "kind": "upload", "role": "file", "label": "Drop files here or Select files",
+              "value": "", "context": "Resume/CV"}  # fmt: skip
+    one = {**page(upload, button(60, "Save and Continue")), "text": "Resume/CV", "file_cards": [name]}
+    assert model.choose(one, "goal", [], candidate)["operation"] != "UPLOAD"
+    first, second = button(50, f"Delete {name}"), button(51, f"Delete {name}")
+    two = {**page(first, second, upload, button(60, "Save and Continue")), "text": "Resume/CV",
+           "file_cards": [name, name]}  # fmt: skip
+    d = model.choose(two, "goal", [], candidate)
+    assert d["operation"] == "CLICK" and d["action"]["node"] == 51  # the later copy
+    pressed = [{"kind": "click", "action": f"Delete {name}", "url": two["url"]}]
+    assert model.choose(two, "goal", pressed, candidate)["action"]["label"] != f"Delete {name}"  # once per copy
+    other = {**two, "file_cards": ["cover.pdf", "cover.pdf"]}  # not your résumé: left alone
+    assert (model.choose(other, "goal", [], candidate).get("action") or {}).get("label", "").startswith("Delete") is False
+
+
+def test_copies_of_your_resume_off_screen_are_scrolled_to(laya):
+    """Harman: both cards sat at the foot of My Experience, out of view, so their Delete was never shown."""
+    name = "YuvrajSoni_GenAI-ML_Resume.pdf"
+    candidate = {**CANDIDATE, "document.resume": name}
+    down = {"id": "scroll_down", "kind": "scroll", "label": "Scroll down", "x": 1, "y": 1, "delta": 400}
+    off = {**page(button(60, "Save and Continue"), down), "file_cards": [name, name],
+           "file_card_where": ["below", "below"]}  # fmt: skip
+    assert model.choose(off, "goal", [], candidate)["operation"] == "SCROLL_DOWN"
+
+
+def test_a_single_box_a_fact_answers_yes_is_ticked_once(laya):
+    """Harman's "I am fluent in this language." stayed unticked for English: Fluent."""
+    candidate = {**CANDIDATE, "language_levels.english_fluent": "Yes"}
+    box = {"id": "c1", "node": 7, "kind": "click", "role": "checkbox", "label": "I am fluent in this language.",
+           "checked": "false", "section": "Languages 1"}  # fmt: skip
+    form = {**page(box, button(60, "Save and Continue")), "text": "Languages"}
+    d = model.choose(form, "goal", [], candidate)
+    assert d["operation"] == "CLICK" and d["action"]["id"] == "c1"
+    ticked = [{"kind": "click", "action": box["label"], "url": form["url"]}]
+    assert (model.choose(form, "goal", ticked, candidate).get("action") or {}).get("id") != "c1"  # once
+    assert (model.choose({**form, "actions": [{**box, "checked": "true"}, button(60, "Save and Continue")]}, "goal",
+                         [], candidate).get("action") or {}).get("id") != "c1"  # never untick  # fmt: skip
+    assert (model.choose(form, "goal", [], CANDIDATE).get("action") or {}).get("id") != "c1"  # nothing on file
+
+
+def test_a_site_pick_that_is_not_what_was_typed_is_searched_again_shorter(laya):
+    """HPE: "Computer Science and Engineering" + Enter, and Workday chose its only result "Electrical Engineering and
+    Computer Science" by itself. The pick is removed once, and the box searched for "Computer Science"."""
+    url = "https://jobs.example/apply"
+    typed = {"kind": "fill", "action": "Field of Study", "typed": "Computer Science and Engineering",
+             "section": "Education 1", "url": url}  # fmt: skip
+    entered = {"kind": "enter", "action": "Press Enter in 'Field of Study'", "section": "Education 1", "url": url}
+    chip = {"id": "c1", "node": 170, "kind": "click", "role": "option", "section": "Education 1",
+            "label": "Electrical Engineering and Computer Science, press delete to clear value.", "value": ""}  # fmt: skip
+    remove = button(171, "Remove: Electrical Engineering and Computer Science", section="Education 1")
+    picked = page(chip, remove, button(60, "Save and Continue"))
+    d = model.choose(picked, "goal", [typed, entered], CANDIDATE)
+    assert d["operation"] == "CLICK" and d["action"]["node"] == 171 and d["action"]["context"] == "Field of Study"
+    removed = {"kind": "click", "action": remove["label"], "context": "Field of Study", "url": url}
+    box = fill(169, "Field of Study", section="Education 1", role="combobox")
+    d = model.choose(page(box, button(60, "Save and Continue")), "goal", [typed, entered, removed], CANDIDATE)
+    assert d["operation"] == "TYPE_TEXT" and d["action"].get("retype") == "Computer Science"
+    # Your own pick (clicked from the list) stays, and a removed pick is never removed twice
+    clicked = {"kind": "click", "action": "Electrical Engineering and Computer Science not checked", "url": url}
+    assert (model.choose(picked, "goal", [typed, entered, clicked], CANDIDATE).get("action") or {}).get("node") != 171
+    assert (model.choose(picked, "goal", [typed, entered, removed], CANDIDATE).get("action") or {}).get("node") != 171
+
+
+def test_a_workday_yes_no_against_your_answer_is_opened_again(laya):
+    """HPE: the draft held "YES" for the export-control countries question, answered before the rule existed."""
+    candidate = {**CANDIDATE, "background.non_compete": "No"}
+    q = "Are you bound by a non-compete agreement?"
+    wrong = button(5, "YES Required", context=q)
+    d = model.choose(page(wrong, button(60, "Save and Continue")), "goal", [], candidate)
+    assert d["operation"] == "CLICK" and d["action"]["node"] == 5
+    right = button(5, "No Required", context=q)
+    assert (model.choose(page(right, button(60, "Save and Continue")), "goal", [], candidate).get("action")
+            or {}).get("node") != 5  # fmt: skip
+    opened = [{"kind": "click", "action": wrong["label"], "context": q, "url": "https://jobs.example/apply"}]
+    assert (model.choose(page(wrong, button(60, "Save and Continue")), "goal", opened, candidate).get("action")
+            or {}).get("node") != 5  # once  # fmt: skip
+
+
+def test_a_drafts_wrong_pick_is_found_by_its_field_name(laya):
+    """HPE's draft kept "Electrical Engineering and Computer Science" from an earlier run: no typing in this run says
+    what was searched, so the site's field name (fieldOfStudy) gives your answer."""
+    url = "https://jobs.example/apply"
+    candidate = {**CANDIDATE, "education.0.field": "Computer Science and Engineering"}
+    chip = {"id": "c1", "node": 170, "kind": "click", "role": "option", "section": "Education 1",
+            "field_id": "fieldOfStudy", "value": "",
+            "label": "Electrical Engineering and Computer Science, press delete to clear value."}  # fmt: skip
+    remove = button(171, "Remove: Electrical Engineering and Computer Science", section="Education 1",
+                    field_id="fieldOfStudy")  # fmt: skip
+    d = model.choose(page(chip, remove, button(60, "Save and Continue")), "goal", [], candidate)
+    assert d["operation"] == "CLICK" and d["action"]["node"] == 171
+    assert d["action"]["answer"] == "Computer Science and Engineering"
+    removed = {"kind": "click", "action": remove["label"], "context": d["action"]["context"], "url": url,
+               "answer": "Computer Science and Engineering"}  # fmt: skip
+    box = fill(169, "Field of Study", section="Education 1", role="combobox", field_id="fieldOfStudy")
+    d = model.choose(page(box, button(60, "Save and Continue")), "goal", [removed], candidate)
+    assert d["operation"] == "TYPE_TEXT" and d["action"].get("retype") == "Computer Science"
+
+
+def test_a_long_question_is_shortened_and_a_refused_request_is_no_pick(monkeypatch):
+    """HPE: a paragraph-long question overflowed Clef's window, its HTTP 400 crashed the run."""
+    from jev_apply import model as backend
+
+    sent = []
+
+    def refuse(body):
+        sent.append(body)
+        raise RuntimeError("Decision model returned HTTP 400: the request exceeds the available context size")
+
+    monkeypatch.setattr(backend, "systemone", refuse)
+    options = [button(1, "Yes"), button(2, "No")]
+    question = "HPE Policy prohibits conflicts of interest. " * 40 + "Would you be engaging in any of these?"
+    assert planner.laya_pick(question, options, {"personal.first_name": "Aarav"}) is None
+    assert len(sent[0]["state"]["field"]["label"]) < 700 and sent[0]["state"]["field"]["label"].endswith("these?")
+    monkeypatch.setattr(backend, "systemone", lambda body: (_ for _ in ()).throw(RuntimeError("unavailable")))
+    with pytest.raises(RuntimeError):  # the model down is not a refusal: the run stops
+        planner.laya_pick(question, options, {"personal.first_name": "Aarav"})
+
+
+def test_a_skill_chip_is_never_taken_for_a_wrong_single_pick(laya):
+    """HPE: the draft check read a skills chip ("ChromaDB") against your whole skills list and removed it."""
+    candidate = {**CANDIDATE, "skills": "Python, ChromaDB"}  # as the planner's facts hold it: one list, no items
+
+    def chip(n, name):
+        return {"id": f"c{n}", "node": n, "kind": "click", "role": "option", "section": "", "field_id": "skills",
+                "value": "", "label": f"{name}, press delete to clear value."}  # fmt: skip
+
+    one = page(chip(1, "ChromaDB"), button(2, "Remove: ChromaDB", field_id="skills"), button(60, "Save and Continue"))
+    assert (model.choose(one, "goal", [], candidate).get("action") or {}).get("node") != 2
+    two = page(chip(1, "ChromaDB"), button(2, "Remove: ChromaDB", field_id="skills"), chip(3, "Python"),
+               button(4, "Remove: Python", field_id="skills"), button(60, "Save and Continue"))  # fmt: skip
+    assert (model.choose(two, "goal", [], candidate).get("action") or {}).get("node") not in {2, 4}
+
+
+def test_a_site_pick_that_is_your_answer_shorter_stays(laya):
+    """Cisco: the school chip "Manipal University" for "Manipal University Jaipur" was removed, then picked again."""
+    url = "https://jobs.example/apply"
+    typed = {"kind": "fill", "action": "School or University", "typed": "Manipal University Jaipur",
+             "section": "Education 1", "url": url}  # fmt: skip
+    chip = {"id": "c1", "node": 170, "kind": "click", "role": "option", "section": "Education 1", "value": "",
+            "label": "Manipal University, press delete to clear value."}  # fmt: skip
+    remove = button(171, "Remove: Manipal University", section="Education 1")
+    d = model.choose(page(chip, remove, button(60, "Save and Continue")), "goal", [typed], CANDIDATE)
+    assert (d.get("action") or {}).get("node") != 171
+
+
+def test_once_applied_manually_the_dialog_is_answered_manually_again():
+    """Deluxe: after each sign-in its start dialog was answered "Use My Last Application" again, which led to the
+    sign-in, the home page and back: a loop. Once the run went manual, manual it stays."""
+    url = "https://deluxe.wd5.myworkdayjobs.com/usa_can/job/x"
+    dialog = [button(1, "Autofill with Resume"), button(2, "Apply Manually"), button(3, "Use My Last Application")]
+    assert planner.way_to_start(dialog, [], url)["label"] == "Use My Last Application"
+    went = [{"kind": "wait", "action": "Apply manually (the start page stayed empty)", "url": url + "/apply"},
+            {"kind": "click", "action": "click: Sign In", "source": "portal account", "url": url}]  # fmt: skip
+    assert planner.way_to_start(dialog, went, url)["label"] == "Apply Manually"
+
+
+def test_a_form_still_loading_or_signed_in_is_no_sign_in_wall():
+    """Deluxe: its Apply Manually form said "Loading" a while with a passing "Sign In": the run signed in again and
+    again. A header showing your e-mail, or a page still loading, is not a sign-in wall."""
+    url = "https://deluxe.wd5.myworkdayjobs.com/usa_can/job/x/apply/applyManually"
+    wall = {"url": url, "title": "", "text": "Software Engineer", "actions": [button(1, "Sign In")]}
+    assert planner.sign_in_to_apply(wall)
+    assert not planner.sign_in_to_apply({**wall, "text": "Software Engineer Loading"})
+    assert not planner.sign_in_to_apply({**wall, "actions": [button(1, "Sign In"), button(2, "yuvrajsoni7@gmail.com")]})
+
+
+def test_one_look_after_an_answer_before_save(laya):
+    """Deluxe: answering "employed by Deluxe?" drew the rest of My Information; Save went first, then eight errors."""
+    url = "https://jobs.example/apply"
+    no = {"id": "r2", "node": 2, "kind": "click", "role": "radio", "label": "No", "checked": "true",
+          "context": "Have you ever been employed by Deluxe?"}  # fmt: skip
+    wait = {"id": "wait", "kind": "wait", "label": "Wait for the page to update"}
+    form = page(fill(3, "City", "Udaipur"), no, button(60, "Save and Continue"), wait)
+    answered = [{"kind": "click", "action": "No", "context": no["context"], "url": url, "page_changed": True}]
+    assert model.choose(form, "goal", answered, CANDIDATE)["operation"] == "WAIT"
+    looked = answered + [{"kind": "wait", "action": wait["label"], "url": url, "page_changed": False}]
+    d = model.choose(form, "goal", looked, CANDIDATE)
+    assert d["operation"] == "CLICK" and d["action"]["label"] == "Save and Continue"
+
+
+def test_a_form_step_is_read_to_its_end_before_save(laya):
+    """HPE, Deluxe: a required consent box under a long block of terms; one scroll, then Save, then errors."""
+    url = "https://jobs.example/apply"
+    down = {"id": "scroll_down", "kind": "scroll", "label": "Scroll down", "x": 1, "y": 1, "delta": 400}
+    step = {**page(button(60, "Save and Continue"), down), "step": "current step 4 of 5 Voluntary Disclosures"}
+    once = [{"kind": "scroll", "action": "Scroll down", "url": url, "page_changed": True}]
+    assert model.choose(step, "goal", once, CANDIDATE)["operation"] == "SCROLL_DOWN"
+    bottom = once * 2 + [{"kind": "scroll", "action": "Scroll down", "url": url, "page_changed": False}] * 2
+    assert model.choose(step, "goal", bottom, CANDIDATE)["action"]["label"] == "Save and Continue"  # end reached
+
+
+def test_site_pick_counts_chips_among_other_options(laya):
+    """Arabelle: an option without a chip beside a chip made the chip count add None and crash the run."""
+    chip = {"id": "c1", "node": 1, "kind": "click", "role": "option", "field_id": "f", "section": "",
+            "label": "Python, press delete to clear value.", "value": ""}  # fmt: skip
+    plain = {"id": "o2", "node": 2, "kind": "click", "role": "option", "field_id": "f", "label": "Java", "value": ""}
+    assert planner.site_pick([plain, chip, plain], [], "https://jobs.example/apply") is None

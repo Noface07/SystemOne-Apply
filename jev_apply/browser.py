@@ -171,14 +171,42 @@ class Browser:
     def close(self):
         self.transport.close()
 
+    @property
+    def frozen(self):
+        """Three reads in a row went unanswered: the page's script is stuck, not loading."""
+        return getattr(self, "unanswered", 0) >= 3
+
+    def reopen(self, url):
+        """The same address in a fresh tab, when the transport can (Chrome); False otherwise."""
+        if not hasattr(self.transport, "reopen"):
+            return False
+        self.transport.reopen(url)
+        self.unanswered, self.after_input = 0, None
+        self.call("Emulation.setFocusEmulationEnabled", enabled=True)
+        self.install_helper()
+        self.wait_loaded()
+        return True
+
     def evaluate(self, expression, await_promise=False):
-        response = self.call("Runtime.evaluate", expression=expression, returnByValue=True, awaitPromise=await_promise)
+        try:
+            response = self.call(
+                "Runtime.evaluate", expression=expression, returnByValue=True, awaitPromise=await_promise
+            )
+        except TimeoutError:
+            # The page didn't answer in time (Stryker, while Google's sign-in window opened): busy, as a page that is
+            # navigating is; the next look at it says how it is. Never sent again from here.
+            self.unanswered = getattr(self, "unanswered", 0) + 1
+            raise StalePage("The page didn't answer (busy)") from None
+        self.unanswered = 0
         if response.get("exceptionDetails"):
             raise StalePage("Document changed during evaluation")
         return response.get("result", {}).get("value")
 
     def navigate(self, url):
-        self.call("Page.navigate", url=url)
+        try:
+            self.call("Page.navigate", url=url)
+        except TimeoutError:  # no answer yet; the navigation itself carries on, so wait for the page instead
+            pass
         self.wait_loaded()
 
     def wait_loaded(self):

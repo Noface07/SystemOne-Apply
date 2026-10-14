@@ -868,6 +868,64 @@ def test_the_rescuer_takes_several_checked_steps_and_says_what_is_missing(make_a
     assert "Claude: Marital Status: nothing on file says" in agent.handovers[-1]["reason"]
 
 
+JOB = "https://harman.wd3.myworkdayjobs.com/en-US/harman/job/Bangalore/Software-Engineer_R-55937-2026"
+
+
+class NavigatingBrowser(FakeBrowser):
+    def navigate(self, url):
+        self.went = getattr(self, "went", []) + [url]
+
+
+def test_an_empty_last_application_page_opens_apply_manually_once(make_agent, monkeypatch):
+    """Harman: a new account's "Use My Last Application" opened on an empty page; the run waited, then gave up.
+    With no form there, the same job's "Apply Manually" address is opened instead, once."""
+    empty = {"url": JOB + "/apply/useMyLastApplication", "title": "", "text": "Candidate Home", "actions": []}
+    agent = make_agent([empty])
+    agent.browser = NavigatingBrowser([empty])
+    agent.page = empty
+    assert agent.start_manually()
+    assert agent.browser.went == [JOB + "/apply/applyManually"]
+    assert not agent.start_manually()  # once a run
+    agent.manual_start, agent.page = False, {**empty, "url": JOB + "/apply/applyManually"}
+    assert not agent.start_manually()  # already manual
+    # A half-drawn form with the site's own note: straight to Apply Manually, fields or not
+    note = "The application didn't autofill because you don't have a previous application. Continue manually."
+    half = {**empty, "text": note, "actions": [{"id": "e9", "kind": "fill", "role": "textbox", "label": "How Did You "
+            "Hear About Us?", "node": 9, "value": "", "required": True}]}  # fmt: skip
+    agent.manual_start, agent.page, agent.browser.went = False, half, []
+    assert not agent.start_manually()  # a form is showing: not without the note
+    assert loop.NO_PREVIOUS.search(note) and agent.start_manually(said=True)
+    assert agent.browser.went == [JOB + "/apply/applyManually"]
+
+
+def test_the_rescuer_never_leaves_the_job(make_agent, monkeypatch):
+    """Harman: Claude clicked Candidate Home, then Search for Jobs, then another job and its Apply. Portal navigation
+    is refused, and a step that lands off the job's pages brings the run back to the job and ends the rescue."""
+    from jev_apply import teacher
+
+    monkeypatch.setattr(teacher, "available", lambda: True)
+    monkeypatch.setattr(loop.Agent, "show_helper", lambda *a: None)
+    home = {"id": "h", "node": 1, "kind": "click", "role": "button", "label": "Candidate Home", "context": ""}
+    other = {"id": "j", "node": 2, "kind": "click", "role": "link", "label": "Director, Embedded Software",
+             "context": ""}  # fmt: skip
+    on = {"url": JOB + "/apply/useMyLastApplication", "title": "", "text": "", "actions": [home, other],
+          "fingerprint": 1}  # fmt: skip
+    off = {**on, "url": "https://harman.wd3.myworkdayjobs.com/en-US/harman/details/Director_R-53670-2026-1",
+           "fingerprint": 2}  # fmt: skip
+    agent = make_agent([on])
+    agent.browser = NavigatingBrowser([on, on, off, on])
+    agent.start_url, agent.page = JOB, on
+    replies = iter([
+        {"action": home, "text": None, "fact": None, "why": "go home"},
+        {"action": other, "text": None, "fact": None, "why": "find a job"},
+    ])  # fmt: skip
+    monkeypatch.setattr(teacher, "rescue", lambda *a: next(replies))
+    assert not agent.rescue("Nothing here leads to an application form")
+    assert [a for a, _ in agent.browser.acts] == ["j"]  # Candidate Home refused outright
+    assert agent.browser.went == [JOB] and "away from this job" in agent.rescue_why
+    assert agent.on_job(JOB + "/apply/applyManually") and agent.on_job("https://accounts.google.com/signin")
+
+
 def test_an_unattended_run_waits_at_a_login_page_then_carries_on(make_agent, monkeypatch):
     monkeypatch.setattr(loop.time, "sleep", lambda s: None)
     login = {**make_page(), "login": True}
@@ -1313,6 +1371,14 @@ def test_a_refused_sign_in_is_never_retried(make_agent, monkeypatch):
     page = portal(email, pw, btn(3, "Sign In"), text="Invalid email or password")
     agent = with_email(make_agent([page], ui=UnattendedFakeUI(handover=False), portal_accounts=True))
     assert not agent.sign_in_with_password() and agent.browser.acts == []
+    # ABB: refused, so the account is yours from before; the next run doesn't try the password on it again
+    from jev_apply import accounts
+
+    entry = accounts.book(agent.profile).get(accounts.site(page["url"]), {})
+    assert entry.get("created") == "existing" and entry.get("refused")
+    fresh = portal(entry_box(1, "Email Address", "email"), entry_box(2, "Password", "password"), btn(3, "Sign In"))
+    again = with_email(make_agent([fresh], ui=UnattendedFakeUI(handover=False), portal_accounts=True))
+    assert not again.sign_in_with_password() and again.browser.acts == []
     monkeypatch.delenv("JEV_PORTAL_PASSWORD")
     assert not make_agent([page], ui=UnattendedFakeUI(), portal_accounts=True).sign_in_with_password()
 
@@ -1371,3 +1437,99 @@ def test_after_signing_in_a_portal_home_page_leads_back_to_the_job(make_agent, m
     agent.page = {**home, "url": job + "/apply/applyManually"}
     agent.back_to_job()
     assert opened == []  # already on the job's own pages
+
+
+def test_an_application_from_before_the_record_is_found_in_your_email(make_agent, monkeypatch, tmp_path):
+    """ABB: applied in July, before this app kept records; "Have you applied before?" would have been "No"."""
+    from jev_apply import gmail
+
+    agent = make_agent([make_page()], email_codes=True)
+    agent.start_url = "https://abb.wd3.myworkdayjobs.com/external_career_page/job/x"
+    monkeypatch.setattr(agent, "applied_path", lambda: tmp_path / "applied.json")
+    monkeypatch.setattr(gmail, "applied_before", lambda folder, url: "abb.wd3" in url)
+    assert agent.applied_here()
+    agent.start_url = "https://nvidia.wd5.myworkdayjobs.com/x"
+    assert not agent.applied_here()
+
+
+def test_an_unanswered_workday_dropdown_goes_to_questions(make_agent):
+    """NCR Atleos: "Are you subject to a non-compete...?" (a required Select One nothing on file answers) never
+    reached QUESTIONS.md, so the run just stopped and you were never asked."""
+    page = make_page()
+    button_ = {"id": "b1", "node": 40, "kind": "click", "role": "button", "label": "Select One Required",
+               "context": "Are you subject to a non-compete/non-solicitation or other post-employment restriction?* "
+                          "Error : The field is required"}  # fmt: skip
+    named = {**button_, "id": "b2", "node": 41, "label": "Do you have any Board of Director commitments? Select One",
+             "required": True, "context": ""}  # fmt: skip
+    agent = make_agent([{**page, "actions": [button_, named]}])
+    agent.page = {**page, "actions": [button_, named]}
+    asked = [e["question"] for e in agent.unanswered_entries()]
+    assert "Are you subject to a non-compete/non-solicitation or other post-employment restriction?" in asked
+    assert "Do you have any Board of Director commitments?" in asked
+
+
+def test_the_rescuer_may_not_clear_a_settled_pick(make_agent):
+    """Harman: Claude tried "Remove: Computer and Information Science", the closest pick for your field of study."""
+    agent = make_agent([make_page()])
+    agent.mapped.add((loop.norm("Field of Study"), loop.norm("Computer and Information Science")))
+    remove = {"id": "r", "kind": "click", "role": "button", "label": "Remove: Computer and Information Science"}
+    chip = {"id": "c", "kind": "click", "role": "option",
+            "label": "Computer and Information Science, press delete to clear value."}  # fmt: skip
+    other = {"id": "o", "kind": "click", "role": "button", "label": "Remove: India (+91)"}
+    assert agent.clears_settled(remove) and agent.clears_settled(chip) and not agent.clears_settled(other)
+
+
+def test_a_page_that_moved_on_is_carried_on_from_not_handed_over(make_agent, monkeypatch):
+    """Cisco: after Save, My Experience still showed while Application Questions loaded; the run gave up on the old
+    step and sent the new step's dropdowns to you. One more look first: a new step means carry on."""
+    old = {**make_page(), "step": "current step 2 of 4 My Experience", "fingerprint": 1}
+    new = {**make_page(), "step": "current step 3 of 4 Application Questions", "fingerprint": 2}
+    agent = make_agent([new], UnattendedFakeUI(handover=False))
+    agent.page = old
+    monkeypatch.setattr(loop.Agent, "rescue", lambda *a, **k: pytest.fail("no rescue for a page that moved on"))
+    agent.handover("Nothing more the agent can fill here, and no Next/Continue or Submit button.")
+    assert agent.page["step"].endswith("Application Questions") and not agent.handovers
+    agent.second_looks = 5  # a page that never settles still ends in a handover
+    agent.page = old
+    monkeypatch.setattr(loop.Agent, "rescue", lambda *a, **k: False)
+    with pytest.raises(loop.Stop):
+        agent.handover("still nothing")
+
+
+def test_a_sign_in_wall_inside_the_form_is_waited_out(make_agent, monkeypatch):
+    """Deluxe: its Apply Manually form showed "Sign In" for a moment while loading; the run signed in through it,
+    landed on the home page, went back, and again. Inside /apply the page is looked at again first."""
+    monkeypatch.setattr(loop.time, "sleep", lambda s: None)
+    url = "https://deluxe.wd5.myworkdayjobs.com/usa_can/job/x/apply/applyManually"
+    wall = {**make_page(), "url": url, "login": True}
+    form = {**make_page(), "url": url}
+    agent = make_agent([wall, form])
+    agent.page = wall
+    assert agent.wall_passes() and not agent.page.get("login")
+    agent = make_agent([wall])
+    agent.page = wall
+    assert not agent.wall_passes()  # still a wall after the wait: a real one
+    agent.page = {**wall, "url": "https://jobs.example/login"}
+    assert not agent.wall_passes()  # not inside an application: no wait
+
+
+def test_a_frozen_page_is_opened_again_in_a_new_tab_once(make_agent, monkeypatch):
+    """Accenture: the page's script hung (not even document.readyState answered); the run handed over for minutes."""
+    page = make_page()
+
+    class Frozen(FakeBrowser):
+        frozen, reopened_at = True, None
+
+        def observe(self):
+            if self.reopened_at:
+                return deepcopy(page)
+            raise StalePage("The page didn't answer (busy)")
+
+        def reopen(self, url):
+            self.reopened_at, self.frozen = url, False
+            return True
+
+    agent = make_agent([page])
+    agent.browser, agent.page = Frozen([page]), page
+    agent.reobserve()
+    assert agent.browser.reopened_at == page["url"] and agent.reopened

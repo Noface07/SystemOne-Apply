@@ -20,6 +20,7 @@ The output is the same decision shape as model.choose, so every guard in agent.p
 """
 
 import re
+from pathlib import Path
 
 from . import laya_backend, rules
 from .browser import PROMPT_ENTER_SITES
@@ -150,7 +151,8 @@ APPLICATION_WORDS = re.compile(
 DECORATIVE_FRAME = re.compile(r"social|share|widget|video|youtube|vimeo|chat|analytics|map|captcha|ads?\b", re.I)
 CLOSED = re.compile(
     r"no longer (available|accepting|open)|job (has )?expired|(position|job|role) (has been |is )?(filled|closed)|"
-    r"job (is )?not found|(posting|job) (has )?closed|not accepting applications",
+    r"job (is )?not found|(posting|job) (has )?closed|not accepting applications|"
+    r"page you are looking for (doesn.t|does not) exist",  # Workday's page for a removed posting (Thomson Reuters)
     re.I,
 )
 # Buttons that do something to the page rather than answer a question.
@@ -205,6 +207,17 @@ def pending_above(page, actions, history, url):
     ]  # fmt: skip
 
 
+def downs_since_advance(history, url):
+    """Scrolls down since the last Next/Save on this page."""
+    count = 0
+    for h in reversed(history):
+        if h.get("kind") == "click" and ADVANCE.search(str(h.get("action") or "")):
+            break
+        if h.get("kind") == "scroll" and h.get("url") == url and str(h.get("action") or "").startswith("Scroll down"):
+            count += 1
+    return count
+
+
 def ups_since_advance(history, url):
     """Scrolls up since the last Next/Save on this page."""
     count = 0
@@ -222,9 +235,22 @@ GENERIC_WORDS = r"(programming language|language|software|framework|protocol|pla
 GENERIC_TAIL = re.compile(rf"\s*(\(\s*{GENERIC_WORDS}\s*\)|{GENERIC_WORDS})?\s*", re.I)
 
 
+def skill_names(typed):
+    """Your skill as written, and what it is also called: "Retrieval-Augmented Generation (RAG)" is
+    "Retrieval-Augmented Generation" and "RAG" too."""
+    head = re.sub(r"\s*\([^)]*\)\s*", " ", typed).strip()
+    names = [typed, head, *re.findall(r"\(([^)]+)\)", typed)]
+    return [n for n in dict.fromkeys(n.strip() for n in names) if n]
+
+
 def same_skill(typed, offered):
-    """Is the site's skill name the same skill as yours? Its own words plus a generic tail ("Programming
-    Language", a bracketed note), or your words as its bracketed abbreviation ("... (OPC UA)")."""
+    """Is the site's skill name the same skill as yours (or as another name of it, skill_names)?"""
+    return any(norm(name) == norm(offered) or one_skill(name, offered) for name in skill_names(typed))
+
+
+def one_skill(typed, offered):
+    """Its own words plus a generic tail ("Programming Language", a bracketed note), or your words as its
+    bracketed abbreviation ("... (OPC UA)")."""
     if norm(typed) in {norm(p) for p in re.findall(r"\(([^)]+)\)", offered)}:
         return True
     if not offered.lower().startswith(typed.lower()):
@@ -577,6 +603,10 @@ def laya_pick(question, options, candidate):
     """Ask Laya which option answers the question. Returns (option, probability, probabilities) or None."""
     if not 2 <= len(options) <= MAX_LAYA_OPTIONS or not question:
         return None
+    # A paragraph of a question (HPE's conflict-of-interest and government-officials notes) overflowed the model's
+    # 2048-token window: its opening and its closing ask are kept
+    if len(question) > 600:
+        question = f"{question[:300]} … {question[-300:]}"
     facts = {k: f"{k}: {v}" for k, v in candidate.items()}
     relevant = laya_backend.shortlist(question, facts, 6)
     criteria = {str(i): option_text(o) for i, o in enumerate(options, 1)}
@@ -592,7 +622,12 @@ def laya_pick(question, options, candidate):
     }
     from . import model  # the configured backend (Laya by default, or Jev): model imports this module
 
-    answer = model.systemone(body)[0]["answers"]["option"]
+    try:
+        answer = model.systemone(body)[0]["answers"]["option"]
+    except RuntimeError as error:
+        if "HTTP 4" not in str(error):
+            raise  # the model is down: the run stops, as it does when Clef can't load
+        return None  # it refused this one request (too long, malformed): no pick, never a guess
     chosen = options[int(answer["choice"]) - 1]
     by_target = {options[int(k) - 1].get("id"): v for k, v in answer["probabilities"].items()}
     return chosen, answer["probabilities"][answer["choice"]], by_target
@@ -686,6 +721,12 @@ def sign_in_to_apply(page):
         return False
     if re.search(r"\bcurrent step \d+ of \d+", page.get("text") or "", re.I):
         return False  # inside the form's steps (one still loading): its own sign-in step is SIGN_IN_STEP's
+    # Signed in already (Workday's header shows your e-mail as its account button), or the form still drawing
+    # behind a passing "Sign In": not a wall (Deluxe signed in again and again while its form said "Loading")
+    if any(re.fullmatch(r"[^@\s]+@[^@\s]+\.\w+", a.get("label") or "") for a in page.get("actions") or []):
+        return False
+    if LOADING.search(page.get("text") or ""):
+        return False
 
     return any(a.get("kind") == "click" and a.get("role") in {"button", "link"}
                and re.fullmatch(r"\W*(sign ?in|log ?in)\W*", a.get("label") or "", re.I)
@@ -856,12 +897,106 @@ def same_value(shown, wanted):
         return False
 
 
+def site_pick(actions, history, url, facts=None, page=None):
+    """A single-choice search box the site filled by itself after a search (HPE: "Computer Science and Engineering"
+    + Enter, and Workday chose its one result "Electrical Engineering and Computer Science"): the chip's "Remove: X"
+    button, when X is not what was typed, nobody clicked X, and the name can be searched shorter. Once per box; its
+    context names the box, so the shorter search knows where it goes."""
+    for chip in actions:
+        if chip.get("role") != "option" or not CHIP.search(chip["label"]):
+            continue
+        name = CHIP.sub("", chip["label"]).strip()
+        if chip.get("field_id") and sum(bool(o.get("role") == "option" and CHIP.search(o["label"])
+                                             and o.get("field_id") == chip["field_id"]) for o in actions) > 1:  # fmt: skip
+            continue  # several picks in one field: a list (skills), each its own item, never a wrong single pick
+        remove = next((a for a in actions if a["kind"] == "click" and norm(a["label"]) == norm(f"Remove: {name}")),
+                      None)  # fmt: skip
+        typed = next((h for h in reversed(history) if h.get("url") == url and h.get("kind") == "fill"
+                      and (h.get("section") or "") == (chip.get("section") or "") and h.get("typed")), None)  # fmt: skip
+        if not typed and facts is not None and chip.get("field_id"):
+            # A draft's pick from an earlier run (HPE's Field of Study): your answer for its field, by the site's
+            # field name
+            words = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", chip["field_id"]).lower()  # "fieldOfStudy": field of study
+            choice = rules.match({**chip, "kind": "fill", "label": words, "context": ""}, facts, False, (),
+                                 (page or {}).get("text", ""))  # fmt: skip
+            fact = facts.by_id.get(choice) if choice else None
+            parts = {norm(x) for x in re.split(r"[,;]", str(fact.value if fact else ""))}
+            if fact and (any(k.startswith(f"{choice}__item_") for k in facts.by_id) or norm(name) in parts):
+                fact = None  # a list of yours (skills): one chip is one item of it (HPE lost ChromaDB to this)
+            typed = {"action": f"field:{chip['field_id']}", "typed": str(fact.value)} if fact else None
+        if not remove or not typed:
+            continue
+        label = typed["action"]
+        if any(a["kind"] == "fill" and a["label"] == label for a in actions):
+            continue  # its box still shows: a list taking several items (skills), not a single choice
+        if norm(name) == norm(typed["typed"]) or not shorter_name(typed["typed"]):
+            continue
+        if set(re.findall(r"\w+", name.lower())) <= set(re.findall(r"\w+", str(typed["typed"]).lower())):
+            continue  # your answer, shorter ("Manipal University" for "Manipal University Jaipur", Cisco)
+        if any(h.get("kind") == "click" and norm(option_text({"kind": "click", "label": h.get("action") or ""}))
+               == norm(name) for h in history):  # fmt: skip
+            continue  # your pick (a closest match the run chose), not the site's
+        if any(h.get("kind") == "click" and str(h.get("action") or "").startswith("Remove: ")
+               and h.get("context") == label for h in history):  # fmt: skip
+            continue  # removed once already: the site's pick stands, and the review shows it
+        return {**remove, "context": label, "answer": typed["typed"]}
+    return None
+
+
+def removed_pick(history, url, field):
+    """What was typed into `field` before the site's own pick was removed from it (site_pick), or None."""
+    names = {field["label"], f"field:{field.get('field_id')}"}
+    removed = next((h for h in history if h.get("kind") == "click" and str(h.get("action") or "").startswith("Remove: ")
+                    and h.get("context") in names and h.get("url") == url), None)  # fmt: skip
+    if not removed:
+        return None
+    typed = next((h for h in history if h.get("kind") == "fill" and h.get("action") == field["label"]
+                  and h.get("typed")), None)  # fmt: skip
+    return typed["typed"] if typed else removed.get("answer")
+
+
+def duplicate_upload(page, actions, history, candidate):
+    """Your résumé twice in the site's file list (an earlier run's upload kept in the draft, then another: Harman,
+    NCR): the "Delete <file>" of one extra copy, when it is on screen. One click per extra copy at most, so a Delete
+    the site ignores is not pressed forever. Only a file of yours, only when another copy stays."""
+    cards = page.get("file_cards") or []
+    mine = {norm(Path(str(v)).name) for k, v in candidate.items() if k.startswith("document.") and v}
+    url = page.get("url")
+    for name in dict.fromkeys(cards):
+        copies = sum(c == name for c in cards)
+        if copies < 2 or norm(name) not in mine:
+            continue
+        label = next((a["label"] for a in actions if a["kind"] == "click" and norm(a["label"]) == norm(f"Delete {name}")),
+                     None)  # fmt: skip
+        pressed = sum(h.get("url") == url and h.get("kind") == "click" and h.get("action") == label for h in history)
+        if label and pressed < copies - 1:
+            return next(a for a in reversed(actions) if a["kind"] == "click" and a["label"] == label)
+        where = page.get("file_card_where") or []
+        if not label and not pressed and len(where) == len(cards):
+            # The copies are off screen (the résumé list sits at the foot of Workday's My Experience): towards them
+            last = where[max(i for i, c in enumerate(cards) if c == name)]
+            scroll = next((a for a in actions if a["id"] == {"below": "scroll_down", "above": "scroll_up"}.get(last)),
+                          None)  # fmt: skip
+            if scroll:
+                return scroll
+    return None
+
+
 def way_to_start(actions, history, url):
     """On a portal asking how to start: your last application there, else autofill from your résumé, else
     manually; never through LinkedIn or another site's account. A way already tried on this page is passed over."""
     ways = [a for a in actions if a["kind"] == "click" and a.get("role") in {"button", "link"}
             and not SOCIAL_APPLY.search(a["label"])]  # fmt: skip
-    for way in WAYS_IN:
+    everything = history
+    # A sign-in starts afresh: a way tried before it (it led to the sign-in) may be taken again (NCR: every way was
+    # "tried" once signed in, so nothing was picked, the dialog was closed and Apply pressed three times)
+    signed = [i for i, h in enumerate(history) if h.get("source") == "portal account" or h.get("kind") == "handover"
+              or str(h.get("action") or "").startswith("Back to the job")]  # fmt: skip
+    # Once this run went to "Apply Manually" (the last application was empty: a new account has none), that is
+    # the way in from then on (Deluxe: "Use My Last Application" again after each sign-in, sign-in, home page, loop)
+    manual = any(str(h.get("action") or "").startswith("Apply manually") for h in everything)
+    history = history[signed[-1] + 1:] if signed else history
+    for way in (WAYS_IN[2], WAYS_IN[1], WAYS_IN[0]) if manual else WAYS_IN:
         pick = next((a for a in ways if way.search(a["label"]) and not touched(history, url, label=a["label"])), None)
         if pick:
             return pick
@@ -913,14 +1048,34 @@ def unanswered(actions):
     return [m[:60] for m in missing]
 
 
-def stale_errors(actions, history, url):
+FORM_STEP = re.compile(r"\bcurrent step (\d+) of \d+", re.I)
+
+
+def form_step(page):
+    """Which step of the form a page is: the step its progress bar marks as current (the page reader's `step`,
+    "My Information"), else "current step 4 of 6" in its text ("4"); None where the page doesn't say."""
+    if isinstance(page, dict):
+        if page.get("step"):
+            return page["step"]
+        page = page.get("text")
+    found = FORM_STEP.search(page or "")
+    return found.group(1) if found else None
+
+
+def stale_errors(actions, history, url, page=""):
     """Every field the site marks wrong has been answered since the last Next/Save (Workday keeps a "required"
     message from a Save pressed early until the next one): pressing it again re-checks them. Once only: errors
-    still there after that Save are real."""
+    still there after that Save are real. Errors on a step the last Save didn't stay on are from an earlier visit
+    (NCR: its draft reopened Application Questions with an earlier run's "Errors Found"): fill first."""
     saves = [i for i, h in enumerate(history) if h.get("kind") == "click" and h.get("url") == url
              and ADVANCE.search(str(h.get("action") or ""))]  # fmt: skip
+    now = form_step(page)  # the page (its progress bar) or its text
+    if now and saves and history[saves[-1]].get("form_step") not in (None, now):
+        return True  # the last Save was on another step: these errors were here when this step opened
     if not saves:
-        return False
+        # No Save pressed here by this run: a site checks only when Save is pressed, so these are from an earlier
+        # visit kept in the portal's draft (NCR opened My Information with "State is required"): fill first
+        return any(h.get("url") == url for h in history) or bool(history)
     since = history[saves[-1] + 1:]
     if not any(h.get("kind") in {"fill", "select", "setdate", "click", "upload"} for h in since):
         return False  # nothing answered since that Save: its errors stand
@@ -1336,6 +1491,9 @@ def choose(page, candidate, exclude=(), history=()):
             }
             return decision("PRESS_ENTER", enter)  # "type and press Enter to find a matching value"
 
+    wrong = site_pick(actions, history, url, facts, page)
+    if wrong:
+        return decision("CLICK", wrong)
     seen = set()
     for a in actions:
         kind, role = a["kind"], a.get("role")
@@ -1365,6 +1523,11 @@ def choose(page, candidate, exclude=(), history=()):
             wanted = [norm(v) for v in re.split(r"[,;]", str(fact.value)) if norm(v)] if fact else []
             if wanted and all(any(w == s or w in s for s in shown) for w in wanted):
                 continue
+        if kind == "fill" and not a.get("multiple") and not a.get("value") and removed_pick(history, url, a):
+            # The site's own pick for the full name was removed: search a shorter one, whose list holds the answer
+            short = shorter_name(removed_pick(history, url, a))
+            if short and not any(h.get("kind") == "fill" and h.get("typed") == short for h in history):
+                return decision("TYPE_TEXT", {**a, "retype": short})
         if kind == "fill" and (a.get("multiple") or not a.get("value")):
             return decision("TYPE_TEXT", a)
         if kind == "fill" and not typed_times(history, url, a):
@@ -1394,7 +1557,8 @@ def choose(page, candidate, exclude=(), history=()):
             # The list around a file field names saved files even when their cards are scrolled out of view.
             shown = norm(
                 " ".join(
-                    [page.get("text", ""), *(o["label"] for o in actions), *(o.get("context") or "" for o in actions)]
+                    [page.get("text", ""), *(o["label"] for o in actions), *(o.get("context") or "" for o in actions),
+                     *(page.get("files") or []), *(page.get("file_cards") or [])]  # also those out of view
                 )
             )
             uploaded = any(
@@ -1553,6 +1717,13 @@ def choose(page, candidate, exclude=(), history=()):
             continue
         if kind == "click" and role == "checkbox" and a.get("checked") == "false" and a.get("required"):
             return decision("CLICK", a)
+        if kind == "click" and role == "checkbox" and a.get("checked") == "false" and not touched(history, url, a["label"]):
+            # A single box a fact of yours answers Yes ("I am fluent in this language." for English: Fluent): ticked
+            # once. Never unticked, and a box no fact speaks for stays as it is.
+            choice = rules.match(a, facts, False, (), page.get("text", ""))
+            fact = facts.by_id.get(choice) if choice else None
+            if fact and norm(fact.value) in {"yes", "true"}:
+                return decision("CLICK", a)
         if kind == "click" and role in {"button", "link"} and ADD.search(a["label"]):
             if add_block(a, candidate, history, url, page["actions"]):
                 return decision("CLICK", a)
@@ -1571,10 +1742,24 @@ def choose(page, candidate, exclude=(), history=()):
         )  # fmt: skip
         if workday_pick and a.get("node") not in input_nodes:
             return decision("CLICK", a)  # open it; its options are answered in step 3
+        if kind == "click" and role == "button" and a.get("context") and not opened and a.get("node") not in input_nodes:
+            # A Workday dropdown showing Yes or No against your answer (HPE's draft held "YES" for its list of
+            # export-control countries from before the rule): opened once, and answered again from your profile.
+            shown = norm(re.sub(r"\brequired\b", "", a["label"], flags=re.I))
+            choice = rules.match({**a, "label": a["context"]}, facts, False, (), page.get("text", "")) \
+                if shown in {"yes", "no"} else None  # fmt: skip
+            fact = facts.by_id.get(choice) if choice else None
+            if fact and norm(fact.value) in {"yes", "no"} and norm(fact.value) != shown:
+                return decision("CLICK", a)
         if kind == "click" and custom and a.get("expanded") == "false" and a.get("node") not in input_nodes:
             if role == "button" or not a.get("value") or PLACEHOLDER.search(a.get("value")):
                 return decision("CLICK", a)  # a custom dropdown ("Select One"): open it, answer it in step 3
 
+    # A second copy of your résumé in the site's list: deleted once this page's own fields are done (scrolling to it
+    # first would pass fields by, as Harman's "I am fluent in this language." was)
+    extra = duplicate_upload(page, actions, history, candidate)
+    if extra:
+        return decision({"scroll_down": "SCROLL_DOWN", "scroll_up": "SCROLL_UP"}.get(extra["id"], "CLICK"), extra)
     scroll = first(lambda a: a.get("id") == "scroll_down")
     stuck_scrolls = 0
     for h in reversed(history):
@@ -1590,7 +1775,7 @@ def choose(page, candidate, exclude=(), history=()):
         # footer that is always on screen, so they are visible long before the last field).
         return decision("SCROLL_DOWN", scroll)
     invalid = invalid_fields(actions)
-    if has_fields and (invalid or ERRORS.search(page.get("text", ""))) and not stale_errors(actions, history, url):
+    if has_fields and (invalid or ERRORS.search(page.get("text", ""))) and not stale_errors(actions, history, url, page):
         # The site says fields are missing or wrong (after a Next/Save click): don't press it again blindly.
         return decision("BLOCKED", None, reason=stuck("The site reports problems on this page.", actions, invalid))
     button = {"button", "link"}
@@ -1608,6 +1793,14 @@ def choose(page, candidate, exclude=(), history=()):
     # No fields yet: the form may still be loading behind an always-visible Next/Save footer. Give it time,
     # much more before Next/Save (pointless on a blank form) than before 'Apply' on a job posting. A form below
     # the fold looks the same, so once the page has stopped changing, look further down too.
+    # Worked on this step: since its last Save / Next that moved on. Workday keeps one address for every step, so a
+    # step still "Loading" counted the earlier steps' fields and was saved unseen (GEA's Application Questions).
+    moved = [i for i, h in enumerate(history) if h.get("url") == url and h.get("kind") == "click"
+             and h.get("page_changed") and ADVANCE.search(str(h.get("action") or ""))]  # fmt: skip
+    step_worked = any(h.get("url") == url and h.get("kind") in {"fill", "select", "setdate", "upload"}
+                      for h in history[(moved[-1] + 1) if moved else 0:])  # fmt: skip
+    # Worked on this address at all (any step): a page whose fields were all tried or left looks empty, and is
+    # never waited on at length (NCR: 75 waits after each Save, three times, until the run's budget ran out).
     worked = any(h.get("url") == url and h.get("kind") in {"fill", "select", "setdate", "upload"} for h in history)
     # The way in is on the page but above the screen (Maersk's "Continue Application" at the top, scrolled past
     # while looking further down): back up for it, a few times.
@@ -1630,10 +1823,15 @@ def choose(page, candidate, exclude=(), history=()):
         return decision("SCROLL_UP", up)
     loading = bool(LOADING.search(page.get("text", "")))  # Workday says "Loading" while it draws each field
     patience = NO_FORM_WAITS * 2 if loading else (NO_FORM_WAITS if advance else 8)
-    if not has_fields and not worked and wait and waiting(history) < patience:
+    # A new step still drawing ("Loading", nothing done on it yet) is waited for even on Workday's one address
+    if not has_fields and (not worked or (loading and not step_worked)) and wait and waiting(history) < patience:
         if advance and scroll and waiting(history) >= 3 and not settling(history):
             return decision("SCROLL_DOWN", scroll)
         return decision("WAIT", wait)
+    if advance and scroll and form_step(page) and downs_since_advance(history, url) < 8:
+        # A step of a multi-step form is read to its end before Save, fields on screen or not (HPE's and Deluxe's
+        # required consent box sat under a long block of terms: one scroll, Save, three errors, a rescue)
+        return decision("SCROLL_DOWN", scroll)
     if advance:
         last = next((h for h in reversed(history) if h.get("kind") not in {"wait", "scroll", "skip"}), None)
         if (
@@ -1660,6 +1858,12 @@ def choose(page, candidate, exclude=(), history=()):
         up = first(lambda a: a.get("id") == "scroll_up")
         if up and pending_above(page, actions, history, url) and ups_since_advance(history, url) < 4:
             return decision("SCROLL_UP", up)
+        # An answer just given may open more of the form below it (Deluxe: "employed by Deluxe?" No, and its name,
+        # address and phone fields drew only then; Save went first and came back with eight errors): one look first.
+        wait = first(lambda a: a.get("id") == "wait")
+        answered = last and last.get("url") == url and last.get("kind") in {"click", "select"} and last is history[-1]
+        if wait and answered and last.get("action") != advance["label"]:
+            return decision("WAIT", wait)
         return decision("CLICK", advance)
     submit = first(
         lambda a: (

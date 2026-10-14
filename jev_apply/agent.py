@@ -68,6 +68,18 @@ class Skipped(Exception):
 
 
 RESCUE_STEPS = 5  # steps one rescue may take on a stuck page
+# A start that opens empty for a new account: the same job's "Apply Manually" address instead (Workday)
+EMPTY_START = re.compile(r"(/apply/)(useMyLastApplication|autofillWithResume)/?$", re.I)
+NO_PREVIOUS = re.compile(r"(didn.t|could not|couldn.t) (auto-?fill|autofill)\b.{0,80}\bno previous application|"
+                         r"don.t have a previous application", re.I)
+# A selected chip's clear control: "Remove: India", "India, press delete to clear value."
+CLEARS = re.compile(r"^\s*remove:\s*|,?\s*press delete to clear value\.?\s*$", re.I)
+# Portal navigation that leaves the job being applied to: never a rescue step
+LEAVES_JOB = re.compile(
+    r"^\s*(candidate home|search for jobs|job search|find jobs|search jobs|careers? home|new careers site|"
+    r"my applications|my account|view all jobs|all jobs|home)\s*$",
+    re.I,
+)
 
 DOING = {"TYPE_TEXT": "Typing into", "CLICK": "Clicking", "SELECT": "Choosing", "SET_DATE": "Setting",
          "UPLOAD": "Uploading", "OPEN_FORM": "Opening", "PRESS_ENTER": "Searching in"}  # fmt: skip
@@ -114,6 +126,10 @@ class Agent:
         self.teacher_rounds = 0  # times this run asked the teacher (ANSWER_ROUNDS at most)
         self.reloads = 0  # page reloads after a site error ("Something went wrong"), 2 at most
         self.rescues = 0  # times Claude was asked for the next step on a stuck page (3 at most)
+        self.manual_start = False  # went to "Apply Manually" once after an empty start page
+        self.second_looks = 0  # pages looked at again before a handover, because they had moved on (5 at most)
+        self.portal_signins = 0  # portal sign-ins this run (2 at most: one asked again each time is a loop)
+        self.reopened = False  # a frozen page opened again in a new tab (once a run)
         # (question, option) picked as your answer in the list's own words ("BS" for B.Tech), and questions already
         # looked up this run (once each): see closest_pick
         self.mapped, self.looked_up = set(), set()
@@ -205,6 +221,8 @@ class Agent:
             return
         if not self.browser.fresh(self.page):
             self.page = self.browser.observe()
+        if NO_PREVIOUS.search(self.page.get("text") or "") and self.start_manually(said=True):
+            return
         offered = {**self.page, "actions": [a for a in self.page["actions"] if not self.excluded(a)]}
         exclude = ("REVIEW",) if self.page.get("doc") in self.no_review else ()
         d = model.choose(offered, self.goal, self.history, self.profile.candidate_state(), exclude)
@@ -264,12 +282,23 @@ class Agent:
                                  "kind": "wait", "context": "", "url": self.page["url"], "page_changed": True})  # fmt: skip
             self.page = self.browser.observe()
             return
+        if operation == "BLOCKED" and self.start_manually():
+            return
         if operation == "BLOCKED":
+            if planner.sign_in_wall(self.page) and self.wall_passes():
+                return  # the form was still drawing: no sign-in wanted
             if planner.sign_in_wall(self.page):
                 if self.policy.google_sign_in and self.sign_in_with_google():
                     return  # signed in with Google: carry on from the form
-                if self.policy.portal_accounts and self.sign_in_with_password():
+                # Twice a run at most: a portal that asks again after each sign-in (Deluxe) is a loop, not a sign-in
+                if self.policy.portal_accounts and self.portal_signins < 2 and self.sign_in_with_password():
+                    self.portal_signins += 1
                     return  # signed in (or signed up) with your portal account: carry on from the form
+                if self.portal_signins >= 2:
+                    # Signed in twice and asked again: nobody signing in by hand fixes that; the run stops now
+                    # rather than waiting out the login wait (15 min) with nobody there
+                    self.handover("The portal asked for a sign-in again after each one (twice): a loop, stopped.")
+                    return
                 if self.unattended and self.wait_for_login():
                     return  # signed in: carry on from the form
             self.handover(
@@ -616,6 +645,18 @@ class Agent:
                     )
             elif a["kind"] == "fill" and a.get("required") and not a.get("value") and not a.get("multiple"):
                 entries.append({"question": self.question(a), "options": [], "urls": [self.page["url"]]})
+        # Workday's required "Select One" dropdowns still unanswered (set aside or not: NCR's non-compete question never
+        # reached QUESTIONS.md): their question, from the button's own words or the text it sits in
+        for a in self.page["actions"]:
+            label = a.get("label") or ""
+            if not (a["kind"] == "click" and a.get("role") == "button" and planner.SHOWS_NOTHING.search(label)
+                    and (a.get("required") or re.search(r"\brequired\b", label, re.I))):  # fmt: skip
+                continue
+            question = planner.SHOWS_NOTHING.sub("", label).strip() or str(a.get("context") or "")
+            question = re.sub(r"\s*\berror\b\W.*$", "", re.sub(r"^\W*error\W+", "", question, flags=re.I),
+                              flags=re.I).strip(" *")  # fmt: skip
+            if question and not any(same_question(question, e["question"]) for e in entries):
+                entries.append({"question": question, "options": [], "urls": [self.page["url"]]})
         # Above or below the screen when the run ended: the page lists its unanswered required questions itself.
         for q in self.page.get("open_questions", []):
             if q.get("question") and not any(same_question(q["question"], e["question"]) for e in entries):
@@ -628,11 +669,18 @@ class Agent:
 
         host = (urlparse(self.start_url).hostname or "").lower()
         path = self.applied_path()
-        if not host or not path or not path.is_file():
-            return False
-        return any((urlparse(e.get("url") or "").hostname or "").lower() == host
-                   and re.search(r"submit|applied", str(e.get("status") or ""), re.I)
-                   for e in applied.read(path).values())  # fmt: skip
+        if host and path and path.is_file() and any(
+            (urlparse(e.get("url") or "").hostname or "").lower() == host
+            and re.search(r"submit|applied", str(e.get("status") or ""), re.I)
+            for e in applied.read(path).values()
+        ):
+            return True
+        # An application from before this app kept records (ABB, July): the company's own e-mail about it
+        if self.policy.email_codes and path:
+            from . import gmail
+
+            return bool(gmail.applied_before(path.parent, self.start_url))
+        return False
 
     def applied_path(self):
         folder = self.profile.questions_path.parent if self.profile.questions_path else None
@@ -1045,7 +1093,10 @@ class Agent:
             "url": self.page["url"],
             "page_changed": None,
             "elapsed_ms": round((time.perf_counter() - self.started) * 1000),
+            "form_step": planner.form_step(self.page),  # Workday's step: one address for them all
         }
+        if action.get("answer"):
+            entry["answer"] = action["answer"]  # a removed site pick: your answer, searched again shorter
         self.history.append(entry)
         return entry
 
@@ -1202,11 +1253,29 @@ class Agent:
                 f["added"] = norm(f["value"]) in norm(fields[f["node"]].get("context", ""))
 
     def reobserve(self):
+        slow = 0
         while True:
             try:
                 self.page = self.browser.observe()
                 return
             except StalePage:
+                if getattr(self.browser, "frozen", False) and not self.reopened:
+                    # Not slow but stuck (Accenture: not even document.readyState answered, for minutes): the page
+                    # again in a fresh tab, once a run
+                    self.reopened = True
+                    self.ui.event("the page froze: opening it again in a new tab")
+                    url = self.page.get("url") or self.start_url
+                    try:
+                        if self.browser.reopen(url):
+                            continue
+                    except (StalePage, RuntimeError, TimeoutError):
+                        pass
+                # A heavy portal (Accenture's Workday) can take longer than one look allows: three more before
+                # handing over
+                slow += 1
+                if slow <= 3:
+                    continue
+                slow = 0
                 self.handover("The page did not finish loading.", observe=False)
 
     def sign_in_with_google(self):
@@ -1263,6 +1332,33 @@ class Agent:
                     continue
         return False
 
+    def start_manually(self, said=False):
+        """Workday's "Use My Last Application" (or "Autofill with Resume") can open on an empty page, or on a form it
+        only half draws (Harman: "you don't have a previous application", its Yes/No and name boxes never showed):
+        a new account has no last application to copy. With no form after the wait, or as soon as the site `said`
+        so, open the same job's "Apply Manually" address instead, once a run. True when it went there."""
+        url = self.page.get("url") or ""
+        manual = EMPTY_START.sub(lambda m: m.group(1) + "applyManually", url)
+        if manual == url or self.manual_start or (not said and planner.application_fields(self.page)):
+            return False
+        self.manual_start = True
+        self.ui.event("the start page stayed empty: applying manually instead")
+        try:
+            self.browser.navigate(manual)
+            self.page = self.browser.observe()
+        except (StalePage, RuntimeError, ValueError):
+            pass
+        self.history.append({"step": len(self.history) + 1, "action": "Apply manually (the start page stayed empty)",
+                             "kind": "wait", "context": "", "url": manual, "page_changed": True})  # fmt: skip
+        return True
+
+    def on_job(self, url):
+        """Is this address still this job's (its own page or its application), not the portal's home, its job search
+        or another job? Only the job's own host is judged; a sign-in on another site is not "leaving"."""
+        start = urlparse(self.start_url)
+        slug = start.path.rstrip("/").split("/")[-1]
+        return not slug or urlparse(url).netloc != start.netloc or slug in url
+
     def back_to_job(self):
         """After a sign-in, a portal may land on your candidate home ("My Applications") instead of the job (Blue
         Yonder's Workday): with no application form showing and the job no longer in the address, back to the job
@@ -1272,8 +1368,13 @@ class Agent:
         if not slug or slug in url or planner.application_fields(self.page):
             return
         self.ui.event("signed in, but the portal showed its home page: back to the job")
+        # On Workday, once this run applied manually, straight to that form: its job page would offer "Use My Last
+        # Application" again, and that leads back to the sign-in (Deluxe looped on it)
+        target = self.start_url
+        if self.manual_start and "myworkdayjobs.com" in urlparse(self.start_url).netloc:
+            target = self.start_url.rstrip("/") + "/apply/applyManually"
         try:
-            self.browser.navigate(self.start_url)
+            self.browser.navigate(target)
             self.page = self.browser.observe()
         except (StalePage, RuntimeError, ValueError):
             pass
@@ -1294,6 +1395,8 @@ class Agent:
             return False
         start = self.page["url"]
         known = accounts.book(self.profile).get(accounts.site(start), {})
+        if known.get("refused"):
+            return False  # it refused your portal password before: never tried again (no locked account); yours
         done, signed_up, signing_up, waits, scrolls, typed = set(), False, False, 0, 0, set()
         verified = False  # the e-mailed verification link was opened in this sign-in
         for _ in range(30):
@@ -1366,6 +1469,11 @@ class Agent:
             )
             if step[0] == "stop":
                 self.ui.event(f"portal sign-in: {step[1]}")
+                if "refused" in step[1]:
+                    # Your portal password doesn't open it: an account you made before (ABB, July), never one the
+                    # agent created. Recorded so, the next run waits for you instead of trying it again.
+                    accounts.note(self.profile, start, email=email, created="existing",
+                                  refused=datetime.now().isoformat(timespec="seconds"))  # fmt: skip
                 return False
             kind, target = step[0], step[1]
             if kind == "wait":
@@ -1697,13 +1805,19 @@ class Agent:
     def wait_for_login(self):
         """Unattended, at a sign-in page: alert the candidate, show the tab and wait for them to sign in or create
         the account (once per company portal; the browser keeps the session). True once the page is past it."""
+        from . import accounts
+
         wait = self.policy.login_wait_s
+        if accounts.book(self.profile).get(accounts.site(self.page.get("url") or ""), {}).get("refused"):
+            # An account of yours with another password (Danaher): only you can sign in, and overnight nobody
+            # does. Two minutes, then the batch goes on to the next job instead of waiting out a quarter hour.
+            wait = min(wait, 120)
         if wait <= 0:
             return False
         self.browser.show()
         self.ui.event(
             f"\a!!! LOGIN NEEDED: sign in (or create your account) in the open tab: {self.page['url'][:120]}  "
-            f"Waiting up to {wait // 60} min (with 'Sign in / sign up on portals' on, it signs in itself where it can)."
+            f"Waiting up to {max(1, wait // 60)} min (with 'Sign in / sign up on portals' on, it signs in itself where it can)."
         )
         deadline = time.monotonic() + wait
         while time.monotonic() < deadline:
@@ -1729,6 +1843,10 @@ class Agent:
         return False
 
     def handover(self, reason, observe=True):
+        if self.unattended and not reason.startswith("This job is no longer open") and self.moved_on():
+            return  # the page went on while the run was giving up on it: carry on from the new one
+        if reason.startswith("This job is no longer open"):
+            self.rescues = 3  # a closed posting: nothing on it to rescue (Barclays), so no call to Claude
         # Not the Save / Next already given up on here: what it is waiting for
         if self.unattended and self.rescue(reason, avoid=[v[-1] for v in self.vetoed]):
             return  # Claude found the next step on this page: the run goes on
@@ -1751,6 +1869,51 @@ class Agent:
         )
         if observe:
             self.reobserve()
+
+    def wall_passes(self):
+        """A sign-in wall on an application's own address may be the form still drawing: Workday shows its "Sign In"
+        button for a moment before it knows you're signed in (Deluxe: the run signed in through it, landed on the home
+        page, went back, and again, all night). Inside /apply, wait and look again, up to 12 s (24 s once this run
+        already signed in on this portal): True once it is no wall."""
+        from . import accounts
+
+        if not re.search(r"/apply(/|$|\?)", self.page.get("url") or ""):
+            return False
+        known = accounts.book(self.profile).get(accounts.site(self.page["url"]), {})
+        began = datetime.fromtimestamp(self.mail_since + 120).isoformat(timespec="seconds")  # this run's start
+        signed_now = str(known.get("last_sign_in") or "") >= began
+        for _ in range(12 if signed_now else 6):
+            time.sleep(2)
+            try:
+                self.page = self.browser.observe()
+            except StalePage:
+                continue
+            if not planner.sign_in_wall(self.page):
+                self.history.append({"step": len(self.history) + 1, "kind": "wait", "context": "",
+                                     "action": "Wait for the form (no sign-in needed)", "url": self.page["url"],
+                                     "page_changed": True})  # fmt: skip
+                return True
+        return False
+
+    def moved_on(self):
+        """Before handing over: one more look. Workday draws its next step late after a Save (Cisco: My Experience
+        still showed, the run gave up on it, and Application Questions loaded meanwhile; its two dropdowns went to
+        you though your profile answers both). A new step, or a page that changed since it was read: True, and the
+        run goes on. Five times a run at most, so a page that never stops changing still ends in a handover."""
+        if self.second_looks >= 5:
+            return False
+        before = self.page
+        try:
+            now = self.browser.observe()
+        except StalePage:
+            return False
+        if planner.form_step(now) == planner.form_step(before) and now.get("fingerprint") == before.get("fingerprint"):
+            return False
+        self.second_looks += 1
+        self.page = now
+        self.history.append({"step": len(self.history) + 1, "action": "Looked again: the page had moved on",
+                             "kind": "wait", "context": "", "url": now["url"], "page_changed": True})  # fmt: skip
+        return True
 
     def job_in_your_country(self):
         """Your country when the job's address or page names it, your city or a place you'd work in (for India
@@ -1816,6 +1979,13 @@ class Agent:
                 break
             action = reply.get("action")
             refusal = self.rescue_refusal(action, reply) if action else None
+            if action and not refusal and LEAVES_JOB.search(action.get("label") or ""):
+                refusal = "it leaves this job's application (the portal's home, its job search or another job)"
+            if action and not refusal and re.fullmatch(r"\W*(back|previous|go back)\W*", action.get("label") or "", re.I):
+                refusal = "it goes back a step, which fixes nothing on this one (Stryker)"
+            if action and not refusal and self.clears_settled(action):
+                refusal = "it clears an answer the run settled (your fact in the list's own words, e.g. a closest pick)"
+            on_job = self.on_job(self.page.get("url") or "")
             if not action or refusal:
                 tried.append({"did": action["label"][:70] if action else None,
                               "result": f"refused: {refusal}" if refusal else reply.get("why", "")[:120]})  # fmt: skip
@@ -1834,9 +2004,24 @@ class Agent:
             except (StalePage, ExecutionUncertain, ValueError) as error:
                 tried.append({"did": action["label"][:70], "result": f"failed: {error}"[:120]})
                 continue
+            if on_job and not self.on_job(self.page.get("url") or ""):
+                # It led away from this job (Harman: Candidate Home, then Search for Jobs, then another job's Apply):
+                # back to the job, and this rescue ends; never an application to a job nobody asked for.
+                self.ui.event("Claude's step left this job: back to the job")
+                try:
+                    self.browser.navigate(self.start_url)
+                    self.page = self.browser.observe()
+                except (StalePage, RuntimeError, ValueError):
+                    pass
+                tried.append({"did": action["label"][:70], "result": "refused: it left this job's pages"})
+                self.rescue_why = "its step led away from this job"
+                break
             moved = self.page.get("fingerprint") != before.get("fingerprint")
-            tried.append({"did": f"{action['kind']} {action['label'][:60]}", "typed": (text or "")[:40],
+            same = next((a for a in self.page["actions"] if a.get("node") == action.get("node")), None)
+            tried.append({"did": f"{action['kind']} {action['label'][:60]}", "typed": (text or "")[:300],
                           "result": "page changed" if moved else "nothing changed",
+                          # what the box holds now: typed text the page didn't keep reads back empty (Harman)
+                          **({"value_after": str(same.get("value") or "")[:300]} if text and same else {}),
                           "errors_after": teacher.page_errors(self.page)[:5]})  # fmt: skip
         else:
             self.rescue_why = self.rescue_why or "five steps didn't get the page moving"
@@ -1850,6 +2035,14 @@ class Agent:
         if not done:
             self.rescue_log[-1]["why"] = self.rescue_why[:200]
         return done
+
+    def clears_settled(self, action):
+        """A chip's "Remove: X" (or "X, press delete to clear value") for an option the run picked as your answer in
+        the list's own words (Harman: Claude tried to remove "Computer and Information Science", the closest pick
+        for your field of study)."""
+        label = action.get("label") or ""
+        chip = CLEARS.sub("", label)
+        return chip != label and any(norm(chip) == picked for _, picked in self.mapped)
 
     def rescue_refusal(self, action, reply):
         """Why a step Claude proposed can't be taken here, or None. A sensitive question (your citizenship, a

@@ -161,7 +161,11 @@ def flatten(node, prefix=""):
         if all(not isinstance(item, (dict, list)) for item in node):
             items = [as_text(item) for item in node if item not in (None, "")]
             yield prefix, ", ".join(items), f"{describe(prefix)} — all of them as ONE comma-separated text"
-            if len(items) > 1:  # tag fields take one value per entry: the first MAX_ITEMS of a longer list
+            # A tag field takes one value per entry, and "REST / OpenAPI" is two of them (its search finds neither
+            # as written): the first MAX_ITEMS of the list, split at " / "
+            tags = [part.strip() for item in items for part in re.split(r"\s+/\s+", item) if part.strip()]
+            if len(tags) > 1:
+                items = tags
                 for n, item in enumerate(items[:MAX_ITEMS], 1):
                     about = (
                         f"{describe(prefix)} — ONE item ({n} of {len(items)}), for fields that add items "
@@ -245,7 +249,9 @@ ANNOUNCEMENT = re.compile(
     r"^\s*(select|choose|please select)\s*(\.\.\.|…)?\s*$|^\s*apply\s*$|"
     r"^\s*(contact information|role description|description|competency/skill|proficiency|combobox|textbox)\s*$|"
     # Workday's error list: "The field X is required and must have a value.", its links "Error X"
-    r"^\s*the field .{1,200} is required and must have a value\.?\s*$|^\s*error\b",
+    r"^\s*the field .{1,200} is required and must have a value\.?\s*$|^\s*error\b|"
+    # Workday's "Start Your Application" dialog (Autofill / Apply Manually / Use My Last Application) asks nothing
+    r"^\s*start your application\b",
     re.I,
 )
 

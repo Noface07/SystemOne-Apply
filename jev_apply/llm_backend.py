@@ -125,7 +125,10 @@ def request(s, messages):
 def provider_message(response):
     """The provider's own reason (daily limit, upstream busy, privacy settings...), without any secrets."""
     try:
-        error = response.json().get("error", {})
+        body = response.json()
+        error = body.get("error", {}) if isinstance(body, dict) else body
+        if not isinstance(error, dict):  # llama-server: {"error": "the request exceeds the available context size"}
+            return str(error)[:400] or "no details"
         message = str(error.get("message") or "")
         raw = str((error.get("metadata") or {}).get("raw") or "")
         return (message + (f" [{raw[:200]}]" if raw and raw not in message else "")).strip()[:400] or "no details"

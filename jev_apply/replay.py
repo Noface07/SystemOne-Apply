@@ -25,7 +25,7 @@ FREEZE = Path(__file__).with_name("freeze.js").read_text(encoding="utf-8")
 RESTORE = """(() => { for (const e of document.querySelectorAll('[data-jev-value]')) e.value = e.dataset.jevValue;
   const [x, y] = (document.documentElement.dataset.jevScroll || '0,0').split(','); scrollTo(+x, +y);
   return document.documentElement.dataset.jevViewport || '1280,900'; })()"""
-MAX_PAGES = 25
+MAX_PAGES = 200  # a whole Workday application (25 stopped in My Experience; 60 ran out in HPE's skill searches)
 # What "reading a page" means for the golden comparison: no values (they change with every applicant), no ids.
 READING = ("kind", "role", "label", "context", "required", "multiple", "field_id", "section", "input_type")
 FIELD_KINDS = {"fill", "select", "setdate", "upload"}
@@ -45,9 +45,11 @@ def has_fields(page):
 
 
 def layout_key(page):
-    """The same page drawn again with other values is the same layout: kept once."""
+    """The same page drawn again with other values is the same layout: kept once. Whether each field is filled is
+    part of it: a site that empties fields after a Save (NCR's Postal Code, Phone Number) is a page to keep."""
     path = re.sub(r"[?#].*", "", page.get("url") or "")
-    shape = [(a["kind"], a.get("role"), a["label"][:60]) for a in page["actions"] if a["kind"] != "wait"]
+    shape = [(a["kind"], a.get("role"), a["label"][:60], bool(a.get("value")) if a["kind"] in FIELD_KINDS else None)
+             for a in page["actions"] if a["kind"] != "wait"]  # fmt: skip
     return hashlib.sha1(json.dumps([path, shape]).encode()).hexdigest()
 
 
@@ -85,6 +87,7 @@ class Recorder:
         secret = {a.get("node") for a in page["actions"] if a.get("secret") or a.get("input_type") == "password"}
         record = {
             "url": page.get("url"), "title": page.get("title"), "text": (page.get("text") or "")[:8000],
+            "step": page.get("step"), "files": page.get("files"), "file_cards": page.get("file_cards"),
             "actions": [{**a, "value": "" if a.get("node") in secret else a.get("value")} for a in page["actions"]],
             "history": [{k: v for k, v in h.items() if k != "typed" or "pass" not in str(h.get("action")).lower()}
                         for h in history[-12:]],

@@ -103,6 +103,14 @@ def fields(page):
     return email, passwords, clicks, agree
 
 
+def email_boxes(page):
+    """Every box on a sign-in or sign-up form that wants your e-mail or user name, its confirmations too."""
+    passwords = {a.get("node") for a in page.get("secrets") or []}
+    return [a for a in page.get("actions") or [] if a.get("kind") == "fill" and not a.get("nav")
+            and a.get("node") not in passwords
+            and (a.get("input_type") == "email" or EMAIL.search(f"{a['label']} {a.get('placeholder') or ''}"))]
+
+
 def plan(page, known, tried_sign_up=False, sign_up_form=False, passwords_typed=0, looked=False):
     """The next step on a sign-in / sign-up page: ("fill", box, what) | ("tick", box) | ("click", button, mode) |
     ("switch", link) to the other form | ("scroll", action) down the form | ("wait", None, why) | ("stop", reason).
@@ -136,8 +144,10 @@ def plan(page, known, tried_sign_up=False, sign_up_form=False, passwords_typed=0
         return ("switch", to_sign_up)  # no account here yet: create it first
     if passwords and not signing_up and not known and not to_sign_up and down and not looked:
         return ("scroll", down)  # a sign-in form with no account on record: its Create Account link may be lower
-    if email and not email.get("value"):
-        return ("fill", email, "email")
+    for box in email_boxes(page):
+        # Every e-mail box (Mercedes: "User Name", "Email Address" and "Re-enter Email Address"): your e-mail
+        if not box.get("value"):
+            return ("fill", box, "email")
     for box in passwords:
         if not box.get("value"):
             return ("fill", box, "password")

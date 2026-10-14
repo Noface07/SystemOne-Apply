@@ -143,8 +143,15 @@ def test_your_answer_is_found_in_the_lists_own_words_and_kept(tmp_path, monkeypa
     degrees = ["Associate", "BS", "MS", "PhD", "Other"]
     reply({"option": "BS", "match": "closest", "why": "B.Tech is a bachelor of science"})
     assert teacher.closest_option("Degree", "education.0.degree", "B.Tech", "degree", degrees, p, "a.test")[0] == "BS"
-    assert teacher.closest_option("Degree", "education.0.degree", "B.Tech", "degree", ["BA", "BS"], p, "b.test")[
-        :2] == ("BS", "closest") and len(calls) == 1  # kept: no second call
+    assert teacher.closest_option("Degree", "education.0.degree", "B.Tech", "degree", ["BA", "BS"], p, "a.test")[
+        :2] == ("BS", "closest") and len(calls) == 1  # kept for its site: no second call
+    # Another site's list may hold a better one ("Computer Science" beside "Computer Engineering"): looked up again
+    teacher.closest_option("Degree", "education.0.degree", "B.Tech", "degree", ["BA", "BS"], p, "b.test")
+    assert len(calls) == 2
+    reply({"option": "India", "match": "same"})
+    teacher.closest_option("Country", "personal.country", "Bharat", "country", ["India", "Nepal"], p, "a.test")
+    teacher.closest_option("Country", "personal.country", "Bharat", "country", ["India", "Nepal"], p, "c.test")
+    assert len(calls) == 3  # one that means the same is your answer on every site
     reply({"option": "Bachelor of Tech", "match": "same"})  # not an option shown
     assert teacher.closest_option("Degree", "education.0.degree", "BE", "degree", degrees, p) is None
     reply({"option": "MS", "match": "other"})  # "other" only for the list's own way out

@@ -124,9 +124,14 @@
     let group=e.closest('fieldset,[role="radiogroup"],[role="group"]');
     // A group holding other questions' fields is a section, not a question (Maersk's "Personal information" wraps
     // all 13 fields in one role="group": each took the section's words). The parts of one date stay one question.
+    // Only a date's own boxes share its group: a field beside them takes not the date's name (GEA's group held
+    // Date of Birth and Citizenship Status: Citizenship read as "Date of Birth" and got the birth date typed in).
     const part=/^\s*(month|day|year|mm|dd|yyyy|hours?|minutes?)\s*\*?\s*$/i;
-    if (group && [...group.querySelectorAll(FIELDS+',button[aria-haspopup]')].some(x=>x!==e && visible(x) &&
-        !part.test(name(x)||'') && !x.contains(e) && !e.contains(x))) group=null;
+    const others=group ? [...group.querySelectorAll(FIELDS+',button[aria-haspopup]')].filter(x=>x!==e && visible(x) &&
+      !x.contains(e) && !e.contains(x)) : [];
+    // A date's box keeps its group's name beside one other field (GEA); among more it is a section (Maersk).
+    const strangers=others.filter(x=>!part.test(name(x)||'')).length;
+    if (others.length && (part.test(name(e)||'') ? strangers>1 : true)) group=null;
     if (group) {
       const legend=group.querySelector('legend');
       const t=clean(legend ? legend.innerText : name(group)) || blockText(group);
@@ -679,8 +684,24 @@
       } else if (e.type!=='checkbox') open_questions.push({question:q.slice(0,300), options:[]});
     }
   }
+  // The form's step a progress bar marks as current (Workday keeps one address for all its steps; its "current step
+  // 1 of 5" is screen-reader text, not in `text`): which step of the form this page is
+  const current=document.querySelector('[aria-current="step"],[data-automation-id="progressBarActiveStep"]');
+  const step=current ? clean(current.innerText||current.textContent||'').slice(0,80) || null : null;
+  // Every file name the page shows, scrolled into view or not (a résumé already in the site's list, below its upload
+  // box, was uploaded again on every run: NCR held three copies)
+  const files=[...new Set((document.body?.innerText||'').match(/[^\s\/:*?"<>|]{2,120}\.(pdf|docx?|rtf|odt|txt)\b/gi)||[])].slice(0,30);
+  // One entry per file card in the site's list ("Delete x.pdf" buttons), on screen or not: an uploaded file even
+  // before its name shows in the text (Harman), and two cards with one name are a duplicate upload
+  // Where each one is: "above", "on" or "below" the screen, so a copy to delete can be scrolled to
+  const cards=[...document.querySelectorAll('button,[role="button"]')]
+    .map(e=>[e,(clean(e.getAttribute('aria-label')||e.innerText||'').match(/^(?:delete|remove)\s+(.+\.(?:pdf|docx?|rtf|odt|txt))$/i)||[])[1]])
+    .filter(([,n])=>n).slice(0,30);
+  const file_cards=cards.map(([,n])=>n);
+  const file_card_where=cards.map(([e])=>{const r=e.getBoundingClientRect();
+    return r.bottom<=0 ? 'above' : r.top>=innerHeight ? 'below' : 'on';});
   return {doc:String(performance.timeOrigin),url:location.href,title:document.title,w:innerWidth,h:innerHeight,text,
     scroll,actions,marker,page_key,guards,omitted_actions,login,required_empty:[...new Set(required_empty)].slice(0,20),
     required_above:[...new Set(required_above)].slice(0,10),
-    open_questions:open_questions.slice(0,20)};
+    open_questions:open_questions.slice(0,20),step,files,file_cards,file_card_where};
 })()

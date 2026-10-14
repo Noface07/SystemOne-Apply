@@ -519,6 +519,13 @@ def ui_cmd(args):
 
 
 def main(argv=None):
+    for stream in (sys.stdout, sys.stderr):
+        # A name the console can't show ("Telangāna" on a Windows code page) is printed with a stand-in character,
+        # never a crash: NCR's run died printing Claude's reason, then again printing the error about it.
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError):
+            pass
     load_environment()
     parser = argparse.ArgumentParser(prog="jev-apply", description="Fill job applications from your own data.")
     parser.add_argument("--data", default="data", help="folder with profile.json, answers.json, policy.json")

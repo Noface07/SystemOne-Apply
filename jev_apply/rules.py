@@ -8,7 +8,7 @@ your profile facts or one of the special choices (ASK_USER, SKIP_FIELD, DRAFT_AN
 
 import re
 
-from .profile import DATE, format_date, safe_id
+from .profile import DATE, MAX_ITEMS, format_date, safe_id
 from .skills import canonical
 
 MONEY = re.compile(r"\b(ctc|salary|compensation|package|income|pay|remuneration|stipend)\b")
@@ -127,8 +127,16 @@ def money(t, action):
         when = "current"  # "What is your annual CTC (in lakhs)?": the CTC you have, as Indian forms mean it
     if when is None:
         return None
+    # "base plus bonus and/or commission" (Stryker) is the whole of it, not the base alone
+    both = re.search(
+        r"(fixed|\bbase|basic)\w*( (pay|salary))?\s*(plus|\+|and|with|including)\s*(\w+\s+)?(variable|bonus|commission|"
+        r"incentive)",
+        t,
+    ) and not re.search(r"exclud|without|not includ", t)
     part = (
-        "fixed"
+        "total"
+        if both
+        else "fixed"
         if re.search(r"fixed|\bbase\b|basic", t)
         else "variable"
         # "Details can include bonus, benefits, or additional compensation" describes a total, not the bonus alone.
@@ -141,12 +149,22 @@ def money(t, action):
     return None if unit is None else f"compensation.{when}.{part}_annual{unit}"
 
 
+def norm_words(text):
+    """Lower-case letters and digits only: "Multi-agent systems" and "multiagent systems" read the same."""
+    return re.sub(r"[^0-9a-z]", "", str(text or "").lower())
+
+
 def next_item(profile, prefix, action, tried):
     """A tag field takes one list item at a time: the first one not tried and not already shown as added."""
     added = re.sub(r"[^0-9a-z]", "", (action.get("context") or "").lower())
     limit = re.search(r"(?:up to|max(?:imum)?(?: of)?|at most) (\d+)", text_of(action))
-    if len(tried) >= (int(limit.group(1)) if limit else MAX_TAGS):
-        return "SKIP_FIELD"  # the field says how many it takes; otherwise your top MAX_TAGS
+    cap = int(limit.group(1)) if limit else MAX_TAGS
+    values = [re.sub(r"[^0-9a-z]", "", f.value.lower()) for k, f in profile.by_id.items()
+              if k.startswith(safe_id(f"{prefix}.item_"))]  # fmt: skip
+    # The field's limit (else your top MAX_TAGS) counts what was added: a skill the site doesn't list costs a
+    # search, not a place (HPE kept 6 of 12, the rest unmatched). Searches stop at twice the limit, or the list's end.
+    if sum(bool(v) and v in added for v in values) >= cap or len(tried) >= (2 * cap if limit else MAX_ITEMS):
+        return "SKIP_FIELD"
     n = 1
     while safe_id(f"{prefix}.item_{n}") in profile.by_id:
         choice = safe_id(f"{prefix}.item_{n}")
@@ -373,7 +391,50 @@ def by_field_id(action):
     return None
 
 
+def family(key):
+    """What a key is about, without its shape: "personal.date_of_birth", "compensation.current"."""
+    first = key[0] if isinstance(key, tuple) else key
+    # Which item or block it is doesn't change what it is about: skills.item_3 and skills.item_1 are both skills
+    dotted = str(first or "").replace("__", ".")  # some rules give a choice id (safe_id: "skills__item_3")
+    bare = re.sub(r"\.(item_\d+|\d+)(?=\.|$)", "", dotted)
+    return ".".join(bare.split(".")[:2])
+
+
 def key_for(action, profile, tried, dates_only=False, page_text=""):
+    """Profile key (dotted), special choice, or None. A field whose own label is a question of its own is answered
+    as its label says when the words around it point to something else (GEA's "Citizenship Status" sat in the
+    "Date of Birth" group and got the birth date typed in); the context still adds what the label leaves open
+    ("Current CTC" in LPA)."""
+    full = _key_for(action, profile, tried, dates_only, page_text)
+    label = label_of(action)
+    if not action.get("context") or len(label.split()) < 2 or re.fullmatch(r"(select one|please select)\b.*", label):
+        return full
+    if action.get("multiple"):
+        return full  # a tag box's context lists what it already holds: read without it, it would add those again
+    own = _key_for({**action, "context": ""}, profile, tried, dates_only, page_text)
+    if own and full and not str(own).isupper() and family(own) != family(full):
+        return own
+    return full
+
+
+# A list of countries asked about citizenship, a passport, permanent residence or refugee status (HPE's export
+# control question): "No" when your citizenship country isn't among them and you hold no other status anywhere
+LISTED_STATUS = re.compile(r"citizen|passport|permanent resident|refugee|asylum", re.I)
+
+
+def listed_countries_answer(t, profile):
+    """The fact answering "for any of the countries listed below, are you a citizen…": the No you gave for any other
+    citizenship or residence, when your own country is not in the list; asked when it is (or nothing is on file)."""
+    if not LISTED_STATUS.search(t) or t.count(",") < 4 or not re.search(r"countr(y|ies)", t):
+        return None
+    home = getattr(profile.by_id.get(safe_id("personal.citizenship_country")), "value", "") or ""
+    other = profile.by_id.get(safe_id("personal.other_citizenship_or_residency"))
+    if home and re.search(rf"\b{re.escape(home.lower())}\b", t):
+        return "ASK_USER"  # your own country is listed: yours to answer
+    return "personal.other_citizenship_or_residency" if home and other else "ASK_USER"
+
+
+def _key_for(action, profile, tried, dates_only=False, page_text=""):
     """Profile key (dotted), special choice, or None. Order matters: specific questions before generic ones."""
     named = by_field_id(action)
     if named:
@@ -406,7 +467,12 @@ def key_for(action, profile, tried, dates_only=False, page_text=""):
     if re.search(r"(have|did) you (ever )?(previously )?(applied|submitted an application)\b|previously applied", t):
         # "Have you applied to A.P. Moller Maersk Group before?": your record of applications on this site.
         return "application.applied_here_before"
-    if re.search(
+    # "Have you worked with Arabelle Solutions before?": a company, not a tool ("worked with Python before" is a
+    # skill), so only when what follows "with" is none of your skills; Workday's own name for it settles it too.
+    with_whom = re.search(r"(have|did) you (ever )?(previously )?worked with (.{2,60}?) before\b", t)
+    skills = {norm_words(f.value) for k, f in profile.by_id.items() if k.startswith("skills__item_")}
+    a_company = with_whom and norm_words(with_whom.group(4)) not in skills
+    if action.get("field_id") == "candidateIsPreviousWorker" or a_company or re.search(
         r"(have|did) you (ever )?(previously )?(work|worked|been employed)\b(?! (on|with|in|using|as)\b)|"
         r"former employee|"
         r"worked (for|at) .* before",
@@ -418,6 +484,17 @@ def key_for(action, profile, tried, dates_only=False, page_text=""):
             if k.startswith("experience__") and k.endswith("__company")
         ]
         return "ASK_USER" if any(c and c in t for c in worked_at) else "work.worked_for_this_company_before"
+    # Declarations, before the salary and years-of-experience rules (HPE's use "compensation" and "employment
+    # experience"): US government work, ties to government officials (before "conflict of interest", which their
+    # wording also uses), then competing interests
+    if re.search(
+        r"(united states|u\.s\.?|us) government|public institution employment|government or public institution", t
+    ):
+        return "background.us_government_employment"
+    if re.search(r"(relationships?|related|ties) (with|to) (a )?(government|public) officials?|government officials?", t):
+        return "background.government_official_relationship"
+    if re.search(r"board of directors?\b|competing interest|conflict(s|\(s\))? of interest", t):
+        return "background.competing_interests"
     if MONEY.search(t) and not re.search(r"pay ?slip|payroll|paypal|pay scale", t):
         return money(t, action)
     if re.search(r"how did you (hear|find|come)|where did you (hear|find)|source of (application|referral)", t):
@@ -471,6 +548,9 @@ def key_for(action, profile, tried, dates_only=False, page_text=""):
         return "personal.country_of_birth"
     if re.search(r"(city|town|place) of birth|birth ?place|birth ?city", t):
         return "personal.city_of_birth"
+    listed = listed_countries_answer(t, profile)
+    if listed:
+        return listed
     if re.search(r"citizenship status|status of (your )?citizenship", t):
         # Workday lists countries, then the status inside yours: "India" > "Citizen".
         return ("personal.citizenship_country", "personal.citizenship_status")
@@ -592,11 +672,46 @@ def key_for(action, profile, tried, dates_only=False, page_text=""):
         return "work_authorization.authorized_to_work_in_india" if in_india else None
     if re.search(r"sponsor", t):
         return "work_authorization.requires_visa_sponsorship"
+    # "Do you possess a valid work permit?" (HPE) asks whether you may work there, not whether you need a visa: your
+    # India authorization, for a job in India (the sponsorship fact would have answered No)
+    if re.search(
+        r"\b(possess|have|hold)\b.{0,20}\b(valid |current )?(work permit|residen(cy|ce) permit|right to work)\b", t
+    ) and not re.search(
+        r"\b(need|needs|require|requires|requiring|support)\b", t
+    ):
+        return "work_authorization.authorized_to_work_in_india" if in_india else None
     if re.search(r"(support|need|require)\w* (for )?(a )?(work )?visa|work permit|residence permit", t):
         # "Will you need support for a work visa and residence permit": none for a job in your own country.
         return "work_authorization.requires_visa_sponsorship" if in_india else None
     if re.search(r"\b(over|above|at least) (the age of )?18\b|18\+? years (of age|or older)|age of 18|\b18\+", t):
         return "personal.over_18"
+    # A signature box under an attestation ("Signed:", "Electronic signature", "type your full name to sign"): your
+    # full name, because you agreed to that (background.sign_attestations); otherwise it is asked
+    if action.get("kind") == "fill" and re.search(
+        r"\bsigned\s*:|\b(electronic |e-)?signature\b|type your (full |legal )?name to (sign|attest)", t
+    ) and not re.search(r"\bdate\b", label):
+        signs = profile.by_id.get(safe_id("background.sign_attestations"))
+        return "personal.full_name" if signs and signs.value.lower() in {"yes", "true"} else "ASK_USER"
+    if re.search(
+        r"non-?compete|non-?solicit|restrictive covenant|post-employment restriction|"
+        r"restrictions? on (competition|solicitation)|restrict\w* (you from )?(competing|soliciting)",
+        t,
+    ):
+        return "background.non_compete"
+    # Your record (background.*), stated once for every form's wording (NCR's declarations). A statement to confirm
+    # ("I confirm I have not been convicted") is its own fact: Yes there means no conviction.
+    if re.search(r"(have not|haven'?t|never) been convicted|not been convicted", t):
+        return "background.confirm_not_convicted"
+    if re.search(r"\bconvicted\b|\bconviction\b|criminal (record|offen[cs]e|charge|case)|\bfelony\b", t):
+        return "background.convicted"
+    if re.search(r"bankrupt|insolven|financial delinquen", t):
+        return "background.bankruptcy"
+    if re.search(r"\blitigation\b|\blawsuits?\b|legal proceeding", t):
+        return "background.litigation"
+    if re.search(r"(suspended|terminated|dismissed|discharged|fired)\b.{0,80}\b(misconduct|fraud|abandon)", t):
+        return "background.terminated_for_misconduct"
+    if re.search(r"\bdisabilit(y|ies)\b", t) and not re.search(r"accommodat", t):
+        return "self_identification.disability"
     # Holding an ID document (never its number: those boxes are never filled): what you said, else asked
     holds = re.compile(r"\b(valid|have|hold|possess)\b.*\b(aadh?aa?r|pan card|driv\w* licen[cs]e|driver'?s licen[cs]e)")
     # A box for its number says "number" or "No." / "no:" ("PAN card no."); a Yes/No question's own "No" option isn't it
@@ -622,7 +737,12 @@ def key_for(action, profile, tried, dates_only=False, page_text=""):
             if wants_date
             else ("work.availability", "work.earliest_start_date")
         )
-    if re.search(r"current (company|employer|organi[sz]ation)|present (employer|company)", t) or label in {
+    # "Who is your current or most recent employer?" (Aptiv): the company you work for now
+    if re.search(
+        r"current (or (most )?recent |or last )?(company|employer|organi[sz]ation)|present (employer|company)|"
+        r"(most recent|latest) (company|employer)",
+        t,
+    ) or label in {
         "company",
         "company name",
         "employer",
@@ -642,12 +762,32 @@ def key_for(action, profile, tried, dates_only=False, page_text=""):
     if (
         CERTIFICATIONS.search(t)
         and action.get("kind", "fill") == "fill"
-        and not re.search(r"upload|attach|number|\bid\b|expir|valid", t)
+        and not re.search(r"upload|attach|number|\bid\b", t)
+        # a certificate's expiry or validity date is its own box; a list "including the expiration date" (Harman) is
+        # still the list
+        and not re.search(r"^\W*(expir|valid)|(expir\w*|valid\w*) (date|until|through|on)\W*$", label)
         and safe_id("certifications") in profile.by_id
     ):
         return "certifications"  # "Have you completed any certifications? Please list them."
     if "skill" in t:
         return next_item(profile, "skills", action, tried) if action.get("multiple") else "skills"
+    # Workday's "I am fluent in this language." box beside the language: Yes from your English level (Fluent); a
+    # "native speaker" box is not the same claim, so it is asked
+    if re.search(r"\bi am fluent in (this|the) language|\bfluent in this language", t):
+        known = safe_id("language_levels.english_fluent") in profile.by_id
+        return "language_levels.english_fluent" if known else "ASK_USER"
+    # A language's level (Workday's "Overall", "Reading", "Speaking" under Languages): your English level, never a
+    # guess; asked until it is on file
+    if re.search(
+        r"^(overall|reading|speaking|writing|comprehension|listening)( (proficiency|level|skills?))?\W*"
+        r"(select one)?\W*(required)?\W*$|language proficiency|fluency level",
+        label,
+    ) and (
+        "language" in f"{section} {action.get('context') or ''} {action.get('field_id') or ''}".lower()
+        or re.search(r"\blanguages?\b", page_text.lower())
+    ):
+        known = safe_id("language_levels.english") in profile.by_id
+        return "language_levels.english" if known else "ASK_USER"
     if re.search(r"languages?( known| spoken)?\b", label):
         return "languages"
     if re.search(r"headline|profile title", t):

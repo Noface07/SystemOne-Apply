@@ -1,7 +1,11 @@
 """Two ways to reach a browser tab over CDP. The executor only needs call(), show() and close()."""
 
 import os
+import time
 from pathlib import Path
+
+SLOW = {"Page.navigate", "Page.reload"}
+SLOW_S = 45.0
 
 
 class ChromeTransport:
@@ -85,7 +89,23 @@ class ChromeTransport:
         return True
 
     def call(self, method, **params):
-        return self._cdp(method, session_id=self.session, **params)
+        # Chrome answers Page.navigate only once the server has replied; a slow portal (Workday) takes longer than
+        # Browser Harness's 5-second default, which would end the run before the page even opened.
+        if method in SLOW:
+            params["_response_timeout"] = SLOW_S
+        from browser_harness.helpers import _IPCResponseTimeout
+
+        for attempt in range(3):
+            try:
+                return self._cdp(method, session_id=self.session, **params)
+            except _IPCResponseTimeout:
+                raise  # sent, but no answer: it may have happened, so it is never sent twice
+            except TimeoutError:
+                # The daemon didn't accept the connection (busy for a moment, Deluxe): nothing was sent, so sending
+                # again is safe. Twice more, a second apart.
+                if attempt == 2:
+                    raise
+                time.sleep(1)
 
     def events(self):
         """This tab's CDP events since the last call (a file chooser opening, for one)."""
@@ -98,6 +118,20 @@ class ChromeTransport:
 
     def show(self):
         self._cdp("Target.activateTarget", targetId=self.target)
+
+    def reopen(self, url):
+        """A tab whose page froze (Accenture: not even document.readyState answered): closed, and the address opened
+        in a new tab of this run, as you would."""
+        frozen = self.target
+        self.target = self._cdp("Target.createTarget", url=url or "about:blank")["targetId"]
+        self.session = self._cdp("Target.attachToTarget", targetId=self.target, flatten=True)["sessionId"]
+        self.opened.append(self.target)
+        try:
+            self._cdp("Target.closeTarget", targetId=frozen)
+        except Exception:  # noqa: BLE001 - gone already
+            pass
+        self.opened = [t for t in self.opened if t != frozen]
+        self.tall()
 
     def close(self):
         if self.target:
